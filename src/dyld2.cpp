@@ -4378,6 +4378,13 @@ void setErrorMessage(const char* message)
 	strlcpy(error_string, message, sizeof(error_string));
 }
 
+#ifdef DARLING_DEBUG
+extern "C" void __simple_kprintf(const char* format, ...);
+#define DYLD_LOG(...) __simple_kprintf(__VA_ARGS__)
+#else
+#define DYLD_LOG(...) ((void)0)
+#endif
+
 const char* getErrorMessage()
 {
 	return error_string;
@@ -4385,6 +4392,7 @@ const char* getErrorMessage()
 
 void halt(const char* message)
 {
+	__simple_kprintf("DYLD HALT: %s\n", message ? message : "(null)");
 	if ( sSharedCacheLoadInfo.errorMessage != nullptr ) {
 		// <rdar://problem/45957449> if dyld fails with a missing dylib and there is no shared cache, display the shared cache load error message
 		dyld::log("dyld: dyld cache load error: %s\n", sSharedCacheLoadInfo.errorMessage);
@@ -6507,10 +6515,12 @@ static ClosureMode getPlatformDefaultClosureMode() {
 // Returns address of main() in target program which __dyld_start jumps to
 //
 uintptr_t
+__attribute__((no_stack_protector))
 _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide, 
 		int argc, const char* argv[], const char* envp[], const char* apple[], 
 		uintptr_t* startGlue)
 {
+	DYLD_LOG("dyld _main started! argc=%d argv[0]=%s\n", argc, argv[0] ? argv[0] : "(null)");
 	if (dyld3::kdebug_trace_dyld_enabled(DBG_DYLD_TIMING_LAUNCH_EXECUTABLE)) {
 		launchTraceID = dyld3::kdebug_trace_dyld_duration_start(DBG_DYLD_TIMING_LAUNCH_EXECUTABLE, (uint64_t)mainExecutableMH, 0, 0);
 	}
@@ -6670,7 +6680,9 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 	}
 #endif
 
+    DYLD_LOG("dyld: before configureProcessRestrictions\n");
     configureProcessRestrictions(mainExecutableMH, envp);
+    DYLD_LOG("dyld: after configureProcessRestrictions\n");
 
 	// Check if we should force dyld3.  Note we have to do this outside of the regular env parsing due to AMFI
 	if ( dyld3::internalInstall() ) {
@@ -6730,8 +6742,11 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 	else
 #endif
 	{
+		DYLD_LOG("dyld: checkEnvironmentVariables start\n");
 		checkEnvironmentVariables(envp);
+		DYLD_LOG("dyld: defaultUninitializedFallbackPaths start\n");
 		defaultUninitializedFallbackPaths(envp);
+		DYLD_LOG("dyld: defaultUninitializedFallbackPaths done\n");
 	}
 #if TARGET_OS_OSX
 	switch (gProcessInfo->platform) {
@@ -7127,8 +7142,10 @@ reloadAllImages:
 
 
 		CRSetCrashLogMessage(sLoadingCrashMessage);
+		DYLD_LOG("dyld: instantiateFromLoadedImage start\n");
 		// instantiate ImageLoader for main executable
 		sMainExecutable = instantiateFromLoadedImage(mainExecutableMH, mainExecutableSlide, sExecPath);
+		DYLD_LOG("dyld: instantiateFromLoadedImage done\n");
 		gLinkContext.mainExecutable = sMainExecutable;
 		gLinkContext.mainExecutableCodeSigned = hasCodeSignatureLoadCommand(mainExecutableMH);
 
@@ -7258,7 +7275,9 @@ reloadAllImages:
 			sMainExecutable->rebase(gLinkContext, -mainExecutableSlide);
 		}
 #endif
+		DYLD_LOG("dyld: link start\n");
 		link(sMainExecutable, sEnv.DYLD_BIND_AT_LAUNCH, true, ImageLoader::RPathChain(NULL, NULL), -1);
+		DYLD_LOG("dyld: link done\n");
 		sMainExecutable->setNeverUnloadRecursive();
 		if ( sMainExecutable->forceFlat() ) {
 			gLinkContext.bindFlat = true;
@@ -7333,10 +7352,12 @@ reloadAllImages:
 		ImageLoader::applyInterposingToDyldCache(gLinkContext);
 
 		// Bind and notify for the main executable now that interposing has been registered
+		DYLD_LOG("dyld: before recursiveBind\n");
 		uint64_t bindMainExecutableStartTime = mach_absolute_time();
 		sMainExecutable->recursiveBindWithAccounting(gLinkContext, sEnv.DYLD_BIND_AT_LAUNCH, true);
 		uint64_t bindMainExecutableEndTime = mach_absolute_time();
 		ImageLoaderMachO::fgTotalBindTime += bindMainExecutableEndTime - bindMainExecutableStartTime;
+		DYLD_LOG("dyld: after recursiveBind\n");
 		gLinkContext.notifyBatch(dyld_image_state_bound, false);
 
 		// Bind and notify for the inserted images now interposing has been registered
@@ -7354,6 +7375,7 @@ reloadAllImages:
 		sMainExecutable->recursiveMakeDataReadOnly(gLinkContext);
 
 		CRSetCrashLogMessage("dyld: launch, running initializers");
+		DYLD_LOG("dyld: before initializeMainExecutable\n");
 	#if SUPPORT_OLD_CRT_INITIALIZATION
 		// Old way is to run initializers via a callback from crt1.o
 		if ( ! gRunInitializersOldWay ) 
@@ -7362,6 +7384,7 @@ reloadAllImages:
 		// run all initializers
 		initializeMainExecutable(); 
 	#endif
+		DYLD_LOG("dyld: after initializeMainExecutable\n");
 
 		// notify any montoring proccesses that this process is about to enter main()
 		notifyMonitoringDyldMain();
@@ -7382,17 +7405,21 @@ reloadAllImages:
 		{
 			// find entry point for main executable
 			result = (uintptr_t)sMainExecutable->getEntryFromLC_MAIN();
+			DYLD_LOG("dyld: getEntryFromLC_MAIN = %p\n", (void*)result);
 			if ( result != 0 ) {
 				// main executable uses LC_MAIN, we need to use helper in libdyld to call into main()
-				if ( (gLibSystemHelpers != NULL) && (gLibSystemHelpers->version >= 9) )
+				if ( (gLibSystemHelpers != NULL) && (gLibSystemHelpers->version >= 9) ) {
 					*startGlue = (uintptr_t)gLibSystemHelpers->startGlueToCallExit;
-				else
+					DYLD_LOG("dyld: startGlue = %p\n", (void*)*startGlue);
+				} else {
 					halt("libdyld.dylib support not present for LC_MAIN");
+				}
 			}
 			else {
 				// main executable uses LC_UNIXTHREAD, dyld needs to let "start" in program set up for main()
 				result = (uintptr_t)sMainExecutable->getEntryFromLC_UNIXTHREAD();
 				*startGlue = 0;
+				DYLD_LOG("dyld: getEntryFromLC_UNIXTHREAD = %p\n", (void*)result);
 			}
 		}
 	}
@@ -7422,6 +7449,7 @@ reloadAllImages:
 		*startGlue = (uintptr_t)gLibSystemHelpers->startGlueToCallExit;
 	}
 
+	DYLD_LOG("dyld: _main returning entry=%p startGlue=%p!\n", (void*)result, (void*)(startGlue ? *startGlue : 0));
 	return result;
 }
 

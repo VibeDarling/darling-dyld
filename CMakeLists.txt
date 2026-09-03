@@ -11,7 +11,8 @@ include (darling_exe)
 add_definitions(-nostdinc)
 add_definitions(-D_LIBCPP_NO_EXCEPTIONS=1)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wno-availability -include ${CMAKE_SOURCE_DIR}/src/duct/include/CrashReporterClient.h")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wno-availability -fno-stack-protector -include ${CMAKE_SOURCE_DIR}/src/duct/include/CrashReporterClient.h")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-stack-protector")
 set(CMAKE_SHARED_LINKER_FLAGS_SAVED "${CMAKE_SHARED_LINKER_FLAGS}")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -nostdlib")
 
@@ -128,7 +129,7 @@ use_ld64(system_loader)
 dsym(system_loader)
 set_target_properties(system_loader PROPERTIES OUTPUT_NAME "dyld")
 set_property(TARGET system_loader APPEND_STRING PROPERTY
-	COMPILE_FLAGS " -DBUILDING_DYLD=1 -DPRIVATE=1 -gfull -fPIC -fno-stack-check")
+	COMPILE_FLAGS " -DBUILDING_DYLD=1 -DPRIVATE=1 -gfull -fPIC -fno-stack-check -fno-stack-protector")
 set_property(TARGET system_loader APPEND_STRING PROPERTY LINK_FLAGS " -Wl,-dylinker -Wl,-dead_strip -Wl,-data_const -nostdlib -Wl,-e,__dyld_start -Wl,-fixup_chains -Wl,-image_base,0x1fe00000 -Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/src/dyld.exp")
 target_link_libraries(system_loader libc_static system_blocks_static
 	cxx_static

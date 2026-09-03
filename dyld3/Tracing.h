@@ -116,13 +116,13 @@ class VIS_HIDDEN ScopedTimer {
 public:
     ScopedTimer(uint32_t code, kt_arg data1, kt_arg data2, kt_arg data3)
         : code(code), data1(data1), data2(data2), data3(data3), data4(0), data5(0), data6(0) {
-#if BUILDING_LIBDYLD || BUILDING_DYLD
+#if (BUILDING_LIBDYLD || BUILDING_DYLD) && !defined(DARLING)
         startTimer();
 #endif
     }
 
     ~ScopedTimer() {
-#if BUILDING_LIBDYLD || BUILDING_DYLD
+#if (BUILDING_LIBDYLD || BUILDING_DYLD) && !defined(DARLING)
         endTimer();
 #endif
     }

@@ -44,6 +44,13 @@
 
 #include "ImageLoader.h"
 
+#ifdef DARLING_DEBUG
+extern "C" void __simple_kprintf(const char* format, ...);
+#define DYLD_LOG(...) __simple_kprintf(__VA_ARGS__)
+#else
+#define DYLD_LOG(...) ((void)0)
+#endif
+
 
 uint32_t								ImageLoader::fgImagesUsedFromSharedCache = 0;
 uint32_t								ImageLoader::fgImagesWithUsedPrebinding = 0;
@@ -1654,7 +1661,9 @@ void ImageLoader::recursiveInitialization(const LinkContext& context, mach_port_
 			context.notifySingle(dyld_image_state_dependents_initialized, this, &timingInfo);
 			
 			// initialize this image
+			DYLD_LOG("dyld: initializing image: %s\n", this->getPath() ? this->getPath() : "(null)");
 			bool hasInitializers = this->doInitialization(context);
+			DYLD_LOG("dyld: initialized image: %s\n", this->getPath() ? this->getPath() : "(null)");
 
 			// let anyone know we finished initializing this image
 			fState = dyld_image_state_initialized;
