@@ -2603,7 +2603,7 @@ uintptr_t ImageLoaderMachO::reserveAnAddressRange(size_t length, const ImageLoad
 	 * above 2^47 collides with ObjC's FAST_DATA_MASK (47 bits) and crashes
 	 * class_initialize. Sequentially hand out low-VA slots so all dylibs
 	 * remain within the addressable range. */
-	static _Atomic(uintptr_t) fgDarlingNextDylibAddr = 0x300000000ULL; /* leave 0x100/0x200 ranges for exe + dyld (atomic CAS) */
+	static uintptr_t fgDarlingNextDylibAddr = 0x300000000ULL; /* leave 0x100/0x200 ranges for exe + dyld (accessed via __atomic builtins / CAS) */
 	uintptr_t req = __atomic_load_n(&fgDarlingNextDylibAddr, __ATOMIC_RELAXED);
 	addr = req;
 	kern_return_t r = vm_alloc(&addr, size, VM_FLAGS_FIXED | VM_MAKE_TAG(VM_MEMORY_DYLIB));

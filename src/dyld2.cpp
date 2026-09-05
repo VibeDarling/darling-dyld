@@ -4392,7 +4392,7 @@ const char* getErrorMessage()
 
 void halt(const char* message)
 {
-	__simple_kprintf("DYLD HALT: %s\n", message ? message : "(null)");
+	DYLD_LOG("DYLD HALT: %s\n", message ? message : "(null)");
 	if ( sSharedCacheLoadInfo.errorMessage != nullptr ) {
 		// <rdar://problem/45957449> if dyld fails with a missing dylib and there is no shared cache, display the shared cache load error message
 		dyld::log("dyld: dyld cache load error: %s\n", sSharedCacheLoadInfo.errorMessage);
