@@ -1095,10 +1095,18 @@ int* __error(void) {
 	return gSyscallHelpers->errnoAddress();
 }
 
+#ifdef DARLING
+extern void mach_driver_init(const char** applep);
+void mach_init(const char** applep) {
+	mach_driver_init(applep);
+	mach_task_self_ = task_self_trap();
+}
+#else
 void mach_init() {
 	mach_task_self_ = task_self_trap();
 	//_task_reply_port = _mach_reply_port();
 }
+#endif
 
 mach_port_t mach_task_self_ = MACH_PORT_NULL;
 
