@@ -60,6 +60,14 @@
 #include <dlfcn.h>
 
 #if __has_feature(ptrauth_calls)
+	#define DARLING_DLSYM_SIGN(p) __builtin_ptrauth_sign_unauthenticated(p, ptrauth_key_asia, 0)
+#elif defined(DARLING) && defined(__arm64__) && defined(__LP64__)
+	// DARLING arm64e compat: arm64e code calls dlsym results with BLRAA (IA key, zero discriminator), so sign
+	// them with the same software PAC helper dyld uses for chained fixups.
+	#define DARLING_DLSYM_SIGN(p) ((void*)dyld3::MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer((uint64_t)(p), nullptr, false, 0, 0))
+#endif
+
+#if __has_feature(ptrauth_calls)
   #include <ptrauth.h>
 #endif
 
@@ -803,7 +811,7 @@ void* NSAddressOfSymbol(NSSymbol symbol)
 		}
 		const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 		if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-			result = __builtin_ptrauth_sign_unauthenticated(result, ptrauth_key_asia, 0);
+			result = DARLING_DLSYM_SIGN(result);
 	}
 #endif
 	return result;
@@ -1857,7 +1865,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 		if ( dyld::flatFindExportedSymbol(underscoredName, &sym, &image) ) {
 			CRSetCrashLogMessage(NULL);
 			result = (void*)image->getExportedSymbolAddress(sym, dyld::gLinkContext, NULL, false, underscoredName);
-#if __has_feature(ptrauth_calls)
+#if __has_feature(ptrauth_calls) || (defined(DARLING) && defined(__arm64__) && defined(__LP64__))
 			// Sign the pointer if it points to a function
 			// Note we only do this if the main executable is arm64e as otherwise we
 			// may end up calling containsAddress on the accelerator tables.
@@ -1868,7 +1876,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = __builtin_ptrauth_sign_unauthenticated(result, ptrauth_key_asia, 0);
+					result = DARLING_DLSYM_SIGN(result);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -1891,7 +1899,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 		if ( sym != NULL ) {
 			CRSetCrashLogMessage(NULL);
 			result = (void*)image->getExportedSymbolAddress(sym, dyld::gLinkContext, NULL, false, underscoredName);
-#if __has_feature(ptrauth_calls)
+#if __has_feature(ptrauth_calls) || (defined(DARLING) && defined(__arm64__) && defined(__LP64__))
 			// Sign the pointer if it points to a function
 			// Note we only do this if the main executable is arm64e as otherwise we
 			// may end up calling containsAddress on the accelerator tables.
@@ -1902,7 +1910,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = __builtin_ptrauth_sign_unauthenticated(result, ptrauth_key_asia, 0);
+					result = DARLING_DLSYM_SIGN(result);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -1937,7 +1945,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 		if ( sym != NULL ) {
 			CRSetCrashLogMessage(NULL);
 			result = (void*)image->getExportedSymbolAddress(sym, dyld::gLinkContext , callerImage, false, underscoredName);
-#if __has_feature(ptrauth_calls)
+#if __has_feature(ptrauth_calls) || (defined(DARLING) && defined(__arm64__) && defined(__LP64__))
 			// Sign the pointer if it points to a function
 			// Note we only do this if the main executable is arm64e as otherwise we
 			// may end up calling containsAddress on the accelerator tables.
@@ -1948,7 +1956,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = __builtin_ptrauth_sign_unauthenticated(result, ptrauth_key_asia, 0);
+					result = DARLING_DLSYM_SIGN(result);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -1982,7 +1990,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 		if ( sym != NULL ) {
 			CRSetCrashLogMessage(NULL);
 			result = (void*)image->getExportedSymbolAddress(sym, dyld::gLinkContext, callerImage, false, underscoredName);
-#if __has_feature(ptrauth_calls)
+#if __has_feature(ptrauth_calls) || (defined(DARLING) && defined(__arm64__) && defined(__LP64__))
 			// Sign the pointer if it points to a function
 			// Note we only do this if the main executable is arm64e as otherwise we
 			// may end up calling containsAddress on the accelerator tables.
@@ -1993,7 +2001,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = __builtin_ptrauth_sign_unauthenticated(result, ptrauth_key_asia, 0);
+					result = DARLING_DLSYM_SIGN(result);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -2033,7 +2041,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				callerImage = dyld::findImageContainingAddress(callerAddress);
 			}
 			result = (void*)image->getExportedSymbolAddress(sym, dyld::gLinkContext, callerImage, false, underscoredName);
-#if __has_feature(ptrauth_calls)
+#if __has_feature(ptrauth_calls) || (defined(DARLING) && defined(__arm64__) && defined(__LP64__))
 			// Sign the pointer if it points to a function
 			// Note we only do this if the main executable is arm64e as otherwise we
 			// may end up calling containsAddress on the accelerator tables.
@@ -2044,7 +2052,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = __builtin_ptrauth_sign_unauthenticated(result, ptrauth_key_asia, 0);
+					result = DARLING_DLSYM_SIGN(result);
 			}
 #endif
 			if ( dyld::gLogAPIs )
