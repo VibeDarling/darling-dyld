@@ -614,7 +614,7 @@ public:
 
 	virtual bool						usesChainedFixups() const { return false; }
 
-	virtual void						makeDataReadOnly() const {}
+	virtual void						setReadOnlyDataWritable(bool) const {}
 	
 										// when resolving symbols look in subImage if symbol can't be found
 	void								reExport(ImageLoader* subImage);
@@ -699,6 +699,7 @@ public:
 	
 			void						setObjCMappedNotified() { fObjCMappedNotified = true; }
 			bool						objCMappedNotified() const { return fObjCMappedNotified; }
+			bool						madeDataReadOnly() const { return fMadeReadOnly; }
 
 	struct InterposeTuple { 
 		uintptr_t										replacement;
