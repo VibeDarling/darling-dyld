@@ -2604,16 +2604,21 @@ uintptr_t ImageLoaderMachO::reserveAnAddressRange(size_t length, const ImageLoad
 	 * class_initialize. Sequentially hand out low-VA slots so all dylibs
 	 * remain within the addressable range. */
 	static uintptr_t fgDarlingNextDylibAddr = 0x300000000ULL; /* leave 0x100/0x200 ranges for exe + dyld (accessed via __atomic builtins / CAS) */
-	uintptr_t req = __atomic_load_n(&fgDarlingNextDylibAddr, __ATOMIC_RELAXED);
-	addr = req;
-	kern_return_t r = vm_alloc(&addr, size, VM_FLAGS_FIXED | VM_MAKE_TAG(VM_MEMORY_DYLIB));
-	if ( r == KERN_SUCCESS ) {
-		uintptr_t target = addr + size + 0x100000; /* leave a 1 MiB gap */
-		uintptr_t cur = req;
-		while (target > cur && !__atomic_compare_exchange_n(&fgDarlingNextDylibAddr, &cur, target, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-			// retry CAS
-		}
-		return addr;
+	/* Claim the range by bumping the cursor BEFORE mapping. Reading the cursor, mapping,
+	 * and only then bumping lets two concurrent loads pick the same address; whether that
+	 * is caught depends on vm_allocate rejecting an occupied fixed range, which it does
+	 * not do today. Reserving first makes the allocator correct on its own. */
+	const uintptr_t stride = size + 0x100000; /* leave a 1 MiB gap */
+	for ( unsigned attempt = 0; attempt < 64; ++attempt ) {
+		uintptr_t claimed = __atomic_fetch_add(&fgDarlingNextDylibAddr, stride, __ATOMIC_RELAXED);
+		if ( claimed + stride >= 0x800000000000ULL )   /* 2^47: past here libobjc truncates pointers */
+			break;
+		addr = claimed;
+		kern_return_t r = vm_alloc(&addr, size, VM_FLAGS_FIXED | VM_MAKE_TAG(VM_MEMORY_DYLIB));
+		if ( r == KERN_SUCCESS )
+			return addr;
+		/* Occupied by something outside our arena (the ELF loader also maps here).
+		 * The cursor has already advanced, so the next attempt tries fresh space. */
 	}
 	/* fall back to ANYWHERE — at least the system might still be usable */
 	addr = 0;
