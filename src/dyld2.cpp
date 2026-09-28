@@ -3894,6 +3894,17 @@ static ImageLoader* loadPhase3(const char* path, const char* orgPath, const Load
 			if ( image != NULL )
 				return image;
 		}
+
+		// Fallback for system Swift runtime libraries in /usr/lib/swift (macOS 10.14.4+)
+		const char* swiftLeaf = strrchr(trailingPath, '/');
+		swiftLeaf = swiftLeaf ? swiftLeaf + 1 : trailingPath;
+		if ( strncmp(swiftLeaf, "libswift", 8) == 0 ) {
+			char swiftPath[PATH_MAX];
+			snprintf(swiftPath, sizeof(swiftPath), "/usr/lib/swift/%s", swiftLeaf);
+			image = loadPhase4(swiftPath, orgPath, context, cacheIndex, exceptions);
+			if ( image != NULL )
+				return image;
+		}
 		
 		// if this is the "open" pass, don't try to open @rpath/... as a relative path
 		if ( (exceptions != NULL) && (trailingPath != path) )
