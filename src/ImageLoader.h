@@ -103,21 +103,18 @@
 
 
 // <rdar://problem/13590567> optimize away dyld's initializers
-#define VECTOR_NEVER_DESTRUCTED(type) \
-	namespace std { \
-		template <> \
-		__vector_base<type, std::allocator<type> >::~__vector_base() { } \
-	}
-#define VECTOR_NEVER_DESTRUCTED_EXTERN(type) \
-       namespace std { \
-               template <> \
-               __vector_base<type, std::allocator<type> >::~__vector_base(); \
-       }
-#define VECTOR_NEVER_DESTRUCTED_IMPL(type) \
-       namespace std { \
-               template <> \
-               __vector_base<type, std::allocator<type> >::~__vector_base() { } \
-       }
+//
+// DARLING: Apple's original macros patched the destructor of libcxx's
+// internal `std::__vector_base` class to be a no-op, avoiding destructor
+// registration work for dyld globals. Newer libcxx refactored that
+// implementation and the `__vector_base` class is gone, so the macro no
+// longer compiles. Expand to nothing rather than specialize private libc++
+// implementation classes. Normal vector destructor code is generated again;
+// the loader's glue.c still discards __cxa_atexit registrations. Linked-loader
+// behavior and startup costs must be evaluated separately.
+#define VECTOR_NEVER_DESTRUCTED(type)
+#define VECTOR_NEVER_DESTRUCTED_EXTERN(type)
+#define VECTOR_NEVER_DESTRUCTED_IMPL(type)
 
 // utilities
 namespace dyld {
