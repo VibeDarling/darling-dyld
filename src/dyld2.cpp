@@ -3900,7 +3900,8 @@ static ImageLoader* loadPhase3(const char* path, const char* orgPath, const Load
 		swiftLeaf = swiftLeaf ? swiftLeaf + 1 : trailingPath;
 		if ( strncmp(swiftLeaf, "libswift", 8) == 0 ) {
 			char swiftPath[PATH_MAX];
-			snprintf(swiftPath, sizeof(swiftPath), "/usr/lib/swift/%s", swiftLeaf);
+			strcpy(swiftPath, "/usr/lib/swift/");
+			strlcat(swiftPath, swiftLeaf, sizeof(swiftPath));
 			image = loadPhase4(swiftPath, orgPath, context, cacheIndex, exceptions);
 			if ( image != NULL )
 				return image;
