@@ -2138,6 +2138,11 @@ void ImageLoaderMachOCompressed::registerEncryption(const encryption_info_comman
 			uint32_t cputype = mh->cputype;
 			uint32_t cpusubtype = mh->cpusubtype;
 			uint32_t cryptid = encryptCmd->cryptid;
+#ifdef DARLING
+			// An unencrypted image needs no kernel decryption registration.
+			if (cryptid == 0)
+				return;
+#endif
 			if (context.verboseMapping) {
 				 dyld::log("                      0x%08lX->0x%08lX configured for FairPlay decryption\n", (long)start, (long)start+len);
 			}
