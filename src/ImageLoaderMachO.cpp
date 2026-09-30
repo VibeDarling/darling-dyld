@@ -1681,10 +1681,18 @@ void ImageLoaderMachO::makeTextSegmentWritable(const LinkContext& context, bool 
 }
 #endif
 
-const ImageLoader::Symbol* ImageLoaderMachO::findExportedSymbol(const char* name, bool searchReExports, const char* thisPath, const ImageLoader** foundIn) const
+const ImageLoader::Symbol* ImageLoaderMachO::findExportedSymbol(const char* name, bool searchReExports, const char* thisPath, const ImageLoader** foundIn, const ExportLookup* parent) const
 {
+	// Track this lookup's ancestry, not global/thread ownership. Include the
+	// symbol name because re-export trie entries may rename the requested symbol.
+	for (const ExportLookup* p = parent; p != nullptr; p = p->parent) {
+		if ( p->image == this && p->searchReExports == searchReExports
+		  && strcmp(p->name, name) == 0 )
+			return NULL;
+	}
+	const ExportLookup lookup = { this, name, parent, searchReExports };
 	// look in this image first
-	const ImageLoader::Symbol* result = this->findShallowExportedSymbol(name, foundIn);
+	const ImageLoader::Symbol* result = this->findShallowExportedSymbol(name, foundIn, &lookup);
 	if ( result != NULL )
 		return result;
 	
@@ -1694,7 +1702,7 @@ const ImageLoader::Symbol* ImageLoaderMachO::findExportedSymbol(const char* name
 				ImageLoader* image = libImage(i);
 				if ( image != NULL ) {
 					const char* reExPath = libPath(i);
-					result = image->findExportedSymbol(name, searchReExports, reExPath, foundIn);
+					result = image->findExportedSymbol(name, searchReExports, reExPath, foundIn, &lookup);
 					if ( result != NULL )
 						return result;
 				}
@@ -3052,4 +3060,3 @@ uintptr_t ImageLoaderMachO::imageBaseAddress() const {
     }
     return 0;
 }
-
