@@ -14,7 +14,8 @@ helper = source[/static bool cacheRangeContains\(.*?^\}/m] || ''
 block = source[/    if \( \(cache->header.mappingCount < 3\).*?(?=    \/\/ register code signature)/m]
 abort 'mapping validation missing' unless block
 header = File.read("#{root}/dyld3/shared-cache/dyld_cache_format.h")
-structs = %w[dyld_cache_header dyld_cache_mapping_info].map do |name|
+max_mappings = File.read("#{root}/dyld3/shared-cache/DyldSharedCache.h")[/MaxMappings = (\d+)/, 1] or abort 'mapping limit missing'
+structs = %w[dyld_cache_header dyld_cache_mapping_info dyld_cache_mapping_and_slide_info].map do |name|
   header[/struct #{name}\s*\{.*?^\};/m] or abort "missing #{name}"
 end.join("\n")
 Dir.mktmpdir('cache-preflight-ranges-') do |dir|
@@ -27,13 +28,14 @@ Dir.mktmpdir('cache-preflight-ranges-') do |dir|
     #include <unistd.h>
     #include <fcntl.h>
     #include <errno.h>
+    #define __offsetof offsetof
     typedef unsigned char uuid_t[16];
     enum { VM_PROT_READ=1, VM_PROT_WRITE=2, VM_PROT_EXECUTE=4 };
     #{structs}
-    struct DyldSharedCache { dyld_cache_header header; enum { MaxMappings=16 }; };
+    struct DyldSharedCache { dyld_cache_header header; enum { MaxMappings=#{max_mappings} }; };
     struct Result { const char *errorMessage=nullptr; };
     #{helper}
-    static bool verify(int fd, const uint8_t *firstPage, uint64_t cacheFileLength, Result *results) {
+    static bool verify(int fd, const uint8_t (&firstPage)[0x4000], uint64_t cacheFileLength, Result *results) {
       const DyldSharedCache *cache = reinterpret_cast<const DyldSharedCache *>(firstPage);
     #{block}
       return true;
@@ -42,7 +44,7 @@ Dir.mktmpdir('cache-preflight-ranges-') do |dir|
       for (unsigned scenario=0; scenario!=9; ++scenario) {
         alignas(16) uint8_t firstPage[0x4000]={};
         auto &h = reinterpret_cast<DyldSharedCache *>(firstPage)->header;
-        h.mappingCount=3; h.mappingOffset=0x168;
+        h.mappingCount=3; h.mappingOffset=offsetof(dyld_cache_header, mappingWithSlideOffset);
         h.sharedRegionStart=0x1000; h.sharedRegionSize=0x4000;
         h.codeSignatureOffset=64; h.codeSignatureSize=0x4000-64;
         auto m = reinterpret_cast<dyld_cache_mapping_info *>(firstPage+h.mappingOffset);
