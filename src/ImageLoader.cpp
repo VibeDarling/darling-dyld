@@ -809,7 +809,16 @@ void ImageLoader::recursiveLoadLibraries(const LinkContext& context, bool prefli
 			catch (const char* msg) {
 				//if ( context.verbosePrebinding )
 				//	fprintf(stderr, "dyld: exception during processing for %s referencing %s\n", this->getPath(), dependentLib->getPath());		
-				if ( requiredLibInfo.required ) {
+#if defined(DARLING) && TARGET_OS_OSX
+				// Darling has only some of iOS's frameworks. An iOS app that
+				// links a missing one starts anyway, as if it were weak-linked.
+				bool missingAsWeak = context.iOSMissingAsWeak && strstr(msg, "image not found") != NULL;
+				if ( missingAsWeak )
+					dyld::log("dyld: %s links %s, which Darling does not have; its symbols are NULL\n", this->getShortName(), requiredLibInfo.name);
+#else
+				bool missingAsWeak = false;
+#endif
+				if ( requiredLibInfo.required && !missingAsWeak ) {
 					fState = dyld_image_state_mapped;
 					// record values for possible use by CrashReporter or Finder
 					if ( strstr(msg, "Incompatible library version") != NULL )

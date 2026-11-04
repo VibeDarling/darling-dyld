@@ -645,6 +645,12 @@ uintptr_t ImageLoaderMachOCompressed::resolveFlat(const LinkContext& context, co
 		// definition can't be found anywhere, ok because it is weak, just return 0
 		return 0;
 	}
+#if defined(DARLING) && TARGET_OS_OSX
+	if ( context.iOSMissingAsWeak ) {
+		dyld::log("dyld: %s: %s is not in any image; using NULL\n", this->getShortName(), symbolName);
+		return 0;
+	}
+#endif
 	throwSymbolNotFound(context, symbolName, this->getPath(), "", "flat namespace");
 }
 
@@ -760,6 +766,12 @@ uintptr_t ImageLoaderMachOCompressed::resolveTwolevel(const LinkContext& context
 		// definition can't be found anywhere, ok because it is weak, just return 0
 		return 0;
 	}
+#if defined(DARLING) && TARGET_OS_OSX
+	if ( context.iOSMissingAsWeak ) {
+		dyld::log("dyld: %s: %s is not in %s; using NULL\n", this->getShortName(), symbolName, definedInImage->getShortName());
+		return 0;
+	}
+#endif
 
 	// nowhere to be found, check if maybe this image is too new for this OS
 	char versMismatch[256];
@@ -826,7 +838,11 @@ uintptr_t ImageLoaderMachOCompressed::resolve(const LinkContext& context, const 
 				libraryOrdinal, libraryCount(), symbolName, this->getPath());
 		}
 		if ( *targetImage == NULL ) {
+#if defined(DARLING) && TARGET_OS_OSX
+			if ( weak_import || context.iOSMissingAsWeak ) {
+#else
 			if ( weak_import ) {
+#endif
 				// if target library not loaded and reference is weak or library is weak return 0
 				symbolAddress = 0;
 			}

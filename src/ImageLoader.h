@@ -318,6 +318,11 @@ public:
 		bool			startedInitializingMainExecutable;
 #if TARGET_OS_OSX
 		bool			iOSonMac;
+#ifdef DARLING
+		// An iOS app's missing libraries and symbols are bound as if they
+		// were weak (NULL) instead of failing the launch.
+		bool			iOSMissingAsWeak;
+#endif
 		// dyld doesn't build for driverKit, so we use the macOS define to control whether driverKit is supported
 		bool			driverKit;
 #endif

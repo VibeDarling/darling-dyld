@@ -6791,6 +6791,9 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 		case PLATFORM_MACCATALYST:
 			gLinkContext.rootPaths = parseColonList("/System/iOSSupport", NULL);
 			gLinkContext.iOSonMac = true;
+#ifdef DARLING
+			gLinkContext.iOSMissingAsWeak = _simple_getenv(envp, "DARLING_STRICT_LINKING") == NULL;
+#endif
 			if ( sEnv.DYLD_FALLBACK_LIBRARY_PATH == sLibraryFallbackPaths )
 				sEnv.DYLD_FALLBACK_LIBRARY_PATH = sRestrictedLibraryFallbackPaths;
 			if ( sEnv.DYLD_FALLBACK_FRAMEWORK_PATH == sFrameworkFallbackPaths )
