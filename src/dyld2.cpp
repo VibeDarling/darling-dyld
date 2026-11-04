@@ -6785,7 +6785,13 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 	switch (gProcessInfo->platform) {
 #if (TARGET_OS_OSX && TARGET_CPU_ARM64)
 		case PLATFORM_IOS:
+#ifndef DARLING
 			sClosureMode = ClosureMode::On; // <rdar://problem/56792308> Run iOS apps on macOS in dyld3 mode
+#else
+			// Stay in dyld2 mode, as Catalyst apps do. Closure-loaded images never get
+			// libdyld's __dyld lookup slot filled in, so libsystem_kernel's
+			// _dyld_func_lookup("__dyld_get_elfcalls") would call a null pointer.
+#endif
 			[[clang::fallthrough]];
 #endif
 		case PLATFORM_MACCATALYST:
