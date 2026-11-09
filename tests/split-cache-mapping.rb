@@ -1,10 +1,13 @@
 # Actual mapSplitCachePrivate, slide-info-v5 rebase and the DyldSharedCache image helpers, run against
 # a synthetic 3-file split cache (tests/gen-split-cache-fixture.py). No Apple cache content is used.
+# Authenticated entries are checked with the PAC instructions themselves (autia/autda, executed with the
+# process's own keys), so this needs an arm64 Linux host with pointer authentication for the signing scenarios.
 # Requires Linux (MAP_FIXED, /proc/self/maps), Ruby, python3 and clang++.
 # Usage: ruby tests/split-cache-mapping.rb [checkout] [base-address]
 # The synthetic region is mapped at base-address (default 0x180000000), which must be free.
 require 'tmpdir'
 require 'open3'
+require 'rbconfig'
 root = File.realpath(ARGV.fetch(0, File.expand_path('..', __dir__)))
 base = ARGV.fetch(1, '0x180000000')
 require_relative 'split-cache-harness'
@@ -44,9 +47,34 @@ VARIANTS = {
   'main_count_mismatch' => 'does not map its header tables',
 }
 
+HWCAP_PACA = 1 << 30
+EXECUTES_PAC = %w[sign_host auth_target_outside_region]
+def auxv(*pairs) = (pairs + [[0, 0]]).map { |t, v| [t, v].pack('QQ') }.join
+
+# The host's own capability decides whether the signing scenario can run: the PAC instructions are undefined
+# without it. Only the scenarios in EXECUTES_PAC run them (auth_target_outside_region signs the page-1 slots before it
+# reaches the bad one); the other fabricated auxiliary vectors stop the mapper before the first signature.
+host_hwcap = File.binread('/proc/self/auxv').unpack('Q*').each_slice(2).find { |type, _| type == 16 }&.last.to_i
+host_pac = RbConfig::CONFIG['host_cpu'] =~ /aarch64|arm64/ && (host_hwcap & HWCAP_PACA) != 0
+
+# name => [fixture variant, mode, auxv file content (nil: the host's own), expected result]. The auxiliary vector
+# is how the mapper learns whether the host can sign; the fabricated ones stand in for hosts that cannot.
+SCENARIOS = {
+  'sign_host' => ['valid', 'sign', nil, nil],
+  'auth_target_outside_region' => ['auth_target_outside_region', 'sign', auxv([16, HWCAP_PACA]), 'outside the cache region'],
+  'leave_alone' => ['valid', 'leave', nil, nil],
+  'leave_alone_no_pac' => ['valid', 'leave', auxv([16, 3]), nil],
+  'no_pac_fails' => ['valid', 'sign', auxv([16, 3]), 'has no pointer authentication'],
+  'no_pac_without_auth_entries_maps' => ['no_auth', 'sign', auxv([16, 3]), nil],
+  'no_hwcap_fails' => ['valid', 'sign', auxv([6, 16384]), 'has no AT_HWCAP'],
+  'auxv_truncated_fails' => ['valid', 'sign', [16].pack('Q'), 'is unreadable'],
+  'auxv_missing_fails' => ['valid', 'sign', :missing, 'cannot be opened'],
+}
+
 Dir.mktmpdir('split-cache-mapping-') do |dir|
   File.write("#{dir}/test.cpp", <<~CPP)
     #{SplitCacheHarness.prefix(root)}
+    #include <sys/wait.h>
 
     static unsigned long long hex(const char *s) { return strtoull(s, nullptr, 16); }
     static std::string permissions(uint64_t address) {
@@ -59,6 +87,30 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
       fclose(maps); return perms;
     }
     static const char *current;
+    // --- independent oracle: the PAC instructions, written here and not shared with the mapper ---
+    __attribute__((target("arch=armv8.3-a"))) static uint64_t authenticate(int isData, uint64_t signedValue, uint64_t modifier, int otherKey) {
+      // otherKey: 0 = the key named by isData, 1 = the other A key class (IA <-> DA), 2 = IB or DB
+      const int cls = (otherKey == 1) ? !isData : isData;
+      if (otherKey == 2) { if (isData) asm("autdb %0, %1" : "+r"(signedValue) : "r"(modifier)); else asm("autib %0, %1" : "+r"(signedValue) : "r"(modifier)); }
+      else if (cls) asm("autda %0, %1" : "+r"(signedValue) : "r"(modifier));
+      else asm("autia %0, %1" : "+r"(signedValue) : "r"(modifier));
+      return signedValue;
+    }
+    // True when authentication hands back exactly the target. A hardware that traps on failure (FPAC) kills the
+    // child, which counts as a failed authentication.
+    static bool authenticates(int isData, uint64_t signedValue, uint64_t modifier, int otherKey, uint64_t target) {
+      fflush(stdout);
+      pid_t pid = fork(); assert(pid >= 0);
+      if (pid == 0) _exit(authenticate(isData, signedValue, modifier, otherKey) == target ? 0 : 1);
+      int status = 0; assert(waitpid(pid, &status, 0) == pid);
+      return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    }
+    // PAC is a truncated MAC (about 7 bits with a 48-bit address space), so one wrong guess can pass by chance
+    // (1 in 128). The checks that a wrong input is rejected therefore pool their trials and ask for a clear majority.
+    struct Rejections { const char *name; unsigned trials = 0, rejected = 0;
+      void add(bool authenticated) { ++trials; if (!authenticated) ++rejected; }
+      void check() const { printf("rejected %s: %u of %u\\n", name, rejected, trials); assert(trials >= 4 && rejected * 2 > trials); } };
+
     static unsigned seenImages; static char seenName[128];
     static unsigned regionCount; static uint64_t regionAddress[8]; static const void *regionContent[8]; static uint32_t regionProt[8];
 
@@ -78,13 +130,16 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
     }
 
     int main(int argc, char **argv) {
-      assert(argc == 2);
+      assert(argc >= 3);
       std::string dir = argv[1];
+      const bool sign = !strcmp(argv[2], "sign");
+      if (argc > 3) gAuxvPath = argv[3];
       FILE *manifest = fopen((dir + "/manifest.txt").c_str(), "r"); assert(manifest);
       uint64_t base = 0, imageAddress = 0, regionSize = 0;
       char installName[128] = "", word[32], a[64], b[64], c[64], d[64], e[64];
       unsigned files = 0, mappingsExpected = 0; unsigned long long pages = 0, plainExpected = 0, authExpected = 0;
       struct Slot { uint64_t address, value; }; Slot expect[16], untouched[16]; unsigned nExpect = 0, nUntouched = 0;
+      struct AuthSlot { uint64_t address, target, raw; int key, addrDiv; uint16_t diversity; }; AuthSlot auths[32]; unsigned nAuth = 0;
       char line[256];
       while (fgets(line, sizeof line, manifest)) {
         if (sscanf(line, "%31s %63s %63s %63s %63s %63s", word, a, b, c, d, e) < 1) continue;
@@ -93,12 +148,13 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
         else if (!strcmp(word, "region")) regionSize = hex(b);
         else if (!strcmp(word, "stats")) sscanf(line, "stats files=%u mappings=%u pages=%llu plain=%llu auth=%llu", &files, &mappingsExpected, &pages, &plainExpected, &authExpected);
         else if (!strcmp(word, "expect")) expect[nExpect++] = {hex(a), hex(b)};
+        else if (!strcmp(word, "auth")) { unsigned long long x, t, r; int k, ad; unsigned dv; sscanf(line, "auth %llx %llx %d %d %x %llx", &x, &t, &k, &ad, &dv, &r); auths[nAuth++] = {x, t, r, k, ad, (uint16_t)dv}; }
         else if (!strcmp(word, "untouched")) untouched[nUntouched++] = {hex(a), hex(b)};
       }
       fclose(manifest);
 
       SharedCacheLoadInfo result = {}; SplitCacheMapStats stats;
-      bool ok = mapSplitCachePrivate((dir + "/cache").c_str(), true, &result, &stats, kSplitCacheAuthLeaveAlone);
+      bool ok = mapSplitCachePrivate((dir + "/cache").c_str(), true, &result, &stats, sign ? kSplitCacheAuthSign : kSplitCacheAuthLeaveAlone);
       if (!ok) {
         assert(result.errorMessage && !result.loadAddress);
         // A failed map must leave the whole region free again.
@@ -109,8 +165,31 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
       }
       assert(!result.errorMessage && result.loadAddress == (const DyldSharedCache *)base && result.slide == 0);
       assert(stats.files == files && stats.mappings == mappingsExpected && stats.pagesWithChains == pages);
-      assert(stats.plainRebased == plainExpected && stats.authLeftAlone == authExpected);
+      assert(stats.plainRebased == plainExpected);
+      assert(stats.authSigned == (sign ? authExpected : 0) && stats.authLeftAlone == (sign ? 0 : authExpected));
       for (unsigned i = 0; i < nExpect; ++i) assert(*(uint64_t *)expect[i].address == expect[i].value);
+      assert(nAuth == authExpected);
+      if (!sign) for (unsigned i = 0; i < nAuth; ++i) assert(*(uint64_t *)auths[i].address == auths[i].raw);
+      if (sign && nAuth) {
+        Rejections wrongModifier = {"a wrong modifier"}, wrongKey = {"a wrong key"}, blendOmitted = {"the address blend omitted"}, blendAdded = {"a blend nobody asked for"};
+        bool seenKey[2] = {}, seenAddrDiv[2] = {}, seenZero = false, seenMax = false;
+        for (unsigned i = 0; i < nAuth; ++i) {
+          const AuthSlot &a = auths[i];
+          const uint64_t signedValue = *(uint64_t *)a.address;
+          const uint64_t blend = (a.address & 0x0000ffffffffffffULL) | ((uint64_t)a.diversity << 48);
+          const uint64_t modifier = a.addrDiv ? blend : a.diversity;
+          // the right key and modifier give back exactly the target, the same address the plain entries get
+          assert(authenticates(a.key, signedValue, modifier, 0, a.target));
+          for (unsigned bit = 0; bit < 16; ++bit) wrongModifier.add(authenticates(a.key, signedValue, modifier ^ (1ULL << bit), 0, a.target));
+          wrongKey.add(authenticates(a.key, signedValue, modifier, 1, a.target));
+          wrongKey.add(authenticates(a.key, signedValue, modifier, 2, a.target));
+          (a.addrDiv ? blendOmitted : blendAdded).add(authenticates(a.key, signedValue, a.addrDiv ? a.diversity : blend, 0, a.target));
+          seenKey[a.key] = seenAddrDiv[a.addrDiv] = true; seenZero |= a.diversity == 0; seenMax |= a.diversity == 0xffff;
+        }
+        assert(seenKey[0] && seenKey[1] && seenAddrDiv[0] && seenAddrDiv[1] && seenZero && seenMax);
+        wrongModifier.check(); wrongKey.check(); blendOmitted.check(); blendAdded.check();
+        printf("authenticated %u signed slots\\n", nAuth);
+      }
       for (unsigned i = 0; i < nUntouched; ++i) assert(*(uint64_t *)untouched[i].address == untouched[i].value);
 
       // private copy-on-write: the file keeps the on-disk chain value that the mapping has rewritten
@@ -186,28 +265,43 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
   failed_build = SplitCacheHarness.compile(root, dir, ['-fsanitize=address,undefined'])
   abort failed_build if failed_build
   failures = 0
-  VARIANTS.each do |variant, expected_error|
-    next puts("skip #{variant} (needs a host page larger than 4 KiB)") if expected_error == :skip
-    fixture = "#{dir}/#{variant}"
+  run = lambda do |label, variant, mode, auxv_content, expected_error|
+    fixture = "#{dir}/#{label}"
     out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", fixture, '--base', base, '--variant', variant)
     abort out unless st.success?
-    out, st = Open3.capture2e("#{dir}/test", fixture)
+    args = [fixture, mode]
+    if auxv_content
+      auxv_path = "#{fixture}/auxv"
+      File.binwrite(auxv_path, auxv_content) unless auxv_content == :missing
+      args << (auxv_content == :missing ? "#{fixture}/no-such-auxv" : auxv_path)
+    end
+    out, st = Open3.capture2e("#{dir}/test", *args)
     result = out[/^RESULT .*$/]
     good = st.success? && result &&
            (expected_error ? (result.start_with?('RESULT error:') && result.include?(expected_error)) : result == 'RESULT ok')
-    puts "#{good ? 'ok  ' : 'FAIL'} #{variant}#{result ? " (#{result})" : ''}"
+    puts "#{good ? 'ok  ' : 'FAIL'} #{label}#{result ? " (#{result})" : ''}"
+    out.each_line { |l| puts "       #{l}" if l.start_with?('rejected', 'authenticated') }
     unless good
       failures += 1
       puts out.lines.last(8).join
     end
   end
+  # The structural variants fail before any authenticated entry matters, so they run in the host-independent mode.
+  VARIANTS.each do |variant, expected_error|
+    next puts("skip #{variant} (needs a host page larger than 4 KiB)") if expected_error == :skip
+    run.call(variant, variant, 'leave', nil, expected_error)
+  end
+  SCENARIOS.each do |label, (variant, mode, auxv_content, expected_error)|
+    next puts("skip #{label} (host has no pointer authentication)") if EXECUTES_PAC.include?(label) && !host_pac
+    run.call(label, variant, mode, auxv_content, expected_error)
+  end
   # a second cache at another base, mapped by a fresh process, enumerates its own regions
   other = '0x1c0000000'
   out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/other", '--base', other)
   abort out unless st.success?
-  out, st = Open3.capture2e("#{dir}/test", "#{dir}/other")
+  out, st = Open3.capture2e("#{dir}/test", "#{dir}/other", 'leave')
   puts "#{out[/^RESULT .*$/] == 'RESULT ok' && st.success? ? 'ok  ' : 'FAIL'} valid at #{other}"
   failures += 1 unless out[/^RESULT .*$/] == 'RESULT ok' && st.success?
   abort "#{failures} split-cache mapping scenario(s) failed" unless failures.zero?
-  puts 'PASS split cache mapping, plain rebase, authenticated entries untouched and counted, and image lookup'
+  puts 'PASS split cache mapping, plain rebase, authenticated entries signed (or left alone on request), PAC-less hosts rejected, and image lookup'
 end

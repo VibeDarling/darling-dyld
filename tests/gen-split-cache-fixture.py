@@ -14,6 +14,7 @@ import struct
 import sys
 
 PAGE = 0x4000
+STUB_SLOT_OFF = 3 * PAGE + 0x100 + 8 * 2   # entry 2 of the page-3 matrix: IA, address diversity, diversity 0
 REGION_SIZE = 0x40000
 INSTALL_NAME = b"/usr/lib/libmini.dylib"
 
@@ -32,7 +33,7 @@ VARIANTS = [
     "sub_first_mapping_offset", "bad_alignment", "sub_bad_magic", "sub_bad_platform", "sub_wx_prot", "sub_bad_prot_bits",
     "main_wx", "slide_outside_file", "sub_outside_region", "chain_start_unaligned", "main_count_mismatch", "page_starts_range",
     "page_starts_truncated", "chain_leaves_page", "chain_start_outside", "unknown_slide_version",
-    "target_outside_region", "bad_page_size",
+    "target_outside_region", "bad_page_size", "auth_target_outside_region", "no_auth",
 ]
 
 
@@ -76,9 +77,21 @@ def build(base, variant):
     macho = bytearray(PAGE)
     lc_name = INSTALL_NAME + b"\0"
     lc_size = (24 + len(lc_name) + 7) & ~7
-    struct.pack_into("<IIIIIIII", macho, 0, 0xFEEDFACF, 0x0100000C, 0x80000002, 6, 1, lc_size, 0, 0)
+    struct.pack_into("<IIIIIIII", macho, 0, 0xFEEDFACF, 0x0100000C, 0x80000002, 6, 2, lc_size + 152, 0, 0)
     struct.pack_into("<IIIIII", macho, 32, 0xD, lc_size, 24, 2, 0x10000, 0x10000)
     macho[32 + 24:32 + 24 + len(lc_name)] = lc_name
+    # A __TEXT segment with one 16-byte __auth_stubs entry, the arm64e stub shape
+    # (adrp x17; add x17, x17, #lo12; ldr x16, [x17]; braa x16, x17) loading from the matrix slot whose entry is
+    # IA, address-diversified, diversity 0 (the shape real stubs have; see tests/real-cache-check.rb).
+    stub_addr = image_addr + 0x400
+    got_slot = base + 0x10000 + STUB_SLOT_OFF
+    pages = ((got_slot >> 12) - (stub_addr >> 12)) & 0x1FFFFF
+    stub = struct.pack("<IIII", 0x90000000 | ((pages & 3) << 29) | ((pages >> 2) << 5) | 17,
+                       0x91000231 | ((got_slot & 0xFFF) << 10), 0xF9400230, 0xD71F0A11)
+    sect = struct.pack("<16s16sQQIIIIIIII", b"__auth_stubs", b"__TEXT", stub_addr, len(stub), 0x400, 2, 0, 0, 0x80000408, 0, 16, 0)
+    struct.pack_into("<II16sQQQQIIII", macho, 32 + lc_size, 0x19, 152, b"__TEXT", image_addr, PAGE, 0, PAGE, 5, 5, 1, 0)
+    macho[32 + lc_size + 72:32 + lc_size + 152] = sect
+    macho[0x400:0x400 + len(stub)] = stub
     sub1_addr = {"sub_overlap": text_addr - 0x4000, "sub_outside_region": base + REGION_SIZE}.get(v, text_addr)
     h1 = header(sub1_addr, 0,
                 magic=b"dyld_v1   arm64" if v == "sub_bad_magic" else b"dyld_v1  arm64e",
@@ -112,6 +125,16 @@ def build(base, variant):
         PAGE + 0x28: plain(rt(0x10040), 0x80, 4),
         PAGE + 0x48: auth(rt(0xC100), 0x0042, 0, 0, 0),
     }
+    if v == "no_auth":
+        chain[PAGE + 0x20] = plain(rt(0xC040), 0, 1)
+        chain[PAGE + 0x48] = plain(rt(0xC100), 0, 0)
+    # page 3 (auth_target_outside_region: its first entry is out of range, after the page-1 slots were already signed):
+    # every key x address-diversity x diversity edge (0 and 0xffff), as one chain of 8 entries
+    matrix = [(key, addr_div, div) for key in (0, 1) for addr_div in (0, 1) for div in (0, 0xFFFF)]
+    assert matrix[2] == (0, 1, 0)
+    for i, (key, addr_div, div) in enumerate([] if v == "no_auth" else matrix):
+        target = rt(REGION_SIZE + 0x4000) if (v == "auth_target_outside_region" and i == 0) else rt(0xC200 + 0x40 * i)
+        chain[3 * PAGE + 0x100 + 8 * i] = auth(target, div, addr_div, key, 1 if i + 1 < len(matrix) else 0)
     last = {2 * PAGE + 0x3FF8: plain(rt(0x4010), 0, 0)}  # page 2: a one-entry chain in the last slot
     if v == "chain_leaves_page":
         last[2 * PAGE + 0x3FF8] = plain(rt(0x4010), 0, 1)
@@ -123,10 +146,10 @@ def build(base, variant):
     for off, raw in list(chain.items()) + list(last.items()):
         struct.pack_into("<Q", data, off, raw)
     slots = {}
-    for off in (PAGE + 0x18, 3 * PAGE):
+    for off in (PAGE + 0x18, 3 * PAGE, 3 * PAGE + 0xF8):
         slots[data_addr + off] = struct.unpack_from("<Q", data, off)[0]
 
-    starts = [0xFFFF, 0x10, 0x3FF8, 0xFFFF]
+    starts = [0xFFFF, 0x10, 0x3FF8, 0xFFFF if v == "no_auth" else 0x100]
     count = npages
     version = 5
     page_size = PAGE
@@ -205,18 +228,21 @@ def build(base, variant):
 
     # ---- values the tests expect after mapping
     expect = []
+    auth_lines = []
     plain_n = auth_n = 0
     for off, raw in sorted(list(chain.items()) + list(last.items())):
         if raw >> 63:
             auth_n += 1
-            expect.append((data_addr + off, raw))
+            auth_lines.append("auth 0x%x 0x%x %d %d 0x%x 0x%x" % (
+                data_addr + off, value_add + (raw & (2 ** 34 - 1)), (raw >> 51) & 1, (raw >> 50) & 1, (raw >> 34) & 0xFFFF, raw))
         else:
             plain_n += 1
             expect.append((data_addr + off, (value_add + (raw & (2 ** 34 - 1))) | (((raw >> 34) & 0xFF) << 56)))
     manifest = ["base 0x%x" % base,
                 "image 0x%x %s" % (image_addr, INSTALL_NAME.decode()),
-                "stats files=3 mappings=3 pages=2 plain=%d auth=%d" % (plain_n, auth_n),
+                "stats files=3 mappings=3 pages=%d plain=%d auth=%d" % (len([x for x in starts if x != 0xFFFF]), plain_n, auth_n),
                 "region 0x%x 0x%x" % (base, REGION_SIZE)]
+    manifest += auth_lines
     manifest += ["expect 0x%x 0x%x" % (a, val) for a, val in expect]
     manifest += ["untouched 0x%x 0x%x" % (a, val) for a, val in sorted(slots.items())]
     return files, "\n".join(manifest) + "\n"
