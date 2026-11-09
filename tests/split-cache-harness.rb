@@ -4,24 +4,30 @@ require 'open3'
 
 module SplitCacheHarness
   # The stubbed export trie finds nothing; the real-cache check declares trieWalk and defines it itself.
+  SIGN_DECL = 'struct ChainedFixupPointerOnDisk { struct Arm64e { static uint64_t signPointer(uint64_t, void*, bool, uint16_t, uint8_t); }; };'
   NO_TRIE = <<~STUB.strip
-    struct MachOLoaded { static const uint8_t *trieWalk(Diagnostics&, const uint8_t*, const uint8_t*, const char*) { return nullptr; } };
+    struct MachOLoaded { #{SIGN_DECL} static const uint8_t *trieWalk(Diagnostics&, const uint8_t*, const uint8_t*, const char*) { return nullptr; } };
           struct MachOFile { static uint64_t read_uleb128(Diagnostics&, const uint8_t*&, const uint8_t*) { return 0; } };
   STUB
   REAL_TRIE = <<~STUB.strip
-    struct MachOLoaded { static const uint8_t *trieWalk(Diagnostics&, const uint8_t*, const uint8_t*, const char*); };
+    struct MachOLoaded { #{SIGN_DECL} static const uint8_t *trieWalk(Diagnostics&, const uint8_t*, const uint8_t*, const char*); };
           struct MachOFile { static uint64_t read_uleb128(Diagnostics&, const uint8_t*&p, const uint8_t*end) { uint64_t r = 0; int sh = 0; while (p < end) { uint8_t b = *p++; r |= (uint64_t)(b & 0x7f) << sh; sh += 7; if (!(b & 0x80)) break; } return r; } };
   STUB
 
   # C++ source up to and including "using namespace dyld3;".
   def self.prefix(root, real_trie: false)
     runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
+    loaded_src = File.read("#{root}/dyld3/MachOLoaded.cpp")
     cache_src = File.read("#{root}/dyld3/shared-cache/DyldSharedCache.cpp")
     runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
     reservation = runtime[/static int mmapProtection\(.*?^\}/m].to_s + "\n" + (runtime[/class DarlingCacheReservation \{.*?^\};/m] or abort 'reservation missing')
     range_helper = runtime[/static bool cacheRangeContains\(.*?(?=^static bool preflightCacheFile)/m] or abort 'range helpers missing'
+    # The one signing routine, taken from the dyld source rather than copied.
+    sign_pointer = loaded_src[/^#if !__has_feature\(ptrauth_calls\) && \(defined\(__aarch64__\).*?^uint64_t MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer\(uint64_t unsignedAddr.*?^\}/m] or abort 'signPointer missing'
     split_code = runtime[/^static const uint32_t kSplitMaxFileMappings.*?^bool mapSplitCachePrivate\(.*?^\}/m] or abort 'split mapper missing'
-    stats_struct = runtime_h[/struct SplitCacheMapStats \{.*?^\};/m] or abort 'stats struct missing'
+    stats_struct = (runtime_h[/enum SplitCacheAuthMode \{.*?^\};/m] or abort 'auth mode enum missing') + "\n" +
+                   (runtime_h[/struct SplitCacheMapStats \{.*?^\};/m] or abort 'stats struct missing') + "\n" +
+                   (runtime_h[/^bool mapSplitCachePrivate\(.*?;/m] or abort 'mapper declaration missing')
     image_funcs = %w[imageTable isSplitCache forEachRegion forEachImage getIndexedImageEntry getIndexedImagePath
                      findMachHeaderImageIndex hasImagePath mappedSize].map do |name|
       cache_src[/^[^\n]*\bDyldSharedCache::#{name}\(.*?^\}/m] or abort "#{name} missing"
@@ -59,6 +65,7 @@ module SplitCacheHarness
     struct Diagnostics {};
     namespace dyld3 {
       #{real_trie ? REAL_TRIE : NO_TRIE}
+      #{sign_pointer}
     }
     struct DyldSharedCache {
       dyld_cache_header header;
@@ -78,7 +85,9 @@ module SplitCacheHarness
     namespace dyld3 {
       struct SharedCacheLoadInfo { const DyldSharedCache *loadAddress; long slide; const char *errorMessage; char path[256]; };
       #{stats_struct}
-      static int open(const char *path, int flags, int mode) { return ::open(path, flags, mode); }
+      // Tests point gAuxvPath at a fabricated auxiliary vector to simulate a host without pointer authentication.
+      static const char *gAuxvPath = "/proc/self/auxv";
+      static int open(const char *path, int flags, int mode) { return ::open(strcmp(path, "/proc/self/auxv") == 0 ? gAuxvPath : path, flags, mode); }
       #{reservation}
       #{range_helper}
       #{split_code}

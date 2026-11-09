@@ -1216,7 +1216,7 @@ static bool mapCachePrivate(const SharedCacheOptions& options, SharedCacheLoadIn
 
 #if defined(DARLING) && !TARGET_OS_SIMULATOR
 // Split caches (a main file plus ".NN" sub-cache files) mapped privately at their preferred address.
-// Plain slide-info-v5 entries are rebased; authenticated ones are left for the signing stage.
+// Plain slide-info-v5 entries are rebased; authenticated ones are signed with this process's keys.
 
 static const uint32_t kSplitMaxFileMappings = 16;
 static const uint32_t kSplitMaxMappings     = 64;
@@ -1251,12 +1251,66 @@ static bool preadAll(int fd, uint64_t offset, void* buffer, size_t length)
     return true;
 }
 
-// Rebases the plain entries of one mapping's slide info in place (slide 0). Any structural doubt is an
-// error: nothing here is allowed to write outside the page its chain started in.
-static bool rebaseSlideInfoV5Plain(uint8_t* mappingContent, uint64_t mappingSize,
-                                   uint64_t sharedRegionStart, uint64_t sharedRegionSize,
-                                   const uint8_t* slideInfo, uint64_t slideInfoSize,
-                                   SplitCacheMapStats* stats, const char** error)
+// Why signing is impossible on this host, or nullptr when it is possible. dyld is a Darwin binary and has no
+// getauxval(), so AT_HWCAP is read from the auxiliary vector the host kernel exposes (arm64 HWCAP_PACA).
+static const char* splitCachePointerAuthError()
+{
+#if defined(__aarch64__) || defined(__arm64__)
+    static const uint64_t kAtNull = 0;
+    static const uint64_t kAtHwcap = 16;
+    static const uint64_t kHwcapPaca = 1ULL << 30;
+    const int fd = dyld3::open("/proc/self/auxv", O_RDONLY, 0);
+    if ( fd == -1 )
+        return "split cache has authenticated pointers but the host auxiliary vector cannot be opened to check pointer authentication";
+    const char* error = "split cache has authenticated pointers but the host auxiliary vector has no AT_HWCAP";
+    for (uint64_t i = 0; i != 128; ++i) {
+        uint64_t entry[2];
+        if ( !preadAll(fd, i * sizeof(entry), entry, sizeof(entry)) ) {
+            error = "split cache has authenticated pointers but the host auxiliary vector is unreadable";
+            break;
+        }
+        if ( entry[0] == kAtNull )
+            break;
+        if ( entry[0] == kAtHwcap ) {
+            error = ((entry[1] & kHwcapPaca) != 0) ? nullptr
+                  : "split cache has authenticated pointers but the host has no pointer authentication (HWCAP_PACA is not set)";
+            break;
+        }
+    }
+    ::close(fd);
+    return error;
+#else
+    return "split cache has authenticated pointers but pointer authentication needs an arm64 host";
+#endif
+}
+
+struct SplitAuthPolicy {
+    SplitCacheAuthMode  mode;
+    bool                verified;   // the host check runs once, when the first authenticated entry is met
+};
+
+static bool splitTarget(const dyld_cache_slide_info5& header, uint64_t runtimeOffset, uint64_t sharedRegionStart,
+                        uint64_t sharedRegionSize, uint64_t* target, const char** error)
+{
+    if ( header.value_add > UINT64_MAX - runtimeOffset ) {
+        *error = "split cache slide info target overflows";
+        return false;
+    }
+    *target = header.value_add + runtimeOffset;
+    if ( !cacheRangeContains(sharedRegionStart, sharedRegionSize, *target, 0) ) {
+        *error = "split cache slide info target lies outside the cache region";
+        return false;
+    }
+    return true;
+}
+
+// Rebases the entries of one mapping's slide info in place (slide 0): plain ones become pointers, authenticated
+// ones are signed (or left, per the policy). Any structural doubt is an error: nothing here is allowed to
+// write outside the page its chain started in.
+static bool rebaseSlideInfoV5(uint8_t* mappingContent, uint64_t mappingSize,
+                              uint64_t sharedRegionStart, uint64_t sharedRegionSize,
+                              const uint8_t* slideInfo, uint64_t slideInfoSize,
+                              SplitAuthPolicy* policy, SplitCacheMapStats* stats, const char** error)
 {
     if ( slideInfoSize < sizeof(dyld_cache_slide_info5) ) {
         *error = "split cache slide info is truncated";
@@ -1301,20 +1355,28 @@ static bool rebaseSlideInfoV5Plain(uint8_t* mappingContent, uint64_t mappingSize
             uint64_t* location = (uint64_t*)(pageContent + offset);
             dyld_cache_slide_pointer5 pointer;
             pointer.raw = *location;
+            uint64_t target;
             if ( pointer.auth.auth ) {
-                ++stats->authLeftAlone;
+                if ( policy->mode == kSplitCacheAuthLeaveAlone ) {
+                    ++stats->authLeftAlone;
+                }
+                else {
+                    if ( !policy->verified ) {
+                        if ( (*error = splitCachePointerAuthError()) != nullptr )
+                            return false;
+                        policy->verified = true;
+                    }
+                    if ( !splitTarget(header, pointer.auth.runtimeOffset, sharedRegionStart, sharedRegionSize, &target, error) )
+                        return false;
+                    // Slide info key bit: 0 = IA, 1 = DA; signPointer() numbers the keys IA, IB, DA, DB.
+                    *location = MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(target, location, pointer.auth.addrDiv,
+                                    (uint16_t)pointer.auth.diversity, pointer.auth.keyIsData ? 2 : 0);
+                    ++stats->authSigned;
+                }
             }
             else {
-                const uint64_t runtimeOffset = pointer.regular.runtimeOffset;
-                if ( header.value_add > UINT64_MAX - runtimeOffset ) {
-                    *error = "split cache slide info target overflows";
+                if ( !splitTarget(header, pointer.regular.runtimeOffset, sharedRegionStart, sharedRegionSize, &target, error) )
                     return false;
-                }
-                const uint64_t target = header.value_add + runtimeOffset;
-                if ( !cacheRangeContains(sharedRegionStart, sharedRegionSize, target, 0) ) {
-                    *error = "split cache slide info target lies outside the cache region";
-                    return false;
-                }
                 *location = target | ((uint64_t)pointer.regular.high8 << 56);
                 ++stats->plainRebased;
             }
@@ -1408,14 +1470,19 @@ static const char* loadSplitFileMappings(int fd, uint64_t fileLength, const dyld
 // - No translateDarlingCacheTSD pass: the TSD rewrite and its veneer reach for a split cache is a separate design.
 // - Protections: each mapping gets its raw initProt, whereas the legacy mapCachePrivate path adds VM_PROT_WRITE to a
 //   DATA_CONST mapping unless gEnableSharedCacheDataConst is set. Revisit when dyld starts binding into the cache.
-// - Authenticated pointers stay in their on-disk form (counted in the stats) until the signing stage.
-bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLoadInfo* results, SplitCacheMapStats* stats)
+// - Authenticated pointers are signed with the running process's own keys; this never changes, resets or
+//   disables a key, it only executes the PAC instructions.
+// - authMode defaults to signing, the production behaviour; kSplitCacheAuthLeaveAlone (and authLeftAlone) exist for
+//   host tests on machines without PAC and for no other caller.
+bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLoadInfo* results, SplitCacheMapStats* stats,
+                          SplitCacheAuthMode authMode)
 {
     memset(stats, 0, sizeof(*stats));
     results->loadAddress = nullptr;
     results->slide = 0;
     results->errorMessage = nullptr;
 
+    SplitAuthPolicy policy = { authMode, false };
     SplitCacheFiles files;
     SplitMapping mappings[kSplitMaxMappings];
     uint32_t mappingCount = 0;
@@ -1532,7 +1599,7 @@ bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLo
         void* content = (void*)(uintptr_t)info.address;
         ok = (::mprotect(content, (size_t)info.size, PROT_READ | PROT_WRITE) == 0);
         if ( ok )
-            ok = rebaseSlideInfoV5Plain((uint8_t*)content, info.size, regionStart, regionSize, slideInfo, info.slideInfoFileSize, stats, &error);
+            ok = rebaseSlideInfoV5((uint8_t*)content, info.size, regionStart, regionSize, slideInfo, info.slideInfoFileSize, &policy, stats, &error);
         else
             error = "could not make split cache data writable for rebasing";
         ::free(slideInfo);
@@ -1555,9 +1622,9 @@ bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLo
     results->loadAddress = (const DyldSharedCache*)(uintptr_t)regionStart;
     strlcpy(results->path, mainCachePath, sizeof(results->path));
     if ( verbose ) {
-        dyld::log("mapped split dyld cache private to process (%s): %u mappings in %u files, %llu plain pointers rebased, %llu authenticated pointers left unsigned\n",
-                  results->path, mappingCount, files.count,
-                  (unsigned long long)stats->plainRebased, (unsigned long long)stats->authLeftAlone);
+        dyld::log("mapped split dyld cache private to process (%s): %u mappings in %u files, %llu plain pointers rebased, %llu authenticated pointers signed, %llu authenticated pointers left in on-disk form\n",
+                  results->path, mappingCount, files.count, (unsigned long long)stats->plainRebased,
+                  (unsigned long long)stats->authSigned, (unsigned long long)stats->authLeftAlone);
     }
     reservation.keep();
     return true;

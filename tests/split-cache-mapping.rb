@@ -98,7 +98,7 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
       fclose(manifest);
 
       SharedCacheLoadInfo result = {}; SplitCacheMapStats stats;
-      bool ok = mapSplitCachePrivate((dir + "/cache").c_str(), true, &result, &stats);
+      bool ok = mapSplitCachePrivate((dir + "/cache").c_str(), true, &result, &stats, kSplitCacheAuthLeaveAlone);
       if (!ok) {
         assert(result.errorMessage && !result.loadAddress);
         // A failed map must leave the whole region free again.

@@ -53,18 +53,28 @@ struct SharedCacheLoadInfo {
 bool loadDyldCache(const SharedCacheOptions& options, SharedCacheLoadInfo* results);
 
 #if defined(DARLING)
+// What mapSplitCachePrivate() does with authenticated slide-info entries. Signing is the production behaviour and
+// the default; kSplitCacheAuthLeaveAlone exists only for the host tests on machines without pointer
+// authentication and has no other caller.
+enum SplitCacheAuthMode {
+    kSplitCacheAuthSign,        // sign them with this process's own keys; fails when the host has no pointer authentication
+    kSplitCacheAuthLeaveAlone,  // keep them in their on-disk chain form (hosts without pointer authentication)
+};
+
 // Counts reported by mapSplitCachePrivate().
 struct SplitCacheMapStats {
     uint32_t    files;
     uint32_t    mappings;
     uint64_t    pagesWithChains;
     uint64_t    plainRebased;
+    uint64_t    authSigned;         // authenticated pointers, signed with this process's keys
     uint64_t    authLeftAlone;      // authenticated pointers, still in their on-disk form
 };
 
 // Maps a split cache (the main file at mainCachePath plus the sub-cache files its header lists, found by
 // appending each suffix to that path) privately at its preferred address. Not called by dyld yet.
-bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLoadInfo* results, SplitCacheMapStats* stats);
+bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLoadInfo* results, SplitCacheMapStats* stats,
+                          SplitCacheAuthMode authMode = kSplitCacheAuthSign);
 #endif
 
 
