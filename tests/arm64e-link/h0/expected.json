@@ -1,0 +1,22 @@
+{
+  "load_dylibs": [
+    {"path": "/usr/lib/libz.1.dylib", "compat": "1.0.0"},
+    {"path": "/usr/lib/libSystem.B.dylib", "compat": "1.0.0"}
+  ],
+  "imports": [
+    {"name": "_zlibVersion", "lib": "/usr/lib/libz.1.dylib"},
+    {"name": "_compress", "lib": "/usr/lib/libz.1.dylib"},
+    {"name": "_uncompress", "lib": "/usr/lib/libz.1.dylib"},
+    {"name": "_crc32", "lib": "/usr/lib/libz.1.dylib"},
+    {"name": "_adler32", "lib": "/usr/lib/libz.1.dylib"},
+    {"name": "_deflateInit_", "lib": "/usr/lib/libz.1.dylib"},
+    {"name": "_deflate", "lib": "/usr/lib/libz.1.dylib"},
+    {"name": "_deflateEnd", "lib": "/usr/lib/libz.1.dylib"},
+    {"name": "_inflateInit_", "lib": "/usr/lib/libz.1.dylib"},
+    {"name": "_inflate", "lib": "/usr/lib/libz.1.dylib"},
+    {"name": "_inflateEnd", "lib": "/usr/lib/libz.1.dylib"},
+    {"name": "_write", "lib": "/usr/lib/libSystem.B.dylib"}
+  ],
+  "build_version": {"minos": "13.0.0", "sdk": "13.0.0"},
+  "auth_bind": {"key": "IA", "addr_div": true, "diversity": 0}
+}

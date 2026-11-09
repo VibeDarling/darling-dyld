@@ -31,6 +31,12 @@ Dir.mktmpdir('cache-alias-lookup-') do |dir|
       uint32_t trieIndex=0;
       bool trieFound=true;
       dyld3::closure::ImageArray array;
+      bool split=false; uint32_t splitOffset=0,splitCount=0;
+      bool isSplitCache() const { return split; }
+      const dyld_cache_image_info *imageTable(uint32_t &count) const {
+        count=split?splitCount:header.imagesCount;
+        return (const dyld_cache_image_info*)((const char*)this+(split?splitOffset:header.imagesOffset));
+      }
       bool hasImagePath(const char *path,uint32_t &index) const {
         index=trieIndex; return trieFound && strcmp(path,"alias")==0;
       }
@@ -73,6 +79,14 @@ Dir.mktmpdir('cache-alias-lookup-') do |dir|
       assert(result.image==&f.cache.array.image);
       assert((uintptr_t)result.mhInCache==(uintptr_t)&f.cache+64);
       assert(strcmp(result.pathInCache,"closure-image")==0);
+      // A split cache reads its own table even though a closure ImageArray is advertised, and the
+      // alias index is bounded by that table, not by the (empty) legacy one.
+      f.cache.split=true; f.cache.header.imagesCount=0;
+      f.cache.splitOffset=offsetof(Fixture,images); f.cache.splitCount=1; f.cache.trieIndex=0;
+      assert(findInSharedCacheImage(load,"alias",&result) && !result.image);
+      assert(strcmp(result.pathInCache,"canonical")==0 && (uintptr_t)result.mhInCache==0x102000);
+      f.cache.trieIndex=1; assert(!findInSharedCacheImage(load,"alias",&result));
+      f.cache.splitCount=0; f.cache.trieIndex=0; assert(!findInSharedCacheImage(load,"canonical",&result));
       load.loadAddress=nullptr; assert(!findInSharedCacheImage(load,"alias",&result));
       puts("PASS actual cache alias lookup, index bounds, missing ImageArray, legacy scan and closure route");
     }

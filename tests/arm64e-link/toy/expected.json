@@ -1,0 +1,33 @@
+{
+  "_comment": "ld64 puts the negative addend of _exe_plain_bind_negative in a second _lib_array import (imports_format 3, DYLD_CHAINED_IMPORT_ADDEND64). Chained-fixup entry each global in toy_lib.c / toy_main.c must produce. at/target/import are [symbol, byte offset]; symbols keep the Mach-O underscore. Unqualified function pointers are signed IA/0 by the arm64e ABI, plain data pointers are not signed.",
+  "lib": {
+    "install_name": "@rpath/libtoy.dylib",
+    "fixups": [
+      {"at": ["_tbl_ia0", 0], "kind": "auth_rebase", "key": "IA", "addr_div": false, "diversity": 0, "target": ["_fn_a", 0]},
+      {"at": ["_tbl_ia_const", 0], "kind": "auth_rebase", "key": "IA", "addr_div": false, "diversity": 4660, "target": ["_fn_b", 0]},
+      {"at": ["_tbl_ib", 0], "kind": "auth_rebase", "key": "IB", "addr_div": false, "diversity": 8738, "target": ["_fn_c", 0]},
+      {"at": ["_tbl_da_addr", 0], "kind": "auth_rebase", "key": "DA", "addr_div": true, "diversity": 17185, "target": ["_lib_value", 0]},
+      {"at": ["_tbl_db_addr", 0], "kind": "auth_rebase", "key": "DB", "addr_div": true, "diversity": 85, "target": ["_lib_array", 8]},
+      {"at": ["_lib_vtable", 0], "kind": "auth_rebase", "key": "IA", "addr_div": true, "diversity": 16, "target": ["_fn_a", 0]},
+      {"at": ["_lib_vtable", 8], "kind": "auth_rebase", "key": "IA", "addr_div": true, "diversity": 17, "target": ["_fn_d", 0]},
+      {"at": ["_lib_vtable", 16], "kind": "auth_rebase", "key": "IA", "addr_div": true, "diversity": 18, "target": ["_fn_e", 0]},
+      {"at": ["_plain_ptr", 0], "kind": "rebase", "target": ["_lib_value", 0]},
+      {"at": ["_plain_fn", 0], "kind": "auth_rebase", "key": "IA", "addr_div": false, "diversity": 0, "target": ["_fn_c", 0]},
+      {"at": ["_sixteen_ptr", 0], "kind": "rebase", "target": ["_lib_value", 0], "section": "__TOY_SEGMENT_16,__toy_sixteen_ab"}
+    ]
+  },
+  "exe": {
+    "load_dylib": "@rpath/libtoy.dylib",
+    "imports": ["_fn_a", "_fn_b", "_lib_value", "_lib_array", "_lib_array"],
+    "fixups": [
+      {"at": ["_exe_auth_bind", 0], "kind": "auth_bind", "key": "IA", "addr_div": false, "diversity": 0, "import": "_fn_a", "addend": 0},
+      {"at": ["_exe_auth_bind_addr", 0], "kind": "auth_bind", "key": "IB", "addr_div": true, "diversity": 119, "import": "_fn_b", "addend": 0},
+      {"at": ["_exe_plain_bind", 0], "kind": "bind", "import": "_lib_value", "addend": 0},
+      {"at": ["_exe_plain_bind_addend", 0], "kind": "bind", "import": "_lib_array", "addend": 8},
+      {"at": ["_exe_plain_bind_negative", 0], "kind": "bind", "import": "_lib_array", "addend": -4},
+      {"at": ["_exe_plain_rebase", 0], "kind": "rebase", "target": ["_exe_data", 0]},
+      {"at": ["_exe_auth_rebase", 0], "kind": "auth_rebase", "key": "IA", "addr_div": false, "diversity": 153, "target": ["_local_fn", 0]}
+    ],
+    "auth_got": {"section": "__DATA_CONST,__auth_got", "kind": "auth_bind", "key": "IA", "addr_div": true, "diversity": 0, "imports": ["_fn_a"]}
+  }
+}
