@@ -938,6 +938,316 @@ DyldSharedCache::DataConstScopedWriter::DataConstScopedWriter(const DyldSharedCa
     : writer(cache, machTask, logFunc) {
     writer.makeWriteable();
 }
+
+// ---- version 4 patch info of a split cache (reader) ----
+// A real cache has an 88 MB patch info that comes from a file, so nothing is read before its extent is checked.
+// The header and the array extents are checked on every use (nine comparisons), the slices of one exporter when
+// that exporter is used, and the whole table only by checkPatchInfoV4(), which is for tools and tests.
+namespace {
+
+struct PatchMapping {
+    uint64_t    address;
+    uint64_t    size;
+    uint64_t    flags;
+    uint32_t    initProt;
+    bool        hasSlideInfo;
+};
+
+struct PatchMappings {
+    PatchMapping    all[(kMaxSplitSubCaches + 1) * kMaxSplitFileMappings];
+    uint32_t        count = 0;
+};
+
+struct PatchTablesV4 {
+    dyld_cache_patch_info_v4                    info;
+    const dyld_cache_image_patches_v4*          patches;
+    const dyld_cache_patchable_export_v4*       exports;
+    const dyld_cache_patch_client_v4*           clients;
+    const dyld_cache_patch_client_export_v4*    clientExports;
+    const dyld_cache_patchable_location_v4*     locations;
+    const dyld_cache_image_got_clients_v4*      gotClients;
+    const dyld_cache_got_client_export_v4*      gotExports;
+    const dyld_cache_patchable_got_location_v4* gotLocations;
+    const char*                                 names;
+    const dyld_cache_image_info*                images;
+    uint32_t                                    imageCount;
+    uint64_t                                    unslidBase;     // the cache offsets of the GOT table are relative to this
+    uint64_t                                    slide;
+};
+
+// Where the slices of one image start, so that the slices of successive images can be checked to tile their arrays.
+// UINT64_MAX means "adopt the first slice's start" (a lazily checked exporter has no predecessor to compare with).
+struct PatchCursors {
+    uint64_t    clients, exports, clientExports, locations, gotExports, gotLocations;
+    explicit PatchCursors(uint64_t start) : clients(start), exports(start), clientExports(start), locations(start), gotExports(start), gotLocations(start) {}
+};
+
+}
+
+static const char* const kPatchErrNotMapped      = "patch info lies outside the cache mappings";
+static const char* const kPatchErrVersion        = "patch info is not version 4 with patch location version 0";
+static const char* const kPatchErrBounds[9]      = {
+    "patch info patchTable array lies outside the patch info", "patch info imageExports array lies outside the patch info",
+    "patch info clients array lies outside the patch info", "patch info clientExports array lies outside the patch info",
+    "patch info locations array lies outside the patch info", "patch info exportNames lies outside the patch info",
+    "patch info gotClients array lies outside the patch info", "patch info gotClientExports array lies outside the patch info",
+    "patch info gotLocations array lies outside the patch info" };
+static const char* const kPatchErrOverlap        = "patch info arrays overlap";
+static const char* const kPatchErrAlign          = "patch info array is not 4-byte aligned";
+static const char* const kPatchErrTableCount     = "patch info per-image tables do not match the image count";
+static const char* const kPatchErrImage          = "patch info image index lies outside the cache";
+static const char* const kPatchErrClientsTile    = "patch info client slices do not tile the clients array";
+static const char* const kPatchErrExportsTile    = "patch info export slices do not tile the exports array";
+static const char* const kPatchErrClientImage    = "patch info client names an image outside the cache";
+static const char* const kPatchErrCExportsTile   = "patch info client export slices do not tile the clientExports array";
+static const char* const kPatchErrExportIndex    = "patch info client export lies outside its exporter's exports";
+static const char* const kPatchErrLocationsTile  = "patch info location slices do not tile the locations array";
+static const char* const kPatchErrExportName     = "patch info export name lies outside the names or is not terminated";
+static const char* const kPatchErrLocation       = "patch info location lies outside the mappings that carry slide info";
+static const char* const kPatchErrGotTile        = "patch info GOT client slices do not tile the gotClientExports array";
+static const char* const kPatchErrGotExportIndex = "patch info GOT export lies outside its exporter's exports";
+static const char* const kPatchErrGotLocsTile    = "patch info GOT location slices do not tile the gotLocations array";
+static const char* const kPatchErrGotLocation    = "patch info GOT location lies outside the mappings that carry slide info";
+static const char* const kPatchErrGotReserved    = "patch info GOT location has a nonzero reserved word";
+
+static bool patchMappings(const DyldSharedCache* cache, PatchMappings* maps)
+{
+    const dyld_cache_mapping_and_slide_info* tables[kMaxSplitSubCaches + 1];
+    uint32_t counts[kMaxSplitSubCaches + 1];
+    uint32_t files;
+    if ( !splitCacheTables(cache, tables, counts, &files) )
+        return false;
+    maps->count = 0;
+    for (uint32_t f = 0; f != files; ++f) {
+        for (uint32_t i = 0; i != counts[f]; ++i) {
+            const dyld_cache_mapping_and_slide_info& m = tables[f][i];
+            maps->all[maps->count++] = { m.address, m.size, m.flags, m.initProt, m.slideInfoFileSize != 0 };
+        }
+    }
+    return true;
+}
+
+// [address, address + size) lies inside one mapping; with needSlideInfo, inside one that carries slide info
+static const PatchMapping* patchMappingContaining(const PatchMappings& maps, uint64_t address, uint64_t size, bool needSlideInfo)
+{
+    for (uint32_t i = 0; i != maps.count; ++i) {
+        if ( (!needSlideInfo || maps.all[i].hasSlideInfo) && dyld_cache_range_contains(maps.all[i].address, maps.all[i].size, address, size) )
+            return &maps.all[i];
+    }
+    return nullptr;
+}
+
+static bool patchSliceInside(uint64_t start, uint64_t count, uint64_t total)
+{
+    return start <= total && count <= total - start;
+}
+
+// The next slice has to begin where the previous one ended, and has to lie inside its array.
+static bool patchTile(uint64_t* cursor, uint64_t start, uint64_t count, uint64_t total)
+{
+    if ( *cursor == UINT64_MAX )
+        *cursor = start;
+    if ( (start != *cursor) || !patchSliceInside(start, count, total) )
+        return false;
+    *cursor = start + count;
+    return true;
+}
+
+static bool patchNameOk(const PatchTablesV4& t, uint32_t nameKind)
+{
+    const uint64_t offset = nameKind & 0x0fffffffu;
+    return offset < t.info.exportNamesSize && memchr(t.names + offset, 0, t.info.exportNamesSize - offset) != nullptr;
+}
+
+static const char* openPatchTablesV4(const DyldSharedCache* cache, const PatchMappings& maps, PatchTablesV4* t)
+{
+    const dyld_cache_header& h = cache->header;
+    if ( !cache->isSplitCache() || (h.patchInfoAddr == 0) || (h.patchInfoSize < sizeof(dyld_cache_patch_info_v4))
+      || (patchMappingContaining(maps, h.patchInfoAddr, h.patchInfoSize, false) == nullptr) )
+        return kPatchErrNotMapped;
+    t->unslidBase = cache->unslidLoadAddress();
+    t->slide = (uint64_t)(uintptr_t)cache - t->unslidBase;
+    memcpy(&t->info, (const void*)(uintptr_t)(h.patchInfoAddr + t->slide), sizeof(t->info));
+    const dyld_cache_patch_info_v4& info = t->info;
+    if ( (info.patchTableVersion != 4) || (info.patchLocationVersion != 0) )
+        return kPatchErrVersion;
+
+    struct Array { uint64_t address, count, stride; };
+    const Array arrays[9] = {
+        { info.patchTableArrayAddr, info.patchTableArrayCount, sizeof(dyld_cache_image_patches_v4) },
+        { info.imageExportsArrayAddr, info.imageExportsArrayCount, sizeof(dyld_cache_patchable_export_v4) },
+        { info.clientsArrayAddr, info.clientsArrayCount, sizeof(dyld_cache_patch_client_v4) },
+        { info.clientExportsArrayAddr, info.clientExportsArrayCount, sizeof(dyld_cache_patch_client_export_v4) },
+        { info.locationArrayAddr, info.locationArrayCount, sizeof(dyld_cache_patchable_location_v4) },
+        { info.exportNamesAddr, info.exportNamesSize, 1 },
+        { info.gotClientsArrayAddr, info.gotClientsArrayCount, sizeof(dyld_cache_image_got_clients_v4) },
+        { info.gotClientExportsArrayAddr, info.gotClientExportsArrayCount, sizeof(dyld_cache_got_client_export_v4) },
+        { info.gotLocationArrayAddr, info.gotLocationArrayCount, sizeof(dyld_cache_patchable_got_location_v4) },
+    };
+    uint64_t lengths[9];
+    for (unsigned i = 0; i != 9; ++i) {
+        if ( arrays[i].count > UINT64_MAX / arrays[i].stride )
+            return kPatchErrBounds[i];
+        lengths[i] = arrays[i].count * arrays[i].stride;
+        // arrays follow the header inside the patch info
+        if ( !dyld_cache_range_contains(h.patchInfoAddr + sizeof(info), h.patchInfoSize - sizeof(info), arrays[i].address, lengths[i]) )
+            return kPatchErrBounds[i];
+        if ( arrays[i].address % 4 != 0 )
+            return kPatchErrAlign;
+    }
+    for (unsigned i = 0; i != 9; ++i) {
+        for (unsigned j = i + 1; j != 9; ++j) {
+            if ( (lengths[i] != 0) && (lengths[j] != 0)
+              && (arrays[i].address < arrays[j].address + lengths[j]) && (arrays[j].address < arrays[i].address + lengths[i]) )
+                return kPatchErrOverlap;
+        }
+    }
+    const uint64_t slide = t->slide;
+    t->patches       = (const dyld_cache_image_patches_v4*)(uintptr_t)(info.patchTableArrayAddr + slide);
+    t->exports       = (const dyld_cache_patchable_export_v4*)(uintptr_t)(info.imageExportsArrayAddr + slide);
+    t->clients       = (const dyld_cache_patch_client_v4*)(uintptr_t)(info.clientsArrayAddr + slide);
+    t->clientExports = (const dyld_cache_patch_client_export_v4*)(uintptr_t)(info.clientExportsArrayAddr + slide);
+    t->locations     = (const dyld_cache_patchable_location_v4*)(uintptr_t)(info.locationArrayAddr + slide);
+    t->names         = (const char*)(uintptr_t)(info.exportNamesAddr + slide);
+    t->gotClients    = (const dyld_cache_image_got_clients_v4*)(uintptr_t)(info.gotClientsArrayAddr + slide);
+    t->gotExports    = (const dyld_cache_got_client_export_v4*)(uintptr_t)(info.gotClientExportsArrayAddr + slide);
+    t->gotLocations  = (const dyld_cache_patchable_got_location_v4*)(uintptr_t)(info.gotLocationArrayAddr + slide);
+    t->images        = cache->imageTable(t->imageCount);
+    if ( (info.patchTableArrayCount != t->imageCount) || (info.gotClientsArrayCount != t->imageCount) )
+        return kPatchErrTableCount;
+    return nullptr;
+}
+
+// One exporter's slices. The GOT part and the exports are always checked; the plain (client) part only when asked,
+// because libobjc alone has 765,442 plain locations. With cursors that start at UINT64_MAX the slices are only
+// checked to be contiguous among themselves; the whole-table pass starts them at 0 and so checks the tiling too.
+static const char* checkPatchExporterV4(const PatchTablesV4& t, const PatchMappings& maps, uint32_t image, bool includePlain,
+                                        PatchCursors* c)
+{
+    if ( image >= t.imageCount )
+        return kPatchErrImage;
+    const dyld_cache_image_patches_v4& p = t.patches[image];
+    if ( !patchTile(&c->exports, p.exportsStartIndex, p.exportsCount, t.info.imageExportsArrayCount) )
+        return kPatchErrExportsTile;
+    if ( !patchTile(&c->clients, p.clientsStartIndex, p.clientsCount, t.info.clientsArrayCount) )
+        return kPatchErrClientsTile;
+    for (uint64_t i = p.exportsStartIndex; i != (uint64_t)p.exportsStartIndex + p.exportsCount; ++i) {
+        if ( !patchNameOk(t, t.exports[i].nameKind) )
+            return kPatchErrExportName;
+    }
+    if ( includePlain ) {
+        for (uint64_t i = p.clientsStartIndex; i != (uint64_t)p.clientsStartIndex + p.clientsCount; ++i) {
+            const dyld_cache_patch_client_v4& client = t.clients[i];
+            if ( client.clientDylibIndex >= t.imageCount )
+                return kPatchErrClientImage;
+            if ( !patchTile(&c->clientExports, client.exportsStartIndex, client.exportsCount, t.info.clientExportsArrayCount) )
+                return kPatchErrCExportsTile;
+            for (uint64_t j = client.exportsStartIndex; j != (uint64_t)client.exportsStartIndex + client.exportsCount; ++j) {
+                const dyld_cache_patch_client_export_v4& e = t.clientExports[j];
+                if ( (e.imageExportIndex < p.exportsStartIndex) || (e.imageExportIndex - p.exportsStartIndex >= p.exportsCount) )
+                    return kPatchErrExportIndex;
+                if ( !patchTile(&c->locations, e.locationsStartIndex, e.locationsCount, t.info.locationArrayCount) )
+                    return kPatchErrLocationsTile;
+                const uint64_t imageAddress = t.images[client.clientDylibIndex].address;
+                for (uint64_t k = e.locationsStartIndex; k != (uint64_t)e.locationsStartIndex + e.locationsCount; ++k) {
+                    const uint32_t offset = t.locations[k].dylibOffsetOfUse;
+                    if ( (offset > UINT64_MAX - imageAddress) || (patchMappingContaining(maps, imageAddress + offset, sizeof(uint64_t), true) == nullptr) )
+                        return kPatchErrLocation;
+                }
+            }
+        }
+    }
+    const dyld_cache_image_got_clients_v4& g = t.gotClients[image];
+    if ( !patchTile(&c->gotExports, g.exportsStartIndex, g.exportsCount, t.info.gotClientExportsArrayCount) )
+        return kPatchErrGotTile;
+    for (uint64_t i = g.exportsStartIndex; i != (uint64_t)g.exportsStartIndex + g.exportsCount; ++i) {
+        const dyld_cache_got_client_export_v4& e = t.gotExports[i];
+        if ( (e.imageExportIndex < p.exportsStartIndex) || (e.imageExportIndex - p.exportsStartIndex >= p.exportsCount) )
+            return kPatchErrGotExportIndex;
+        if ( !patchTile(&c->gotLocations, e.locationsStartIndex, e.locationsCount, t.info.gotLocationArrayCount) )
+            return kPatchErrGotLocsTile;
+        for (uint64_t k = e.locationsStartIndex; k != (uint64_t)e.locationsStartIndex + e.locationsCount; ++k) {
+            const dyld_cache_patchable_got_location_v4& l = t.gotLocations[k];
+            const uint64_t offset = ((uint64_t)l.cacheOffsetHi << 32) | l.cacheOffsetLo;
+            if ( (offset > UINT64_MAX - t.unslidBase) || (patchMappingContaining(maps, t.unslidBase + offset, sizeof(uint64_t), true) == nullptr) )
+                return kPatchErrGotLocation;
+            if ( l.reserved != 0 )
+                return kPatchErrGotReserved;
+        }
+    }
+    return nullptr;
+}
+
+bool DyldSharedCache::hasPatchInfoV4() const
+{
+    if ( !isSplitCache() || (header.patchInfoAddr == 0) || (header.patchInfoSize < sizeof(dyld_cache_patch_info_v4)) )
+        return false;
+    PatchMappings maps;
+    if ( !patchMappings(this, &maps) || (patchMappingContaining(maps, header.patchInfoAddr, header.patchInfoSize, false) == nullptr) )
+        return false;
+    uint32_t version;
+    memcpy(&version, (const void*)(uintptr_t)(header.patchInfoAddr + ((uint64_t)(uintptr_t)this - unslidLoadAddress())), sizeof(version));
+    return version == 4;
+}
+
+const char* DyldSharedCache::checkPatchInfoV4Headers() const
+{
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    return openPatchTablesV4(this, maps, &t);
+}
+
+const char* DyldSharedCache::checkPatchInfoV4Exporter(uint32_t imageIndex) const
+{
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    if ( const char* error = openPatchTablesV4(this, maps, &t) )
+        return error;
+    PatchCursors cursors(UINT64_MAX);
+    return checkPatchExporterV4(t, maps, imageIndex, false, &cursors);
+}
+
+const char* DyldSharedCache::checkPatchInfoV4(PatchInfoV4Counts* counts) const
+{
+    memset(counts, 0, sizeof(*counts));
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    if ( const char* error = openPatchTablesV4(this, maps, &t) )
+        return error;
+    PatchCursors cursors(0);
+    for (uint32_t i = 0; i != t.imageCount; ++i) {
+        if ( const char* error = checkPatchExporterV4(t, maps, i, true, &cursors) )
+            return error;
+    }
+    const dyld_cache_patch_info_v4& info = t.info;
+    if ( cursors.exports != info.imageExportsArrayCount )
+        return kPatchErrExportsTile;
+    if ( cursors.clients != info.clientsArrayCount )
+        return kPatchErrClientsTile;
+    if ( cursors.clientExports != info.clientExportsArrayCount )
+        return kPatchErrCExportsTile;
+    if ( cursors.locations != info.locationArrayCount )
+        return kPatchErrLocationsTile;
+    if ( cursors.gotExports != info.gotClientExportsArrayCount )
+        return kPatchErrGotTile;
+    if ( cursors.gotLocations != info.gotLocationArrayCount )
+        return kPatchErrGotLocsTile;
+    counts->images = t.imageCount;
+    counts->exports = info.imageExportsArrayCount;
+    counts->clients = info.clientsArrayCount;
+    counts->plainLocations = info.locationArrayCount;
+    counts->gotExports = info.gotClientExportsArrayCount;
+    counts->gotLocations = info.gotLocationArrayCount;
+    return nullptr;
+}
+
+// ---- end of the patch info reader ----
 #endif
 
 #if !(BUILDING_LIBDYLD || BUILDING_DYLD)

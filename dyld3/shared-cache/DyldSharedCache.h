@@ -461,6 +461,21 @@ public:
 
         DataConstLazyScopedWriter writer;
     };
+
+    // Version 4 patch info of a split macOS cache (see dyld_cache_patch_info_v4). Every read is bounds-checked
+    // against the mapped patch info; the check functions return nullptr or a specific message.
+    struct PatchInfoV4Counts {
+        uint64_t    images, exports, clients, plainLocations, gotExports, gotLocations;
+    };
+
+    // A split cache whose patch info is version 4 and lies in a mapping. Nothing below is meaningful without it.
+    bool        hasPatchInfoV4() const;
+    // The header and the extents, bounds and alignment of the nine arrays: cheap, what the runtime does on every use.
+    const char* checkPatchInfoV4Headers() const;
+    // The headers plus everything one exporter's GOT slices and exports reach.
+    const char* checkPatchInfoV4Exporter(uint32_t imageIndex) const;
+    // The whole table, including every plain location: for tools and tests (88 MB in a real cache).
+    const char* checkPatchInfoV4(PatchInfoV4Counts* counts) const;
 #endif
 
 #if !(BUILDING_LIBDYLD || BUILDING_DYLD)
