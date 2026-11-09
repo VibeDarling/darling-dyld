@@ -1,7 +1,9 @@
 # Build the H0 test executable and its link-only stubs with the arm64e recipe and
 # check the result (structure only: nothing is executed on the guest side).
-# Needs Ruby, python3, clang, the in-tree ld64 and the Darling SDK.
-# Usage: LD64=/path/to/aarch64-apple-darwin20-ld SDKROOT=/path/to/MacOSX.sdk \
+# Needs Ruby, python3, clang and the in-tree ld64. SDKROOT (the Darling SDK) enables the
+# variant that links the SDK's libSystem.dylib; LIBZ_EXP (Darling's src/external/zlib/libz.exp)
+# enables the check that every stub symbol is exported by Apple's libz.
+# Usage: LD64=/path/to/aarch64-apple-darwin20-ld [SDKROOT=/path/to/MacOSX.sdk] [LIBZ_EXP=...] \
 #          ruby tests/arm64e-link/h0/arm64e-link-h0.rb
 # Also compiles the test program natively against the host libz (if available) to
 # check its logic and exit codes.
@@ -14,6 +16,7 @@ HERE = __dir__
 RECIPE_DIR = File.dirname(HERE)
 LD64 = ENV['LD64'].to_s
 SDKROOT = ENV['SDKROOT'].to_s
+LIBZ_EXP = ENV['LIBZ_EXP'].to_s
 
 $failures = 0
 
@@ -26,8 +29,8 @@ def check(desc, ok, detail = nil)
   end
 end
 
-unless !LD64.empty? && File.file?(LD64) && File.executable?(LD64) && !SDKROOT.empty? && File.directory?(SDKROOT)
-  puts 'SKIP arm64e-link-h0: set LD64 (in-tree ld64 binary) and SDKROOT (Darling SDK root)'
+unless !LD64.empty? && File.file?(LD64) && File.executable?(LD64)
+  puts 'SKIP arm64e-link-h0: set LD64 to the in-tree ld64 binary'
   exit 0
 end
 unless system('clang', '--version', out: File::NULL, err: File::NULL)
@@ -78,6 +81,7 @@ Dir.mktmpdir('arm64e-link-h0-') do |tmp|
     check('executable is arm64e (cpusubtype 2) and an executable', d['cpusubtype'] == 2 && d['filetype'] == 2)
     check('dependencies are exactly libz then libSystem', d['load_dylibs'] == [LIBZ, LIBSYSTEM], d['load_dylibs'].inspect)
     check('compat versions are 1.0.0 for both', d['load_dylib_versions'].map(&:last) == %w[1.0.0 1.0.0])
+    check('built for macOS 13.0 (minos and sdk)', d['build_versions'] == %w[13.0.0 13.0.0], d['build_versions'].inspect)
     check('LC_MAIN entry present', d['entry_offset'].to_i.positive?)
     want = EXPECTED['imports'].map { |i| [i['name'], [i['lib'] == LIBZ ? 1 : 2, i['lib']]] }.sort
     got = d['chained']['imports'].map { |i| [i['name'], [i['ordinal'], i['lib']]] }.sort
@@ -99,17 +103,29 @@ Dir.mktmpdir('arm64e-link-h0-') do |tmp|
       check("#{f} has no dependencies and no fixups", s['load_dylibs'].empty? && s['chained']['fixups'].empty?)
     end
     libz = dump(File.join(out, 'libz.1.linkonly.dylib'))
-    check('libz stub install name /usr/lib/libz.1.dylib, current 1.2.12, compat 1.0.0',
-          libz['install_name'] == LIBZ && libz['install_versions'] == %w[1.2.12 1.0.0])
-    check('every executable import from libz is exported by the libz stub',
-          got.select { |_n, (_o, lib)| lib == LIBZ }.all? { |n, _| libz['symbols'].key?(n) })
+    check('libz stub install name /usr/lib/libz.1.dylib, current 1.2.11, compat 1.0.0',
+          libz['install_name'] == LIBZ && libz['install_versions'] == %w[1.2.11 1.0.0])
+    libz_imports = got.select { |_n, (_o, lib)| lib == LIBZ }.map(&:first).sort
+    check('libz stub exports exactly the libz names the executable imports',
+          libz['symbols'].keys.sort == libz_imports, "#{libz['symbols'].keys.sort} vs #{libz_imports}")
+    if !LIBZ_EXP.empty? && File.file?(LIBZ_EXP)
+      apple = File.readlines(LIBZ_EXP, chomp: true).map(&:strip).reject { |l| l.empty? || l.start_with?('#') }
+      check('every libz stub symbol is in libz.exp', (libz['symbols'].keys - apple).empty?, (libz['symbols'].keys - apple).inspect)
+    else
+      puts 'SKIP libz.exp check: set LIBZ_EXP to Darling src/external/zlib/libz.exp'
+    end
   end
 
   # ---- same executable against the SDK's libSystem.dylib: identical import table
   sdk_out = File.join(tmp, 'sdk')
-  o, e, st = build(HERE, sdk_out, '--libsystem', 'sdk')
-  check('build against the SDK libSystem.dylib succeeds', st.success?, e + o)
-  if st.success?
+  if SDKROOT.empty? || !File.directory?(SDKROOT)
+    puts 'SKIP SDK libSystem variant: set SDKROOT to the Darling SDK root'
+    st = nil
+  else
+    o, e, st = build(HERE, sdk_out, '--libsystem', 'sdk')
+    check('build against the SDK libSystem.dylib succeeds', st.success?, e + o)
+  end
+  if st&.success?
     d = dump(File.join(sdk_out, 'h0_zlib_main'))
     got = d['chained']['imports'].map { |i| [i['name'], [i['ordinal'], i['lib']]] }.sort
     check('SDK libSystem gives the same dependencies and import table as the stub',
@@ -137,36 +153,42 @@ Dir.mktmpdir('arm64e-link-h0-') do |tmp|
   check('checking a non-Mach-O file fails loudly', !st.success? && e.include?('Mach-O'), e)
 
   # ---- mutation probes: each edit to a scratch copy of the recipe must break the build
-  def probe(tmp, name, file, from, to)
+  # edits: [[file, from, to], ...] applied to the scratch copy
+  def probe(tmp, name, edits)
     root = File.join(tmp, "probe-#{name}")
     FileUtils.mkdir_p(root)
     FileUtils.cp_r(Dir.glob(File.join(RECIPE_DIR, '*.{py,json}')), root)
     FileUtils.cp_r(File.join(RECIPE_DIR, 'h0'), root)
     FileUtils.rm_f(File.join(root, 'h0', 'arm64e-link-h0.rb'))
-    path = File.join(root, file)
-    src = File.read(path)
-    return [name, false, "probe text not found in #{file}"] unless src.include?(from)
-    File.write(path, src.sub(from) { to })
+    edits.each do |file, from, to|
+      path = File.join(root, file)
+      src = File.read(path)
+      return [name, false, "probe text not found in #{file}"] unless src.include?(from)
+      File.write(path, src.sub(from) { to })
+    end
     o, e, st = build(File.join(root, 'h0'), File.join(root, 'out'))
     [name, !st.success?, st.success? ? 'build and checks still passed' : (e + o).lines.first(4).join]
   end
 
   probes = [
-    ['wrong stub install name', 'h0/build_h0.py', '("/usr/lib/libz.1.dylib", "libz_symbols.txt"',
-     '("/usr/lib/libz.2.dylib", "libz_symbols.txt"'],
-    ['import from the wrong ordinal (link order swapped)', 'h0/build_h0.py', 'libs, ld_args = [libz, libsystem], []',
-     'libs, ld_args = [libsystem, libz], []'],
-    ['caps byte not cleared', 'arm64e_link.py', 'struct.pack_into("<I", out, 8, cpusubtype & ~CAPS_MASK)',
-     'struct.pack_into("<I", out, 8, cpusubtype)'],
-    ['missing exported symbol (_compress)', 'h0/libz_symbols.txt', "\ncompress\n", "\n"],
-    ['extra undefined symbol in the test source', 'h0/h0_zlib_main.c', 'int main(void) {',
-     "int h0_unexpected(void);\nint main(void) {\n    h0_unexpected();"],
-    ['extra import the stub does provide (deflateReset)', 'h0/h0_zlib_main.c', 'int main(void) {',
-     "int deflateReset(z_stream *);\nint main(void) {\n    deflateReset(0);"],
-    ['stub function without a trap', 'h0/libz_stub.c', '__builtin_trap();', ';'],
+    ['wrong stub install name', [['h0/build_h0.py', '("/usr/lib/libz.1.dylib", "libz_symbols.txt"',
+                                  '("/usr/lib/libz.2.dylib", "libz_symbols.txt"']]],
+    ['import from the wrong ordinal (link order swapped)',
+     [['h0/build_h0.py', 'libs, ld_args = [libz, libsystem], []', 'libs, ld_args = [libsystem, libz], []']]],
+    ['caps byte not cleared', [['arm64e_link.py', 'struct.pack_into("<I", out, 8, cpusubtype & ~CAPS_MASK)',
+                                'struct.pack_into("<I", out, 8, cpusubtype)']]],
+    ['missing exported symbol (_compress)', [['h0/libz_symbols.txt', "\ncompress\n", "\n"]]],
+    ['extra undefined symbol in the test source',
+     [['h0/h0_zlib_main.c', 'int main(void) {', "int h0_unexpected(void);\nint main(void) {\n    h0_unexpected();"]]],
+    ['extra import the stub does provide (deflateReset)',
+     [['h0/libz_symbols.txt', "\ninflateEnd\n", "\ninflateEnd\ndeflateReset\n"],
+      ['h0/h0_zlib_main.c', 'int main(void) {', "int deflateReset(z_stream *);\nint main(void) {\n    deflateReset(0);"]]],
+    ['stub function without a trap', [['h0/libz_stub.c', '__builtin_trap();', ';']]],
+    ['minos 11.0 instead of 13.0', [['arm64e_link.py', 'min_os="13.0", sdk="13.0"', 'min_os="11.0", sdk="13.0"']]],
+    ['sdk 11.0 instead of 13.0', [['arm64e_link.py', 'min_os="13.0", sdk="13.0"', 'min_os="13.0", sdk="11.0"']]],
   ]
-  probes.each do |name, file, from, to|
-    n, killed, detail = probe(tmp, name.gsub(/\W+/, '_'), file, from, to)
+  probes.each do |name, edits|
+    _n, killed, detail = probe(tmp, name.gsub(/\W+/, '_'), edits)
     check("mutation probe killed: #{name}", killed, detail)
     puts "     reason: #{detail.lines.reject { |l| l.start_with?('ld: warning') }.first(3).map(&:strip).join(' | ')}" if killed
   end
@@ -198,6 +220,39 @@ Dir.mktmpdir('arm64e-link-h0-') do |tmp|
       o, _e, st = Open3.capture3(bin)
       check("injected failure returns exit code #{code} and says so",
             st.exitstatus == code && o == format("h0 zlib FAIL %02d\n", code), "#{st.exitstatus} #{o.inspect}")
+    end
+    # A deflate() that reports the right total_out but leaves the output buffer as it was after its first
+    # 10 bytes must be caught by the streaming round trip: the program has to clear the buffer first, or
+    # compress()'s identical leftovers would make a short write pass (call 1 is compress()'s internal
+    # deflate, call 2 the program's own stream).
+    trunc = File.join(tmp, 'trunc_deflate.c')
+    File.write(trunc, <<~C)
+      #define _GNU_SOURCE
+      #include <dlfcn.h>
+      struct zs { const unsigned char *next_in; unsigned avail_in; unsigned long total_in;
+                  unsigned char *next_out; unsigned avail_out; unsigned long total_out; };
+      int deflate(struct zs *s, int flush) {
+        static int (*real)(struct zs *, int);
+        static int calls;
+        unsigned char old[16384];
+        unsigned char *start = s->next_out;
+        unsigned n = s->avail_out < sizeof old ? s->avail_out : sizeof old;
+        if (!real) real = dlsym(RTLD_NEXT, "deflate");
+        for (unsigned i = 0; i < n; i++) old[i] = start[i];
+        int rc = real(s, flush);
+        if (++calls == 2)
+          for (unsigned long i = 10; i < s->total_out && i < n; i++) start[i] = old[i];
+        return rc;
+      }
+    C
+    bin = File.join(tmp, 'native_trunc')
+    _o, e, st = Open3.capture3('clang', *cflags, src, trunc, '-lz', '-ldl', '-o', bin)
+    if st.success?
+      o, _e, st = Open3.capture3(bin)
+      check('a deflate() that truncates its output fails the stream check with exit 13',
+            st.exitstatus == 13 && o == "h0 zlib FAIL 13\n", "#{st.exitstatus} #{o.inspect}")
+    else
+      check('truncating-deflate shim builds', false, e)
     end
   else
     puts 'SKIP native logic checks: cannot link the test program against a host libz'

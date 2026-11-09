@@ -17,5 +17,6 @@
     {"name": "_inflateEnd", "lib": "/usr/lib/libz.1.dylib"},
     {"name": "_write", "lib": "/usr/lib/libSystem.B.dylib"}
   ],
+  "build_version": {"minos": "13.0.0", "sdk": "13.0.0"},
   "auth_bind": {"key": "IA", "addr_div": true, "diversity": 0}
 }
