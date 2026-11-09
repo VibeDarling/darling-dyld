@@ -1753,16 +1753,9 @@ const SharedCacheAllowList& sharedCacheAllowList()
     return kSharedCacheAllowList;
 }
 
-static const size_t kSharedCacheMaxPath = 1024;
-
-static bool canonicalPathIsUsable(const char* path)
-{
-    return (path != nullptr) && (path[0] == '/') && (memchr(path, '\0', kSharedCacheMaxPath) != nullptr);
-}
-
 bool sharedCachePathIsAllowListed(const char* canonicalPath, const SharedCacheAllowList& allowList)
 {
-    if ( !canonicalPathIsUsable(canonicalPath) )
+    if ( canonicalPath == nullptr )
         return false;
     for (size_t i = 0; i < allowList.count; ++i) {
         if ( strcmp(canonicalPath, allowList.paths[i]) == 0 )
@@ -1778,8 +1771,6 @@ SharedCacheLoadSource chooseSharedCacheLoadSource(bool isSplitCache, bool inCach
         return ( inCache && !existsOnDisk ) ? kSharedCacheLoadFromCache : kSharedCacheLoadFromDisk;
     if ( !inCache )
         return kSharedCacheLoadFromDisk;
-    if ( !canonicalPathIsUsable(canonicalPath) )
-        return kSharedCacheLoadInvalidPath;
     if ( sharedCachePathIsAllowListed(canonicalPath, allowList) )
         return kSharedCacheLoadFromCache;
     return existsOnDisk ? kSharedCacheLoadFromDisk : kSharedCacheLoadFromCache;

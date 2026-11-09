@@ -13,7 +13,9 @@ runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
 runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
 load5 = dyld2[/^static ImageLoader\* loadPhase5load\(.*?^\}/m] or abort 'loadPhase5load missing'
 relative = dyld2[/^static bool isFileRelativePath\(.*?^\}/m] or abort 'isFileRelativePath missing'
-records = dyld2[/^static std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;.*?^static void recordDiskOverrideOfCacheImage\(.*?^\}/m] or abort 'override records missing'
+records = (dyld2[/^static std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;.*?^\}/m] or abort 'override vector missing') + "\n" +
+          (dyld2[/^static bool useCacheImageWithoutClosure\(.*?^static void recordDiskOverrideOfCacheImage\(.*?^\}/m] or abort 'override records missing')
+forget = dyld2[/\t\/\/ a record of a cache image that this image stood in for.*?sDiskOverridesOfCacheImages\.end\(\)\);/m] or abort 'removeImage erase missing'
 record_struct = dyld2_h[/^\tstruct DiskOverrideOfCacheImage \{.*?^\t\};/m] or abort 'override record struct missing'
 in_cache = dyld2[/^bool inSharedCache\(const char\* path\)\n\{.*?^\}/m] or abort 'inSharedCache missing'
 overridden = dyld2[/if \( !gSharedCacheOverridden && !image->inSharedCache\(\).*?^\t\t\}/m] or abort 'gSharedCacheOverridden test missing'
@@ -39,6 +41,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
     #include <string>
     #include <vector>
     #include <map>
+    #include <algorithm>
     #define SUPPORT_ACCELERATE_TABLES 0
     #define TARGET_OS_SIMULATOR 0
     #define TARGET_OS_IPHONE 0
@@ -113,8 +116,9 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       static ImageLoader* loadPhase5check(const char*, const char*, const LoadContext&) { return nullptr; }
       ImageLoader* findLoadedImage(const struct stat&) { return nullptr; }
       static ImageLoader* checkandAddImage(ImageLoader* image, const LoadContext&) { return image; }
+      ImageLoader* gOpenReturns = nullptr;   // an image that is already loaded under the same install name
       static ImageLoader* loadPhase5open(const char*, const LoadContext&, const struct stat&, std::vector<const char*>*) {
-        ++seen.diskCalls; return newImage(2);
+        ++seen.diskCalls; return gOpenReturns ? gOpenReturns : newImage(2);
       }
       bool sandboxBlockedStat(const char*) { return false; }
       const char* mkstringf(const char*, ...) { return ""; }
@@ -139,7 +143,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       dyld::seen = dyld::Seen();
       dyld::LoadContext ctx; unsigned idx = 0; std::vector<const char*> ex;
       try { ImageLoader* i = dyld::loadPhase5load(path, path, ctx, idx, &ex); if (out) *out = i; return i ? i->tag : 0; }
-      catch (const std::string&) { return -1; }
+      catch (const std::string&) { return -1; }   // a throw is a failure of the rule
     }
 
     int main() {
@@ -178,10 +182,31 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       CHECK(load("/usr/lib/libnotincache.dylib") == 2 && dyld::sDiskOverridesOfCacheImages.empty());
       dyld3::gDisk.clear();
       CHECK(load("/usr/lib/libnotincache.dylib") == 0);
-      // a canonical path the cache gives back that is unusable is a loud error, not a silent choice
-      f.libz[0] = '\\0'; dyld3::gDisk.clear(); dyld3::gDisk[kLibz] = 1;
-      CHECK(load(kLibz) == -1);
+      // a canonical path the cache gives back that is unusable is just not allow-listed: today's rule
+      f.libz[0] = '\0'; dyld3::gDisk.clear(); dyld3::gDisk[kLibz] = 1;
+      CHECK(load(kLibz) == 2);
+      dyld3::gDisk.clear();
+      CHECK(load(kLibz) == 1);
       f.libz[0] = '/';
+      // loading can return an image that is already loaded: it is recorded once
+      dyld3::gDisk.clear(); dyld3::gDisk[kObjc] = 556; dyld::sDiskOverridesOfCacheImages.clear();
+      CHECK(load(kObjc, &img) == 2);
+      dyld::gOpenReturns = img;
+      CHECK(load(kObjc) == 2 && load(kObjc) == 2);
+      dyld::gOpenReturns = nullptr;
+      CHECK(dyld::sDiskOverridesOfCacheImages.size() == 1 && dyld::diskOverridesOfCacheImages().size() == 1);
+      // removeImage forgets exactly the records of the image it removes
+      ImageLoader* other = newImage(2);
+      dyld::sDiskOverridesOfCacheImages.push_back({ other, 0 });
+      auto removeImage = [&](ImageLoader* image) {
+        #{forget.gsub('sDiskOverridesOfCacheImages', 'dyld::sDiskOverridesOfCacheImages').gsub('const DiskOverrideOfCacheImage&', 'const dyld::DiskOverrideOfCacheImage&')}
+      };
+      removeImage(img);
+      CHECK(dyld::sDiskOverridesOfCacheImages.size() == 1 && dyld::sDiskOverridesOfCacheImages[0].image == other);
+      removeImage(img);
+      CHECK(dyld::sDiskOverridesOfCacheImages.size() == 1);
+      removeImage(other);
+      CHECK(dyld::sDiskOverridesOfCacheImages.empty());
 
       // --- old caches (no closure Image here either): a file on disk wins, even for the allow-listed path ---
       f.cache.split = false;

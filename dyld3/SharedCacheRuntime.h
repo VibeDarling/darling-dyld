@@ -96,7 +96,6 @@ bool pathIsInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* d
 enum SharedCacheLoadSource {
     kSharedCacheLoadFromDisk,
     kSharedCacheLoadFromCache,
-    kSharedCacheLoadInvalidPath,    // an image of a split cache whose canonical path is NULL, empty, relative or too long
 };
 
 // Canonical cache paths that a split cache serves even when a file exists at the same path on disk. Exact

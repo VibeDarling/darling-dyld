@@ -47,13 +47,13 @@ Dir.mktmpdir('shared-cache-precedence-') do |dir|
     } // namespace dyld3
     using namespace dyld3;
 
-    struct Fixture { DyldSharedCache cache; dyld_cache_image_info images[2]; char libz[32]; char objc[32]; };
+    struct Fixture { DyldSharedCache cache; dyld_cache_image_info images[2]; char libz[32]; char objc[1200]; };
     static const SharedCacheAllowList kNone = { nullptr, 0 };
     static const char* const kTwo[] = { "/usr/lib/foo.dylib", "/usr/lib/system/*" };
     static const SharedCacheAllowList kCustom = { kTwo, 2 };
     static const char* const kLibz[] = { "/usr/lib/libz.1.dylib" };
     static const SharedCacheAllowList kLibzList = { kLibz, 1 };
-    static const SharedCacheLoadSource C = kSharedCacheLoadFromCache, D = kSharedCacheLoadFromDisk, X = kSharedCacheLoadInvalidPath;
+    static const SharedCacheLoadSource C = kSharedCacheLoadFromCache, D = kSharedCacheLoadFromDisk;
     static int failures = 0;
     #define CHECK(cond) do { if (!(cond)) { printf("FAIL line %d: %s\\n", __LINE__, #cond); ++failures; } } while (0)
 
@@ -93,23 +93,14 @@ Dir.mktmpdir('shared-cache-precedence-') do |dir|
       CHECK(chooseSharedCacheLoadSource(true, true, true, "/usr/lib/LIBZ.1.dylib", kLibzList) == D);
       CHECK(chooseSharedCacheLoadSource(true, true, true, "/usr/lib/libz.dylib", kLibzList) == D);   // an alias is not the canonical name
 
-      // Unusable canonical paths for a split cache image are refused, with or without a disk copy or list entry.
-      std::string max1(1023, 'a'), max2(1024, 'a');
-      std::string ok = "/" + max1.substr(1);          // 1023 characters: the longest accepted
-      std::string longer = "/" + max2.substr(1);      // 1024 characters: too long for PATH_MAX
-      for (int disk = 0; disk < 2; ++disk) {
-        CHECK(chooseSharedCacheLoadSource(true, true, disk, nullptr, kLibzList) == X);
-        CHECK(chooseSharedCacheLoadSource(true, true, disk, "", kLibzList) == X);
-        CHECK(chooseSharedCacheLoadSource(true, true, disk, "usr/lib/libz.1.dylib", kLibzList) == X);
-        CHECK(chooseSharedCacheLoadSource(true, true, disk, "./usr/lib/libz.1.dylib", kLibzList) == X);
-        CHECK(chooseSharedCacheLoadSource(true, true, disk, longer.c_str(), kLibzList) == X);
-        CHECK(chooseSharedCacheLoadSource(true, true, disk, ok.c_str(), kLibzList) == (disk ? D : C));
+      // An unusable canonical path (NULL, empty, relative, 1024 characters or more) is just not allow-listed:
+      // today's rule, the file wins when there is one and the cache otherwise.
+      std::string longer = "/" + std::string(1100, 'a');
+      for (const char* odd : { (const char*)nullptr, "", "usr/lib/libz.1.dylib", "./usr/lib/libz.1.dylib", longer.c_str() }) {
+        CHECK(chooseSharedCacheLoadSource(true, true, true, odd, kLibzList) == D);
+        CHECK(chooseSharedCacheLoadSource(true, true, false, odd, kLibzList) == C);
+        CHECK(!sharedCachePathIsAllowListed(odd, kLibzList));
       }
-      // The list never matches an unusable path, even if the list itself holds one.
-      static const char* const kBad[] = { "", "relative/libz.dylib" };
-      static const SharedCacheAllowList kBadList = { kBad, 2 };
-      CHECK(!sharedCachePathIsAllowListed("", kBadList) && !sharedCachePathIsAllowListed("relative/libz.dylib", kBadList));
-      CHECK(!sharedCachePathIsAllowListed(nullptr, kLibzList));
       // A path that is not in the cache needs no canonical name.
       CHECK(chooseSharedCacheLoadSource(true, false, true, nullptr, kLibzList) == D);
       CHECK(chooseSharedCacheLoadSource(true, false, false, "", kLibzList) == D);
@@ -138,6 +129,15 @@ Dir.mktmpdir('shared-cache-precedence-') do |dir|
       CHECK(!pathIsPinnedToSharedCache(load, kOther));
       CHECK(!pathIsPinnedToSharedCache(load, "/usr/lib/libnotthere.dylib"));
       CHECK(!pathIsPinnedToSharedCache(load, "/usr/lib/libz.1.dylibx"));
+      // Both routes agree on a cache image whose recorded path is unusable: not pinned, today's rule.
+      for (const char* odd : { "", "relative/libobjc.dylib", longer.c_str() }) {
+        strcpy(f.objc, odd);
+        CHECK(findInSharedCacheImage(load, kOther, &res) && strcmp(res.pathInCache, odd) == 0);
+        CHECK(!pathIsPinnedToSharedCache(load, kOther));
+        CHECK(chooseSharedCacheLoadSource(true, true, true, res.pathInCache, sharedCacheAllowList()) == D);
+        CHECK(chooseSharedCacheLoadSource(true, true, false, res.pathInCache, sharedCacheAllowList()) == C);
+      }
+      strcpy(f.objc, kOther);
       // Old caches and a missing cache pin nothing, even for the allow-listed path.
       f.cache.split = false;
       CHECK(!pathIsPinnedToSharedCache(load, kLibzPath));
@@ -148,7 +148,7 @@ Dir.mktmpdir('shared-cache-precedence-') do |dir|
       CHECK(findInSharedCacheImage(load, kOther, &res) && strcmp(res.pathInCache, kOther) == 0);
 
       if (failures) { printf("%d failure(s)\\n", failures); return 1; }
-      puts("PASS precedence matrix (split and old caches), exact allow-list matching, path refusals, alias canonicalisation");
+      puts("PASS precedence matrix (split and old caches), exact allow-list matching, unusable paths, alias canonicalisation");
       return 0;
     }
   CPP

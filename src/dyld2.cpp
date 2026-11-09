@@ -1579,6 +1579,13 @@ static void addImage(ImageLoader* image)
 	
 }
 
+static std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;
+
+const std::vector<DiskOverrideOfCacheImage>& diskOverridesOfCacheImages()
+{
+	return sDiskOverridesOfCacheImages;
+}
+
 //
 // Helper for std::remove_if
 //
@@ -1657,6 +1664,11 @@ void removeImage(ImageLoader* image)
 			break;
 		}
 	}
+
+	// a record of a cache image that this image stood in for must not outlive it
+	sDiskOverridesOfCacheImages.erase(std::remove_if(sDiskOverridesOfCacheImages.begin(), sDiskOverridesOfCacheImages.end(),
+													 [image](const DiskOverrideOfCacheImage& r) { return r.image == image; }),
+									  sDiskOverridesOfCacheImages.end());
 
 	// If this image is the potential canonical definition of any weak defs, then set them to a tombstone value
 	if ( gLinkContext.weakDefMapInitialized && image->hasCoalescedExports() && (image->getState() >= dyld_image_state_bound) ) {
@@ -3550,13 +3562,6 @@ static bool isFileRelativePath(const char* path)
 static ImageLoader* loadPhase5check(const char* path, const char* orgPath, const LoadContext& context);
 
 
-static std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;
-
-const std::vector<DiskOverrideOfCacheImage>& diskOverridesOfCacheImages()
-{
-	return sDiskOverridesOfCacheImages;
-}
-
 // A split cache image has no closure Image, so the cache cannot say whether a file on disk may override it
 // (see dyld3::chooseSharedCacheLoadSource). Sets existsOnDisk and statErrNo from the stat of path.
 static bool useCacheImageWithoutClosure(const char* path, const dyld3::SharedCacheFindDylibResults& found,
@@ -3568,15 +3573,12 @@ static bool useCacheImageWithoutClosure(const char* path, const dyld3::SharedCac
 	const bool splitCache = sSharedCacheLoadInfo.loadAddress->isSplitCache();
 	const dyld3::SharedCacheLoadSource source = dyld3::chooseSharedCacheLoadSource(splitCache, true, existsOnDisk,
 																				  found.pathInCache, dyld3::sharedCacheAllowList());
-	if ( source == dyld3::kSharedCacheLoadFromCache ) {
-		// the stat was of a disk file that the cache now shadows: its inode and mtime must not end up on the cache image
-		if ( splitCache )
-			bzero(&statBuf, sizeof(statBuf));
-		return true;
-	}
 	if ( source == dyld3::kSharedCacheLoadFromDisk )
 		return false;
-	throwf("shared cache image has an unusable path for %s", path);
+	// the stat was of a disk file that the cache now shadows: its inode and mtime must not end up on the cache image
+	if ( splitCache )
+		bzero(&statBuf, sizeof(statBuf));
+	return true;
 }
 
 // the patch-table override must know which cache image a disk image stands in for
@@ -3584,6 +3586,11 @@ static void recordDiskOverrideOfCacheImage(const ImageLoader* image, const dyld3
 {
 	if ( (found.image == nullptr) && (found.cacheImageIndex != dyld3::kNoCacheImageIndex)
 	  && sSharedCacheLoadInfo.loadAddress->isSplitCache() ) {
+		// loading can hand back an image that is already loaded under the same install name
+		for (const DiskOverrideOfCacheImage& existing : sDiskOverridesOfCacheImages) {
+			if ( existing.image == image )
+				return;
+		}
 		DiskOverrideOfCacheImage record = { image, found.cacheImageIndex };
 		sDiskOverridesOfCacheImages.push_back(record);
 	}
