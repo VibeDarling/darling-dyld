@@ -1,10 +1,12 @@
 # How dyld2.cpp applies the patch info override: the actual overrideSplitCacheGotSlots (extracted from src/dyld2.cpp,
 # with the cache, the images and halt stubbed, and the real allow-list code of SharedCacheRuntime.cpp behind it).
-# Checks which loaded images are treated as exporters (only a loaded dylib the cache does not serve, whose install
-# name is in the cache and not allow-listed), that nothing runs without version 4 patch info or without a cache,
-# that the symbols are looked up in the loaded image with dyld's own export lookup, that the totals add up, that a
-# second pass counts nothing twice, that a reader error halts with the exporter's name, and that the two hooks sit
-# in front of every initializer pass. The reader and the signing are tested in tests/patch-info-v4-override.rb.
+# Checks that the exporters are the disk images that loadPhase5 recorded as standing in for a cache image (and not an
+# allow-listed one), that nothing runs without a cache, without version 4 patch info, without records or without a cache
+# image in the process, that the symbols are looked up in the loaded image with dyld's own export lookup, that a second
+# pass counts nothing twice, that a reader error halts with the exporter's name, and that exactly one summary line is
+# printed per pass (always when a slot kept the cache's pointer, otherwise only with the verbose mapping option). It also
+# checks where the hook sits: at the end of link(), which runs under dyld's lock, and in neither initializer pass (those
+# run after dlopen has released the lock). The reader and the signing are tested in tests/patch-info-v4-override.rb.
 # Usage: ruby tests/patch-info-v4-wiring.rb [checkout]
 require 'tmpdir'
 require 'open3'
@@ -13,21 +15,23 @@ dyld2 = File.read("#{root}/src/dyld2.cpp")
 dyld2_h = File.read("#{root}/src/dyld2.h")
 runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
 runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
-override_fn = dyld2[/^static SplitCachePatchTotals sSplitCachePatchTotals;.*?^static void overrideSplitCacheGotSlots\(\).*?^\}/m] or abort 'overrideSplitCacheGotSlots missing'
-totals_struct = dyld2_h[/^\tstruct SplitCachePatchTotals \{.*?^\t\};/m] or abort 'SplitCachePatchTotals missing'
+override_fn = dyld2[/^static struct \{ uint64_t patched, missing, unexplained; \} sSplitCachePatchTotals;.*?^static void overrideSplitCacheGotSlots\(\).*?^\}/m] or abort 'overrideSplitCacheGotSlots missing'
+record_struct = dyld2_h[/^\tstruct DiskOverrideOfCacheImage \{.*?^\t\};/m] or abort 'DiskOverrideOfCacheImage missing'
 allow_list = runtime[/^\/\/ libz is a leaf library.*?^bool sharedCachePathIsAllowListed\(.*?^\}/m] or abort 'allow-list code missing'
 allow_decl = runtime_h[/^struct SharedCacheAllowList \{.*?^\};/m] or abort 'SharedCacheAllowList missing'
 
-# The hooks: one call in front of the first initializer of the launch pass, one in front of the dlopen pass.
+# The hook: at the end of link() (under dyld's lock), after the image and everything it needs are linked, and nowhere else.
+link_fn = dyld2[/^void link\(ImageLoader\* image, bool forceLazysBound.*?^\}/m] or abort 'link missing'
 init_main = dyld2[/^void initializeMainExecutable\(\)\n\{.*?^\}/m] or abort 'initializeMainExecutable missing'
 run_init = dyld2[/^void runInitializers\(ImageLoader\* image\)\n\{.*?^\}/m] or abort 'runInitializers missing'
-[['initializeMainExecutable', init_main, 'runInitializers('], ['runInitializers', run_init, 'image->runInitializers(']].each do |name, body, first|
-  hook = body.index('overrideSplitCacheGotSlots();')
-  abort "#{name} does not call overrideSplitCacheGotSlots" unless hook
-  abort "#{name} runs an initializer before the GOT override" unless hook < body.index(first)
-  abort "#{name}: the call is not under #ifdef DARLING" unless body[0...hook].rindex('#ifdef DARLING') && body[hook..].include?('#endif')
+hook = link_fn.index('overrideSplitCacheGotSlots();') or abort 'link() does not call overrideSplitCacheGotSlots'
+abort 'the override runs before the image is linked' unless hook > link_fn.index('image->link(gLinkContext')
+abort 'link(): the call is not under #ifdef DARLING' unless link_fn[0...hook].rindex('#ifdef DARLING') > link_fn.index('image->link(gLinkContext') && link_fn[hook..].include?('#endif')
+abort 'the override is skipped when link() throws and still run after the catch' if link_fn.index('catch') < hook
+[['initializeMainExecutable', init_main], ['runInitializers', run_init]].each do |name, body|
+  abort "#{name} calls overrideSplitCacheGotSlots without dyld's lock (dlopen releases it before the initializers)" if body.include?('overrideSplitCacheGotSlots')
 end
-puts 'ok   both initializer passes call overrideSplitCacheGotSlots first'
+puts 'ok   the override runs at the end of link() and in neither initializer pass'
 
 Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
   File.write("#{dir}/test.cpp", <<~CPP)
@@ -58,21 +62,19 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       struct PatchOverrideStats { uint64_t exports, slots, patched, unexplained, missingExports, missingSlots; bool alreadyApplied; };
       typedef void (*DataConstLogFunc)(const char*, ...);
       bool patchInfo = true;
-      std::vector<std::string> images = {"/usr/lib/libSystem.B.dylib", "/usr/lib/system/libsystem_kernel.dylib", "/usr/lib/system/libsystem_c.dylib", "/usr/lib/libz.1.dylib"};
+      std::vector<std::string> images = {"/usr/lib/libSystem.B.dylib", "/usr/lib/system/libsystem_kernel.dylib", "/usr/lib/system/libsystem_c.dylib", "/usr/lib/libz.1.dylib", "/usr/lib/system/libsystem_malloc.dylib"};
       mutable std::vector<uint32_t> calls; mutable std::set<uint32_t> applied;
       const char *error = nullptr;                 // what overridePatchGotSlots returns for index 2
-      const char *headerError = nullptr;           // what checkPatchInfoV4Headers returns
       bool hasPatchInfoV4() const { return patchInfo; }
-      const char *checkPatchInfoV4Headers() const { return headerError; }
-      bool hasImagePath(const char *path, uint32_t &index) const { for (uint32_t i = 0; i < images.size(); ++i) if (images[i] == path) { index = i; return true; } return false; }
       const char *getIndexedImagePath(uint32_t i) const { return images[i].c_str(); }
-      // symbols the exporter has in its GOT: two the loaded image defines and one it does not
+      // symbols the exporter has in its GOT: two the loaded image defines and one it does not; index 4 has two unexplained slots instead
       const char *overridePatchGotSlots(uint32_t index, bool (^resolve)(const char *symbol, uint64_t *address), DataConstLogFunc, PatchOverrideStats *s) const {
         calls.push_back(index);
         memset(s, 0, sizeof *s);
         if (applied.count(index)) { s->alreadyApplied = true; return nullptr; }
         if (index == 2 && error) return error;
         applied.insert(index);
+        if (index == 4) { s->exports = 1; s->slots = 2; s->unexplained = 2; return nullptr; }
         for (const char *name : {"_open", "_close", "_nosuchsymbol"}) {
           uint64_t address = 0; ++s->exports; s->slots += 2;
           if (resolve(name, &address)) { s->patched += 2; lastAddress[name] = address; } else { ++s->missingExports; s->missingSlots += 2; }
@@ -83,9 +85,8 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     };
     struct ImageLoader {
       struct LinkContext { bool verboseMapping = false; };
-      std::string install; bool dylib = true, inCache = false; std::map<std::string, uintptr_t> exports;
-      bool isDylib() const { return dylib; }
-      const char *getInstallPath() const { return install.empty() ? nullptr : install.c_str(); }
+      std::string install; bool inCache = false; std::map<std::string, uintptr_t> exports;
+      const char *getInstallPath() const { return install.c_str(); }
       bool inSharedCache() const { return inCache; }
       // the real lookup is ImageLoader::findExportedSymbolAddress (searchReExports, resolvers run for a GOT pointer)
       bool findExportedSymbolAddress(const LinkContext &, const char *name, const ImageLoader *requestor, int ordinal, bool runResolver, const ImageLoader **foundIn, uintptr_t *address) const {
@@ -95,11 +96,12 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       }
     };
     namespace dyld {
-      #{totals_struct}
+      #{record_struct}
       ImageLoader::LinkContext gLinkContext;
       dyld3::SharedCacheLoadInfo sSharedCacheLoadInfo = {nullptr};
       std::vector<ImageLoader*> sAllImages;
-      std::vector<std::string> logged; std::string halted;
+      std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;
+      std::vector<std::string> logged;
       void log(const char *format, ...) { char buffer[512]; va_list a; va_start(a, format); vsnprintf(buffer, sizeof buffer, format, a); va_end(a); logged.push_back(buffer); }
       const char *mkstringf(const char *format, ...) { static char buffer[512]; va_list a; va_start(a, format); vsnprintf(buffer, sizeof buffer, format, a); va_end(a); return buffer; }
       void halt(const char *message) { throw std::runtime_error(message); }
@@ -107,70 +109,81 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     }
     using namespace dyld;
 
-    static ImageLoader *image(const char *install, bool inCache = false, bool dylib = true) {
-      ImageLoader *i = new ImageLoader; i->install = install ? install : ""; i->inCache = inCache; i->dylib = dylib;
+    static ImageLoader *image(const char *install, bool inCache = false) {
+      ImageLoader *i = new ImageLoader; i->install = install; i->inCache = inCache;
       i->exports = {{"_open", 0x1000}, {"_close", 0x2000}}; return i;   // _nosuchsymbol is not exported
     }
-    static void reset(DyldSharedCache &cache) { sAllImages.clear(); cache.calls.clear(); cache.applied.clear(); cache.lastAddress.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
+    // a disk image standing in for cache image `index`, as loadPhase5 records it
+    static void shadow(const char *install, uint32_t index) { ImageLoader *i = image(install); sAllImages.push_back(i); sDiskOverridesOfCacheImages.push_back({i, index}); }
+    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); cache.lastAddress.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
+    static unsigned summaries() { unsigned n = 0; for (const std::string &l : logged) n += l.find("split cache GOT override: patched=") != std::string::npos; return n; }
 
     int main() {
       DyldSharedCache cache;
-      // --- no cache, no patch info: nothing is touched, not even a lookup ---
-      sAllImages = {image("/usr/lib/system/libsystem_kernel.dylib")};
+      // --- no cache, no patch info, no records, no cache image in the process: nothing is touched, not even a lookup ---
+      shadow("/usr/lib/system/libsystem_kernel.dylib", 1); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
       overrideSplitCacheGotSlots();
-      CHECK(cache.calls.empty() && splitCachePatchTotals().exporters == 0);
+      CHECK(cache.calls.empty() && logged.empty());
       sSharedCacheLoadInfo.loadAddress = &cache;
       cache.patchInfo = false;
       overrideSplitCacheGotSlots();
-      CHECK(cache.calls.empty() && splitCachePatchTotals().exporters == 0);
+      CHECK(cache.calls.empty() && logged.empty());
       cache.patchInfo = true;
+      sDiskOverridesOfCacheImages.clear();
+      overrideSplitCacheGotSlots();
+      CHECK(cache.calls.empty() && logged.empty());                       // nothing is shadowed
+      reset(cache); shadow("/usr/lib/system/libsystem_kernel.dylib", 1);
+      overrideSplitCacheGotSlots();
+      CHECK(cache.calls.empty() && logged.empty());                       // no image of the cache is loaded: nothing to fix, no mapping is touched
 
-      // --- a damaged header halts before any exporter is looked at, naming the reason; the check is retried until it passes ---
-      cache.headerError = "patch info array is not 4-byte aligned";
-      bool headerHalted = false;
-      try { overrideSplitCacheGotSlots(); } catch (const std::runtime_error &e) { headerHalted = true; CHECK(strstr(e.what(), "patch info array is not 4-byte aligned")); }
-      CHECK(headerHalted && cache.calls.empty());
-      cache.headerError = nullptr;
-
-      // --- which loaded images are exporters ---
-      reset(cache);
-      sAllImages = {image(nullptr, false, false),                              // the main executable: not a dylib
-                    image("/usr/lib/system/libsystem_kernel.dylib", true),     // served from the cache
-                    image("/usr/lib/libnotincache.dylib"),                     // no such image in the cache
-                    image(nullptr),                                            // no install path
-                    image("/usr/lib/libz.1.dylib"),                            // allow-listed: the cache serves it
-                    image("/usr/lib/system/libsystem_kernel.dylib")};          // the exporter Darling provides
+      // --- the exporters are the recorded disk images; an allow-listed cache path is never overridden ---
+      sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+      shadow("/usr/lib/libz.1.dylib", 3);
       overrideSplitCacheGotSlots();
       CHECK(cache.calls == std::vector<uint32_t>{1});
       CHECK(cache.lastAddress.size() == 2 && cache.lastAddress["_open"] == 0x1000 && cache.lastAddress["_close"] == 0x2000);   // the loaded image's addresses
-      CHECK(splitCachePatchTotals().exporters == 1 && splitCachePatchTotals().slots == 6 && splitCachePatchTotals().patched == 4);
-      CHECK(splitCachePatchTotals().missingExports == 1 && splitCachePatchTotals().missingSlots == 2 && splitCachePatchTotals().unexplained == 0);
+      CHECK(summaries() == 1 && logged.size() == 1 && logged[0].find("patched=4 missing=2 unexplained=0") != std::string::npos);   // a missing symbol is always reported
 
-      // --- a second pass (the dlopen hook) does not count the same exporter twice, and new exporters are added ---
-      sAllImages.push_back(image("/usr/lib/libSystem.B.dylib"));
+      // --- a second pass (the next link) does not count the same exporter twice, a new one is added; the line is cumulative ---
+      logged.clear();
+      shadow("/usr/lib/libSystem.B.dylib", 0);
       overrideSplitCacheGotSlots();
       CHECK((cache.calls == std::vector<uint32_t>{1, 1, 0}));
-      CHECK(splitCachePatchTotals().exporters == 2 && splitCachePatchTotals().slots == 12 && splitCachePatchTotals().missingExports == 2);
-
-      // --- the verbose log names the missing symbol and the totals; silent otherwise ---
-      CHECK(logged.empty());
-      reset(cache); cache.applied.clear();
-      gLinkContext.verboseMapping = true;
-      sAllImages = {image("/usr/lib/system/libsystem_kernel.dylib")};
+      CHECK(summaries() == 1 && logged[0].find("patched=8 missing=4 unexplained=0") != std::string::npos);
+      logged.clear();
       overrideSplitCacheGotSlots();
-      bool sawMissing = false, sawTotals = false;
-      for (const std::string &l : logged) { sawMissing |= l.find("_nosuchsymbol") != std::string::npos && l.find("libsystem_kernel") != std::string::npos; sawTotals |= l.find("4 patched") != std::string::npos; }
-      CHECK(sawMissing && sawTotals);
+      CHECK(logged.empty());                                              // nothing new, nothing to say
+
+      // --- slots that are left because they cannot be explained are reported too ---
+      shadow("/usr/lib/system/libsystem_malloc.dylib", 4);
+      overrideSplitCacheGotSlots();
+      CHECK(summaries() == 1 && logged[0].find("unexplained=2") != std::string::npos);
+
+      // --- all good: silent, unless the verbose mapping option asks for the line; the missing symbol is named then ---
+      reset(cache);
+      sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+      ImageLoader *kernel = image("/usr/lib/system/libsystem_kernel.dylib"); kernel->exports["_nosuchsymbol"] = 0x3000;
+      sAllImages.push_back(kernel); sDiskOverridesOfCacheImages.push_back({kernel, 1});
+      overrideSplitCacheGotSlots();
+      CHECK(logged.empty() && cache.calls.size() == 1);
+      cache.applied.clear(); gLinkContext.verboseMapping = true;
+      overrideSplitCacheGotSlots();
+      CHECK(summaries() == 1);                                            // nothing missing, but the verbose mapping option asks for the line
+      logged.clear(); cache.applied.clear(); kernel->exports.erase("_nosuchsymbol");
+      overrideSplitCacheGotSlots();
+      bool sawMissing = false;
+      for (const std::string &l : logged) sawMissing |= l.find("_nosuchsymbol") != std::string::npos && l.find("libsystem_kernel") != std::string::npos;
+      CHECK(sawMissing && summaries() == 1);
       gLinkContext.verboseMapping = false;
 
-      // --- a reader error halts, naming the exporter and the reason; the totals stay ---
+      // --- a reader error halts, naming the exporter and the reason ---
       reset(cache);
       cache.error = "patch info is damaged";
-      sAllImages = {image("/usr/lib/system/libsystem_c.dylib")};
-      const uint64_t exportersBefore = splitCachePatchTotals().exporters;
+      sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+      shadow("/usr/lib/system/libsystem_c.dylib", 2);
       bool threw = false;
       try { overrideSplitCacheGotSlots(); } catch (const std::runtime_error &e) { threw = true; CHECK(strstr(e.what(), "libsystem_c.dylib") && strstr(e.what(), "patch info is damaged")); }
-      CHECK(threw && splitCachePatchTotals().exporters == exportersBefore);
+      CHECK(threw);
       printf(failures ? "RESULT failed (%d)\\n" : "RESULT ok\\n", failures);
       return failures != 0;
     }
