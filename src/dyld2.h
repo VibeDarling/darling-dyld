@@ -124,6 +124,17 @@ namespace dyld {
 		uint32_t			cacheImageIndex;	// position in the cache's image table
 	};
 	extern const std::vector<DiskOverrideOfCacheImage>&	diskOverridesOfCacheImages();
+
+	// What overrideSplitCacheGotSlots did so far (Darling only); the guest test asserts missingExports == 0.
+	struct SplitCachePatchTotals {
+		uint64_t	exporters;
+		uint64_t	slots;
+		uint64_t	patched;
+		uint64_t	unexplained;
+		uint64_t	missingExports;		// symbols the process's image does not export: the cache's pointer stays
+		uint64_t	missingSlots;
+	};
+	extern const SplitCachePatchTotals&	splitCachePatchTotals();
 #if LOG_BINDINGS
 	extern void					logBindings(const char* format, ...);
 #endif

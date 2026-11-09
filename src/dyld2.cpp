@@ -1765,10 +1765,76 @@ static void runAllStaticTerminators(void* extra)
 	}
 }
 
+#ifdef DARLING
+static SplitCachePatchTotals sSplitCachePatchTotals;
+
+const SplitCachePatchTotals& splitCachePatchTotals()
+{
+	return sSplitCachePatchTotals;
+}
+
+// The images of a split cache import through its coalesced GOT, whose slots the mapper has signed to the cache's own
+// exporters. For every cache exporter that this process provides itself (a loaded dylib with the exporter's install
+// name that the cache does not serve), point the slots of the symbols it exports at the loaded image's definitions.
+// Idempotent, and a no-op without version 4 patch info, so it runs before every initializer pass: new exporters can
+// arrive with a later dlopen. A symbol the loaded image does not export keeps the cache's pointer and is counted.
+static void overrideSplitCacheGotSlots()
+{
+	const DyldSharedCache* cache = sSharedCacheLoadInfo.loadAddress;
+	if ( (cache == nullptr) || !cache->hasPatchInfoV4() )
+		return;
+	static bool headersChecked = false;
+	if ( !headersChecked ) {
+		if ( const char* error = cache->checkPatchInfoV4Headers() )
+			halt(mkstringf("split cache patch info: %s\n", error));
+		headersChecked = true;
+	}
+	for (size_t i = 0; i < sAllImages.size(); ++i) {
+		ImageLoader* image = sAllImages[i];
+		const char* installPath = image->isDylib() ? image->getInstallPath() : nullptr;
+		uint32_t cacheIndex;
+		if ( image->inSharedCache() || (installPath == nullptr) || !cache->hasImagePath(installPath, cacheIndex) )
+			continue;
+		if ( dyld3::sharedCachePathIsAllowListed(cache->getIndexedImagePath(cacheIndex), dyld3::sharedCacheAllowList()) )
+			continue;
+		const bool verbose = gLinkContext.verboseMapping;
+		DyldSharedCache::PatchOverrideStats stats;
+		const char* error = cache->overridePatchGotSlots(cacheIndex, ^(const char* symbol, uint64_t* address) {
+			const ImageLoader* foundIn;
+			uintptr_t found;
+			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) ) {
+				*address = found;
+				return true;
+			}
+			if ( verbose )
+				dyld::log("dyld: split cache GOT override: %s does not export %s, the cache's pointer stays\n", installPath, symbol);
+			return false;
+		}, verbose ? &dyld::log : nullptr, &stats);
+		if ( error != nullptr )
+			halt(mkstringf("split cache GOT override of '%s': %s\n", installPath, error));
+		if ( stats.alreadyApplied )
+			continue;
+		sSplitCachePatchTotals.exporters += 1;
+		sSplitCachePatchTotals.slots += stats.slots;
+		sSplitCachePatchTotals.patched += stats.patched;
+		sSplitCachePatchTotals.unexplained += stats.unexplained;
+		sSplitCachePatchTotals.missingExports += stats.missingExports;
+		sSplitCachePatchTotals.missingSlots += stats.missingSlots;
+		if ( verbose )
+			dyld::log("dyld: split cache GOT override of %s: %llu symbols, %llu slots, %llu patched, %llu unexplained, %llu symbols missing (%llu slots)\n",
+					  installPath, (unsigned long long)stats.exports, (unsigned long long)stats.slots, (unsigned long long)stats.patched,
+					  (unsigned long long)stats.unexplained, (unsigned long long)stats.missingExports, (unsigned long long)stats.missingSlots);
+	}
+}
+#endif
+
 void initializeMainExecutable()
 {
 	// record that we've reached this step
 	gLinkContext.startedInitializingMainExecutable = true;
+#ifdef DARLING
+	overrideSplitCacheGotSlots();
+#endif
 
 	// run initialzers for any inserted dylibs
 	ImageLoader::InitializerTimingList initializerTimes[allImagesCount()];
@@ -5257,6 +5323,10 @@ void link(ImageLoader* image, bool forceLazysBound, bool neverUnload, const Imag
 
 void runInitializers(ImageLoader* image)
 {
+#ifdef DARLING
+	// a dlopen may have brought in an exporter the process provides itself
+	overrideSplitCacheGotSlots();
+#endif
 	// do bottom up initialization
 	ImageLoader::InitializerTimingList initializerTimes[allImagesCount()];
 	initializerTimes[0].count = 0;
