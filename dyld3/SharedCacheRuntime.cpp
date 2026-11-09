@@ -1663,6 +1663,7 @@ bool loadDyldCache(const SharedCacheOptions& options, SharedCacheLoadInfo* resul
 
 bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dylibPathToFind, SharedCacheFindDylibResults* results)
 {
+    results->cacheImageIndex = kNoCacheImageIndex;
     if ( loadInfo.loadAddress == nullptr )
         return false;
 
@@ -1691,6 +1692,7 @@ bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dyl
             results->pathInCache = (const char*)loadInfo.loadAddress + p->pathFileOffset;
             results->slideInCache = loadInfo.slide;
             results->image = nullptr;
+            results->cacheImageIndex = aliasIndex;
             return true;
         }
         for (const dyld_cache_image_info* p = start; p != end; ++p) {
@@ -1705,6 +1707,7 @@ bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dyl
                 results->pathInCache  = aPath;
                 results->slideInCache = loadInfo.slide;
                 results->image        = nullptr;
+                results->cacheImageIndex = (uint32_t)(p - start);
                 return true;
             }
         }
@@ -1724,6 +1727,7 @@ bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dyl
     results->mhInCache    = (const mach_header*)((uintptr_t)loadInfo.loadAddress + results->image->cacheOffset());
     results->pathInCache  = results->image->path();
     results->slideInCache = loadInfo.slide;
+    results->cacheImageIndex = imageIndex;
     return true;
 }
 

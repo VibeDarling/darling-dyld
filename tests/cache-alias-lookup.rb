@@ -43,18 +43,21 @@ Dir.mktmpdir('cache-alias-lookup-') do |dir|
       const dyld3::closure::ImageArray *cachedDylibsImageArray() const { return header.dylibsImageArrayAddr?&array:nullptr; }
     };
     struct SharedCacheLoadInfo { const DyldSharedCache *loadAddress; long slide; };
-    struct SharedCacheFindDylibResults { const mach_header *mhInCache; const char *pathInCache; long slideInCache; const dyld3::closure::Image *image; };
+    static const uint32_t kNoCacheImageIndex = 0xFFFFFFFF;
+    struct SharedCacheFindDylibResults { const mach_header *mhInCache; const char *pathInCache; long slideInCache; const dyld3::closure::Image *image; uint32_t cacheImageIndex; };
     #{lookup}
-    struct Fixture { DyldSharedCache cache; dyld_cache_image_info images[1]; char canonical[32]; };
+    struct Fixture { DyldSharedCache cache; dyld_cache_image_info images[2]; char canonical[32]; char second[32]; };
     int main() {
-      Fixture f={}; strcpy(f.canonical,"canonical");
+      Fixture f={}; strcpy(f.canonical,"canonical"); strcpy(f.second,"second");
       f.cache.header.imagesOffset=offsetof(Fixture,images);
       f.images[0].address=0x100000;
       f.images[0].pathFileOffset=offsetof(Fixture,canonical);
+      f.images[1].address=0x200000;
+      f.images[1].pathFileOffset=offsetof(Fixture,second);
       SharedCacheLoadInfo load={&f.cache,0x2000}; SharedCacheFindDylibResults result={};
       assert(findInSharedCacheImage(load,"alias",&result));
       assert((uintptr_t)result.mhInCache==0x102000 && result.slideInCache==0x2000);
-      assert(strcmp(result.pathInCache,"canonical")==0 && !result.image);
+      assert(strcmp(result.pathInCache,"canonical")==0 && !result.image && result.cacheImageIndex==0);
       // A matching format without an ImageArray must also take the safe fallback.
       f.cache.header.formatVersion=dyld3::closure::kFormatVersion;
       assert(findInSharedCacheImage(load,"alias",&result) && !result.image);
@@ -76,7 +79,7 @@ Dir.mktmpdir('cache-alias-lookup-') do |dir|
       assert(!findInSharedCacheImage(load,"alias",&result));
       f.cache.trieFound=true; f.cache.header.dylibsImageArrayAddr=1;
       assert(findInSharedCacheImage(load,"alias",&result));
-      assert(result.image==&f.cache.array.image);
+      assert(result.image==&f.cache.array.image && result.cacheImageIndex==0);
       assert((uintptr_t)result.mhInCache==(uintptr_t)&f.cache+64);
       assert(strcmp(result.pathInCache,"closure-image")==0);
       // A split cache reads its own table even though a closure ImageArray is advertised, and the
@@ -87,7 +90,14 @@ Dir.mktmpdir('cache-alias-lookup-') do |dir|
       assert(strcmp(result.pathInCache,"canonical")==0 && (uintptr_t)result.mhInCache==0x102000);
       f.cache.trieIndex=1; assert(!findInSharedCacheImage(load,"alias",&result));
       f.cache.splitCount=0; f.cache.trieIndex=0; assert(!findInSharedCacheImage(load,"canonical",&result));
-      load.loadAddress=nullptr; assert(!findInSharedCacheImage(load,"alias",&result));
+      // The index a caller records for an override: the table position, whichever route found the image.
+      f.cache.header.dylibsImageArrayAddr=0; f.cache.split=false; f.cache.header.imagesCount=2;
+      assert(findInSharedCacheImage(load,"second",&result) && result.cacheImageIndex==1 && strcmp(result.pathInCache,"second")==0);
+      f.cache.trieIndex=1; assert(findInSharedCacheImage(load,"alias",&result) && result.cacheImageIndex==1 && strcmp(result.pathInCache,"second")==0);
+      f.cache.split=true; f.cache.splitCount=2;
+      assert(findInSharedCacheImage(load,"alias",&result) && result.cacheImageIndex==1 && !result.image);
+      assert(!findInSharedCacheImage(load,"missing",&result) && result.cacheImageIndex==kNoCacheImageIndex);
+      load.loadAddress=nullptr; assert(!findInSharedCacheImage(load,"alias",&result) && result.cacheImageIndex==kNoCacheImageIndex);
       puts("PASS actual cache alias lookup, index bounds, missing ImageArray, legacy scan and closure route");
     }
   CPP

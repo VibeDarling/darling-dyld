@@ -78,11 +78,14 @@ bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLo
 #endif
 
 
+static const uint32_t kNoCacheImageIndex = 0xFFFFFFFF;
+
 struct SharedCacheFindDylibResults {
     const mach_header*          mhInCache;
-    const char*                 pathInCache;
+    const char*                 pathInCache;    // the canonical path: aliases resolve to it
     long                        slideInCache;
-    const closure::Image*       image;
+    const closure::Image*       image;          // null for split and old caches
+    uint32_t                    cacheImageIndex;// index in the cache's image table, kNoCacheImageIndex when not found
 };
 
 bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dylibPathToFind, SharedCacheFindDylibResults* results);
