@@ -65,7 +65,12 @@ module SplitCacheHarness
     #define MACH_PORT_NULL 0
     static mach_port_t mach_task_self() { return 1; }
     bool gEnableSharedCacheDataConst = true;
-    static kern_return_t vm_protect(mach_port_t, vm_address_t address, vm_size_t size, int, int prot) { return mprotect((void *)address, size, prot & 7) == 0 ? 0 : 1; }
+    // Tests inject a failure: 1 fails making a mapping writable, 2 fails putting it back read-only (nothing is changed then).
+    int gFailProtect = 0;
+    static kern_return_t vm_protect(mach_port_t, vm_address_t address, vm_size_t size, int, int prot) {
+      if ( (gFailProtect == 1 && (prot & VM_PROT_WRITE)) || (gFailProtect == 2 && !(prot & VM_PROT_WRITE)) ) return 1;
+      return mprotect((void *)address, size, prot & 7) == 0 ? 0 : 1;
+    }
     #include "dyld_cache_format.h"
     #if !__GLIBC_PREREQ(2, 38)
     static size_t strlcpy(char *d, const char *s, size_t n) { size_t l=strlen(s); if (n) { size_t c=l<n-1?l:n-1; memcpy(d,s,c); d[c]=0; } return l; }

@@ -172,10 +172,28 @@ OVERRIDE_MAIN = <<~CPP
     CHECK_ERR(cache->overridePatchGotSlots(2, good, nullptr, &stats), "cannot be made writable");
     poke(flagsField, 8, savedFlags);
     CHECK(snapshot(f).words == before.words && permissions(f.gotMapAddr) == "r--p");
+    // a failure to make the mapping writable is an error, before anything is written
+    gFailProtect = 1;
+    CHECK_ERR(cache->overridePatchGotSlots(2, good, nullptr, &stats), "could not make a DATA_CONST mapping writable");
+    gFailProtect = 0;
+    CHECK(snapshot(f).words == before.words && permissions(f.gotMapAddr) == "r--p");
+    // a mapping that is writable already (DATA_CONST by flag, but writable by protection) must stay writable
+    const uint64_t protField = flagsField + 12;                                  // initProt follows flags (8), maxProt (4)
+    uint32_t savedProt; memcpy(&savedProt, (void *)protField, 4);
+    poke(protField, 4, 3);
+    assert(mprotect((void *)f.gotMapAddr, f.gotMapSize, PROT_READ | PROT_WRITE) == 0);
+    CHECK(cache->overridePatchGotSlots(2, good, nullptr, &stats) == nullptr && stats.patched == 1);
+    CHECK(permissions(f.gotMapAddr) == "rw-p");
+    poke(protField, 4, savedProt);
+    assert(mprotect((void *)f.gotMapAddr, f.gotMapSize, PROT_READ) == 0);
+    // a failure to put the mapping back is an error too (the exporter is not marked done)
+    gFailProtect = 2;
+    CHECK_ERR(cache->overridePatchGotSlots(1, good, nullptr, &stats), "could not make a DATA_CONST mapping read-only again");
+    gFailProtect = 0;
     // a process that keeps DATA_CONST writable (gEnableSharedCacheDataConst false) is not toggled either way
     assert(mprotect((void *)f.gotMapAddr, f.gotMapSize, PROT_READ | PROT_WRITE) == 0);
     gEnableSharedCacheDataConst = false;
-    CHECK(cache->overridePatchGotSlots(2, good, nullptr, &stats) == nullptr && stats.patched == 1);
+    CHECK(cache->overridePatchGotSlots(1, good, nullptr, &stats) == nullptr && stats.patched == 6 && stats.unexplained == 1);
     CHECK(permissions(f.gotMapAddr) == "rw-p");
     printf(failures ? "RESULT failed (%d)\\n" : "RESULT ok\\n", failures);
     return failures != 0;

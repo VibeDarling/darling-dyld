@@ -1321,10 +1321,12 @@ const char* DyldSharedCache::forEachPatchPlainLocation(uint32_t imageIndex,
 static const char* const kPatchErrSign     = "patch override: the address of an exported symbol does not fit a pointer of the slot's kind";
 static const char* const kPatchErrSlot     = "patch override: a GOT slot is misaligned or lies in a mapping that cannot be made writable";
 static const char* const kPatchErrProtect  = "patch override: could not make a DATA_CONST mapping writable";
+static const char* const kPatchErrRestore  = "patch override: could not make a DATA_CONST mapping read-only again";
 
 namespace {
-// Makes the DATA_CONST mappings that a slot is written into writable, each on its first write, and puts them back to
-// read-only on the way out, however that happens. Mappings without a write are never touched.
+// Makes the read-only DATA_CONST mappings that a slot is written into writable, each on its first write, and puts them
+// back with restore() (the destructor does it too, for the early exits). A mapping that is already writable is never
+// touched, so it cannot come back read-only; mappings without a write are never touched either.
 struct PatchWriter {
     const PatchMappings&                maps;
     uint64_t                            slide;
@@ -1332,17 +1334,26 @@ struct PatchWriter {
     bool                                writable[(kMaxSplitSubCaches + 1) * kMaxSplitFileMappings] = {};
 
     PatchWriter(const PatchMappings& m, uint64_t s, DyldSharedCache::DataConstLogFunc log) : maps(m), slide(s), logFunc(log) { }
-    ~PatchWriter() {
+    ~PatchWriter() { restore(); }
+    // false when a mapping could not be made read-only again
+    bool restore() {
+        bool ok = true;
         for (uint32_t i = 0; i != maps.count; ++i) {
-            if ( writable[i] && (vm_protect(mach_task_self(), (vm_address_t)(maps.all[i].address + slide), (vm_size_t)maps.all[i].size, false, VM_PROT_READ) != KERN_SUCCESS)
-              && (logFunc != nullptr) )
-                logFunc("dyld: failed to make the shared cache GOT read-only again\n");
+            if ( !writable[i] )
+                continue;
+            writable[i] = false;
+            if ( vm_protect(mach_task_self(), (vm_address_t)(maps.all[i].address + slide), (vm_size_t)maps.all[i].size, false, VM_PROT_READ) != KERN_SUCCESS ) {
+                ok = false;
+                if ( logFunc != nullptr )
+                    logFunc("dyld: failed to make the shared cache GOT read-only again\n");
+            }
         }
+        return ok;
     }
-    // A mapping that is not DATA_CONST, or that this process keeps writable (gEnableSharedCacheDataConst is false), needs nothing.
+    // A mapping that is not DATA_CONST, is writable already, or that this process keeps writable (gEnableSharedCacheDataConst is false), needs nothing.
     bool prepare(const PatchMapping* m) {
         const uint32_t index = (uint32_t)(m - maps.all);
-        if ( writable[index] || ((m->flags & DYLD_CACHE_MAPPING_CONST_DATA) == 0) || !gEnableSharedCacheDataConst )
+        if ( writable[index] || ((m->flags & DYLD_CACHE_MAPPING_CONST_DATA) == 0) || ((m->initProt & VM_PROT_WRITE) != 0) || !gEnableSharedCacheDataConst )
             return true;
         if ( vm_protect(mach_task_self(), (vm_address_t)(m->address + slide), (vm_size_t)m->size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS )
             return false;
@@ -1432,6 +1443,8 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
             ++stats->patched;
         }
     }
+    if ( !writer.restore() )
+        return kPatchErrRestore;
     sPatchedExporters[imageIndex / 64] |= 1ULL << (imageIndex % 64);
     return nullptr;
 }
