@@ -31,6 +31,10 @@ COMMON = <<~CPP
   static size_t strlcpy(char *d, const char *s, size_t n) { size_t l=strlen(s); if (n) { size_t c=l<n-1?l:n-1; memcpy(d,s,c); d[c]=0; } return l; }
   static size_t strlcat(char *d, const char *s, size_t n) { size_t dl=strnlen(d,n); if (dl==n) return n+strlen(s); return dl+strlcpy(d+dl,s,n-dl); }
   #endif
+  // The block runtime is not linked: these blocks are never copied or escaped.
+  extern "C" { void *_NSConcreteStackBlock[32]; void *_NSConcreteGlobalBlock[32];
+               void _Block_object_assign(void*, const void*, const int) {}
+               void _Block_object_dispose(const void*, const int) {} }
   static int failures = 0;
   #define CHECK(cond) do { if (!(cond)) { printf("FAIL line %d: %s\\n", __LINE__, #cond); ++failures; } } while (0)
 CPP
@@ -267,6 +271,58 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
 
       if (failures) { printf("%d failure(s)\\n", failures); return 1; }
       puts("PASS global state of a mapped cache and the __DATA_CONST override");
+      return 0;
+    }
+  CPP
+
+  # --- libdyld asks every mapped cache for its objc tables: a split cache has none of the dyld3 image arrays ---
+  cache_src = File.read("#{root}/dyld3/shared-cache/DyldSharedCache.cpp")
+  objc_opt_fn = cache_src[/^const objc_opt::objc_opt_t\* DyldSharedCache::objcOpt\(\) const \{.*?^\}/m] or abort 'objcOpt missing'
+  objc_range_fn = cache_src[/^std::pair<const void\*, uint64_t> DyldSharedCache::getObjCConstantRange\(\) const \{.*?^\}/m] or abort 'getObjCConstantRange missing'
+  run_cpp(dir, 'objc', <<~CPP, root)
+    #{COMMON}
+    #include <utility>
+    #define TARGET_OS_OSX 1
+    namespace objc_opt { struct objc_opt_t { uint32_t version; }; static const uint32_t VERSION = 16; }
+    static int arrayCalls = 0;
+    static objc_opt::objc_opt_t gOpt = { objc_opt::VERSION };
+    static char gRanges[16];
+    namespace dyld3 {
+      namespace closure { struct Image { uint32_t cacheOffset() const { return 0; } };
+                          struct ImageArray { const Image* imageForNum(uint32_t) const { static Image i; return &i; } }; }
+      struct MachOAnalyzer {
+        struct SegmentInfo { const char* segName; };
+        struct SectionInfo { SegmentInfo segInfo; uint64_t sectAddr; const char* sectName; };
+        int64_t getSlide() const { return 0; }
+        void forEachSection(void (^cb)(const SectionInfo&, bool, bool&)) const {
+          SectionInfo info = { { "__TEXT" }, (uint64_t)(uintptr_t)&gOpt, "__objc_opt_ro" }; bool stop = false; cb(info, false, stop);
+        }
+        const void* findSectionContent(const char*, const char*, uint64_t& size) const { size = sizeof gRanges; return gRanges; }
+      };
+    }
+    struct DyldSharedCache {
+      bool split = false;
+      bool isSplitCache() const { return split; }
+      bool hasImagePath(const char*, uint32_t& index) const { index = 0; return true; }
+      const dyld3::closure::ImageArray* cachedDylibsImageArray() const { ++arrayCalls; static dyld3::closure::ImageArray a; return &a; }
+      const objc_opt::objc_opt_t* objcOpt() const;
+      std::pair<const void*, uint64_t> getObjCConstantRange() const;
+    };
+    #{objc_opt_fn}
+    #{objc_range_fn}
+    int main() {
+      DyldSharedCache cache;
+      // an ordinary cache is read exactly as before
+      CHECK(cache.objcOpt() == &gOpt);
+      CHECK(cache.getObjCConstantRange().first == gRanges && cache.getObjCConstantRange().second == sizeof gRanges);
+      CHECK(arrayCalls > 0);
+      // a split cache has no tables to give and the image array (which it does not have) is never read
+      arrayCalls = 0; cache.split = true;
+      CHECK(cache.objcOpt() == nullptr);
+      CHECK(cache.getObjCConstantRange().first == nullptr && cache.getObjCConstantRange().second == 0);
+      CHECK(arrayCalls == 0);
+      if (failures) { printf("%d failure(s)\\n", failures); return 1; }
+      puts("PASS objc tables of a split cache are absent, not read through a missing image array");
       return 0;
     }
   CPP

@@ -1076,6 +1076,10 @@ const uint8_t* DyldSharedCache::legacyCacheDataRegionBuffer() const
 
 #if !BUILDING_LIBDSC
 const objc_opt::objc_opt_t* DyldSharedCache::objcOpt() const {
+    // A split cache has no dyld3 image array to find libobjc through, and libdyld asks every mapped cache.
+    if ( isSplitCache() )
+        return nullptr;
+
     // Find the objc image
     const dyld3::MachOAnalyzer* objcMA = nullptr;
 
@@ -1148,6 +1152,9 @@ const void* DyldSharedCache::objcOptPtrs() const {
 #endif
 
 std::pair<const void*, uint64_t> DyldSharedCache::getObjCConstantRange() const {
+    if ( isSplitCache() )
+        return { nullptr, 0 };
+
     const dyld3::MachOAnalyzer* libDyldMA = nullptr;
     uint32_t imageIndex;
     if ( hasImagePath("/usr/lib/system/libdyld.dylib", imageIndex) ) {
