@@ -3550,6 +3550,46 @@ static bool isFileRelativePath(const char* path)
 static ImageLoader* loadPhase5check(const char* path, const char* orgPath, const LoadContext& context);
 
 
+static std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;
+
+const std::vector<DiskOverrideOfCacheImage>& diskOverridesOfCacheImages()
+{
+	return sDiskOverridesOfCacheImages;
+}
+
+// A split cache image has no closure Image, so the cache cannot say whether a file on disk may override it
+// (see dyld3::chooseSharedCacheLoadSource). Sets existsOnDisk and statErrNo from the stat of path.
+static bool useCacheImageWithoutClosure(const char* path, const dyld3::SharedCacheFindDylibResults& found,
+										struct stat& statBuf, bool& existsOnDisk, uint& statErrNo)
+{
+	// HACK to support old caches
+	existsOnDisk = ( dyld3::stat(path, &statBuf) == 0 );
+	statErrNo = errno;
+	const bool splitCache = sSharedCacheLoadInfo.loadAddress->isSplitCache();
+	const dyld3::SharedCacheLoadSource source = dyld3::chooseSharedCacheLoadSource(splitCache, true, existsOnDisk,
+																				  found.pathInCache, dyld3::sharedCacheAllowList());
+	if ( source == dyld3::kSharedCacheLoadFromCache ) {
+		// the stat was of a disk file that the cache now shadows: its inode and mtime must not end up on the cache image
+		if ( splitCache )
+			bzero(&statBuf, sizeof(statBuf));
+		return true;
+	}
+	if ( source == dyld3::kSharedCacheLoadFromDisk )
+		return false;
+	throwf("shared cache image has an unusable path for %s", path);
+}
+
+// the patch-table override must know which cache image a disk image stands in for
+static void recordDiskOverrideOfCacheImage(const ImageLoader* image, const dyld3::SharedCacheFindDylibResults& found)
+{
+	if ( (found.image == nullptr) && (found.cacheImageIndex != dyld3::kNoCacheImageIndex)
+	  && sSharedCacheLoadInfo.loadAddress->isSplitCache() ) {
+		DiskOverrideOfCacheImage record = { image, found.cacheImageIndex };
+		sDiskOverridesOfCacheImages.push_back(record);
+	}
+}
+
+
 // try to open file
 static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const LoadContext& context, unsigned& cacheIndex, std::vector<const char*>* exceptions)
 {
@@ -3573,6 +3613,7 @@ static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const 
 	bool existsOnDisk;
 	__block dyld3::SharedCacheFindDylibResults shareCacheResults;
 	shareCacheResults.image = nullptr;
+	shareCacheResults.cacheImageIndex = dyld3::kNoCacheImageIndex;
 
 #if TARGET_OS_SIMULATOR
 
@@ -3608,11 +3649,8 @@ static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const 
 		}
 		bool useCache = false;
 		if ( shareCacheResults.image == nullptr ) {
-			// HACK to support old caches
-			existsOnDisk = ( dyld3::stat(path, &statBuf) == 0 );
+			useCache = useCacheImageWithoutClosure(path, shareCacheResults, statBuf, existsOnDisk, statErrNo);
 			didStat = true;
-			statErrNo = errno;
-			useCache = !existsOnDisk;
 		}
 		else {
 			// <rdar://problem/7014995> zero out stat buffer so mtime, etc are zero for items from the shared cache
@@ -3686,6 +3724,9 @@ static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const 
 			if ( shareCacheResults.image != nullptr ) {
 				// if image was found in cache, but is overridden by a newer file on disk, record what the image overrides
 				imageLoader->setOverridesCachedDylib(shareCacheResults.image->imageNum());
+			}
+			else {
+				recordDiskOverrideOfCacheImage(imageLoader, shareCacheResults);
 			}
 			return imageLoader;
 		}
@@ -4022,7 +4063,8 @@ static ImageLoader* loadPhase1(const char* path, const char* orgPath, const Load
 
 	bool pathIsInDyldCacheWhichCannotBeOverridden = false;
 	if ( sSharedCacheLoadInfo.loadAddress != nullptr ) {
-		pathIsInDyldCacheWhichCannotBeOverridden = sSharedCacheLoadInfo.loadAddress->hasNonOverridablePath(path);
+		pathIsInDyldCacheWhichCannotBeOverridden = sSharedCacheLoadInfo.loadAddress->hasNonOverridablePath(path)
+												|| dyld3::pathIsPinnedToSharedCache(sSharedCacheLoadInfo, path);
 	}
 
 	// <rdar://problem/48490116> dyld customer cache cannot be overridden
