@@ -10,18 +10,7 @@ require 'open3'
 
 HERE = __dir__
 SCRIPT = ENV.fetch('ARM64E_LINK_SCRIPT', File.join(HERE, 'arm64e_link.py'))
-LD64 = ENV['LD64'].to_s
-unless !LD64.empty? && File.file?(LD64) && File.executable?(LD64)
-  puts 'SKIP arm64e-link-toy: set LD64 to the in-tree ld64 binary (aarch64-apple-darwin20-ld)'
-  exit 0
-end
-CLANG = ENV.fetch('CLANG', 'clang')
-unless system(CLANG, '--version', out: File::NULL, err: File::NULL)
-  puts "SKIP arm64e-link-toy: #{CLANG} not runnable"
-  exit 0
-end
 
-CFLAGS = %w[-ffreestanding -fno-stack-protector -O1].freeze
 $failures = 0
 
 def check(desc, ok, detail = nil)
@@ -33,6 +22,23 @@ def check(desc, ok, detail = nil)
   end
 end
 
+# The parser checks need no linker, so they run even when the toy build is skipped.
+unit, st = Open3.capture2e({ 'ARM64E_LINK_SCRIPT' => SCRIPT }, 'python3', '-I', File.join(HERE, 'parser_unit.py'))
+puts unit
+check('parser unit checks', st.success?, unit)
+
+LD64 = ENV['LD64'].to_s
+unless !LD64.empty? && File.file?(LD64) && File.executable?(LD64)
+  puts 'SKIP arm64e-link-toy: set LD64 to the in-tree ld64 binary (aarch64-apple-darwin20-ld)'
+  exit($failures.zero? ? 0 : 1)
+end
+CLANG = ENV.fetch('CLANG', 'clang')
+unless system(CLANG, '--version', out: File::NULL, err: File::NULL)
+  puts "SKIP arm64e-link-toy: #{CLANG} not runnable"
+  exit($failures.zero? ? 0 : 1)
+end
+
+CFLAGS = %w[-ffreestanding -fno-stack-protector -O1].freeze
 def tool(*args, env: {}, unset: [])
   env = env.dup
   unset.each { |k| env[k] = nil }
@@ -339,11 +345,14 @@ Dir.mktmpdir('arm64e-link-') do |dir|
   check('failed verification leaves no output', !File.exist?(bad_out) && !File.exist?("#{bad_out}.partial"))
   # Default workdir: nothing but the output remains next to it.
   clean = File.join(dir, 'clean')
+  scratch = File.join(dir, 'scratch')
   Dir.mkdir(clean)
+  Dir.mkdir(scratch)
   _o, e, s = tool(*build_args([c_arm64], File.join(clean, 'ok.dylib'), 'dylib', ['--install-name', '@rpath/ok.dylib']),
-                  env: { 'LD64' => LD64 })
+                  env: { 'LD64' => LD64, 'TMPDIR' => scratch })
   check('default workdir build succeeds', s.success?, e)
   check('default workdir build leaves only the output', Dir.children(clean) == ['ok.dylib'], Dir.children(clean).inspect)
+  check('default workdir is removed from TMPDIR', Dir.children(scratch).empty?, Dir.children(scratch).inspect)
 
   undef_src = File.join(dir, 'undef.c')
   File.write(undef_src, "extern int missing_symbol(void);\nint f(void) { return missing_symbol(); }\n")
@@ -354,10 +363,6 @@ Dir.mktmpdir('arm64e-link-') do |dir|
   _o, e, s = tool('verify', raw_e)
   check('verify refuses a clang object', !s.success? && e.include?('cpusubtype'), e)
 end
-
-unit, st = Open3.capture2e({ 'ARM64E_LINK_SCRIPT' => SCRIPT }, 'python3', '-I', File.join(HERE, 'parser_unit.py'))
-puts unit
-check('parser unit checks', st.success?, unit)
 
 puts $failures.zero? ? 'PASS arm64e-link-toy' : "FAIL arm64e-link-toy: #{$failures} check(s) failed"
 exit($failures.zero? ? 0 : 1)
