@@ -1,6 +1,8 @@
 # Maps a real split dyld shared cache with the actual mapSplitCachePrivate and checks the result against an
 # independent walk of the slide info (pread of the files, no mapping code shared with the mapper), then
-# exercises the DyldSharedCache image helpers on the mapped cache. Opt-in: it reads the cache you point it at
+# exercises the DyldSharedCache image helpers on the mapped cache. Authenticated slots are checked with the
+# PAC instructions (autia/autda with the process's own keys, so this needs a PAC-capable arm64 Linux host)
+# against the independently decoded key, modifier and target. Opt-in: it reads the cache you point it at
 # and the process peaks at several GB of memory, so it is skipped unless DYLD_REAL_CACHE_DIR is set.
 #
 #   DYLD_REAL_CACHE_DIR   directory holding dyld_shared_cache_arm64e and its sub-cache files
@@ -22,6 +24,7 @@ require_relative 'split-cache-harness'
 Dir.mktmpdir('real-cache-check-') do |dir|
   File.write("#{dir}/test.cpp", <<~CPP)
     #{SplitCacheHarness.prefix(root, real_trie: true)}
+    #include <unordered_map>
 
     // Standard export-trie walk (the tests stub the dyld one): the terminal info of symbol, or null.
     const uint8_t *dyld3::MachOLoaded::trieWalk(Diagnostics&, const uint8_t *start, const uint8_t *end, const char *symbol) {
@@ -45,6 +48,16 @@ Dir.mktmpdir('real-cache-check-') do |dir|
       return nullptr;
     }
 
+    // Independent of the mapper: authenticate a signed slot, 0 = IA key, 1 = DA key; returns the stripped pointer or garbage.
+    // On hardware with FPAC a failed authentication faults here and kills the process before the counts below are
+    // printed, which is still a loud failure of the check.
+    __attribute__((target("arch=armv8.3-a"))) static uint64_t authenticate(int isData, uint64_t value, uint64_t modifier) {
+      if (isData) asm("autda %0, %1" : "+r"(value) : "r"(modifier)); else asm("autia %0, %1" : "+r"(value) : "r"(modifier));
+      return value;
+    }
+
+    struct StubSlot { uint64_t raw = 0, valueAdd = 0; bool found = false; };
+
     static unsigned gImages, gRegions;
     static uint64_t le64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
     static uint32_t le32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -62,9 +75,9 @@ Dir.mktmpdir('real-cache-check-') do |dir|
         printf("RESULT error: %s\\n", result.errorMessage ? result.errorMessage : "(none)");
         return 1;
       }
-      printf("mapped: load=%p files=%u mappings=%u pagesWithChains=%llu plainRebased=%llu authLeftAlone=%llu\\n",
+      printf("mapped: load=%p files=%u mappings=%u pagesWithChains=%llu plainRebased=%llu authSigned=%llu authLeftAlone=%llu\\n",
              (const void *)result.loadAddress, stats.files, stats.mappings, (unsigned long long)stats.pagesWithChains,
-             (unsigned long long)stats.plainRebased, (unsigned long long)stats.authLeftAlone);
+             (unsigned long long)stats.plainRebased, (unsigned long long)stats.authSigned, (unsigned long long)stats.authLeftAlone);
 
       // independent walk of every slide-info chain straight from the files, compared with the mapped memory
       std::vector<std::string> paths; paths.push_back(mainPath);
@@ -77,7 +90,50 @@ Dir.mktmpdir('real-cache-check-') do |dir|
       }
       close(mfd);
       uint64_t regionStart = le64(hdr + 0xe0), regionSize = le64(hdr + 0xe8);
-      uint64_t pages = 0, plain = 0, auth = 0, bad = 0, outside = 0, shown = 0;
+      uint64_t pages = 0, plain = 0, auth = 0, bad = 0, outside = 0, shown = 0, authBad = 0, authOutside = 0;
+
+      // Consumer cross-check of the key and diversity bits: every arm64e auth stub (adrp x17; add x17, x17, #lo12;
+      // ldr x16, [x17]; braa x16, x17) authenticates its GOT slot with the IA key and the slot address as modifier, so
+      // that slot's chain entry must say IA, address diversity and diversity 0. The images are found through the
+      // image table and their Mach-O headers parsed here, not through the mapper's helpers.
+      std::unordered_map<uint64_t, StubSlot> stubSlots; uint64_t stubs = 0;
+      {
+        int ifd = ::open(mainPath.c_str(), O_RDONLY); assert(ifd >= 0);
+        uint32_t imagesOffset = le32(hdr + 0x1c0), imagesCount = le32(hdr + 0x1c4);
+        const uint64_t regionEnd = regionStart + regionSize;
+        for (uint32_t i = 0; i < imagesCount; ++i) {
+          uint8_t info[32]; preadall(ifd, info, sizeof info, imagesOffset + (uint64_t)i * 32);
+          uint64_t imageAddress = le64(info); assert(imageAddress >= regionStart && imageAddress + 32 < regionEnd);
+          const uint8_t *header = (const uint8_t *)imageAddress; assert(le32(header) == 0xFEEDFACF);
+          uint32_t ncmds = le32(header + 16), sizeofcmds = le32(header + 20);
+          assert(sizeofcmds <= 0x100000 && imageAddress + 32 + sizeofcmds <= regionEnd);
+          const uint8_t *cmd = header + 32, *cmdsEnd = cmd + sizeofcmds;
+          for (uint32_t c = 0; c < ncmds; ++c) {
+            assert(cmd + 8 <= cmdsEnd); uint32_t id = le32(cmd), size = le32(cmd + 4); assert(size >= 8 && cmd + size <= cmdsEnd);
+            if (id == 0x19 && size >= 72) {
+              uint32_t nsects = le32(cmd + 64); assert(72 + 80ULL * nsects <= size);
+              for (uint32_t k = 0; k < nsects; ++k) {
+                const uint8_t *sect = cmd + 72 + 80 * k;
+                if (strncmp((const char *)sect, "__auth_stubs", 16) != 0) continue;
+                uint64_t sectAddress = le64(sect + 32), sectSize = le64(sect + 40);
+                assert(sectAddress >= regionStart && sectAddress + sectSize <= regionEnd);
+                for (uint64_t off = 0; off + 16 <= sectSize; off += 16) {
+                  const uint8_t *stub = (const uint8_t *)(sectAddress + off);
+                  uint32_t adrp = le32(stub), add = le32(stub + 4);
+                  if ((adrp & 0x9F00001F) != 0x90000011 || (add & 0xFF8003FF) != 0x91000231 || le32(stub + 8) != 0xF9400230 || le32(stub + 12) != 0xD71F0A11) continue;
+                  int64_t pageDelta = (int64_t)(((adrp >> 5) & 0x7FFFF) << 2 | ((adrp >> 29) & 3));
+                  if (pageDelta & 0x100000) pageDelta -= 0x200000;
+                  uint64_t imm12 = (add >> 10) & 0xFFF; if ((add >> 22) & 1) imm12 <<= 12;
+                  uint64_t slot = (((sectAddress + off) & ~0xFFFULL) + (uint64_t)(pageDelta * 4096)) + imm12;
+                  stubSlots.emplace(slot, StubSlot()); ++stubs;
+                }
+              }
+            }
+            cmd += size;
+          }
+        }
+        close(ifd);
+      }
       for (const std::string &p : paths) {
         int fd = ::open(p.c_str(), O_RDONLY); assert(fd >= 0);
         uint8_t h[0x200]; preadall(fd, h, sizeof h, 0);
@@ -100,7 +156,17 @@ Dir.mktmpdir('real-cache-check-') do |dir|
             for (;;) {
               assert(off + 8 <= pageSize);
               uint64_t raw = le64(page.data() + off), loc = pageAddr + off, mapped = *(const uint64_t *)loc, expect;
-              if (raw >> 63) { ++auth; expect = raw; }
+              auto stubSlot = stubSlots.find(loc);
+              if (stubSlot != stubSlots.end()) stubSlot->second = {raw, valueAdd, true};
+              if (raw >> 63) {
+                // signed in place: the key, modifier and target are decoded here from the on-disk entry
+                ++auth;
+                uint64_t target = valueAdd + (raw & 0x3ffffffffULL), diversity = (raw >> 34) & 0xffff;
+                uint64_t modifier = ((raw >> 50) & 1) ? ((loc & 0x0000ffffffffffffULL) | (diversity << 48)) : diversity;
+                if (target < regionStart || target >= regionStart + regionSize) ++authOutside;
+                if (authenticate((raw >> 51) & 1, mapped, modifier) != target) ++authBad;
+                expect = mapped;   // the signed value itself is not predictable, authentication is its check
+              }
               else {
                 ++plain;
                 expect = (valueAdd + (raw & 0x3ffffffffULL)) | (((raw >> 34) & 0xff) << 56);
@@ -117,10 +183,28 @@ Dir.mktmpdir('real-cache-check-') do |dir|
         }
         close(fd);
       }
-      printf("independent walk: pages=%llu plain=%llu auth=%llu plain-targets-outside-region=%llu mismatches=%llu\\n",
-             (unsigned long long)pages, (unsigned long long)plain, (unsigned long long)auth, (unsigned long long)outside, (unsigned long long)bad);
-      assert(pages == stats.pagesWithChains && plain == stats.plainRebased && auth == stats.authLeftAlone);
-      assert(bad == 0 && outside == 0);
+      printf("independent walk: pages=%llu plain=%llu auth=%llu plain-targets-outside-region=%llu mismatches=%llu auth-targets-outside-region=%llu auth-failures=%llu\\n",
+             (unsigned long long)pages, (unsigned long long)plain, (unsigned long long)auth, (unsigned long long)outside, (unsigned long long)bad,
+             (unsigned long long)authOutside, (unsigned long long)authBad);
+      assert(pages == stats.pagesWithChains && plain == stats.plainRebased && auth == stats.authSigned && stats.authLeftAlone == 0);
+      assert(bad == 0 && outside == 0 && authOutside == 0 && authBad == 0);
+
+      uint64_t checked = 0, notChain = 0, notAuth = 0, wrongKey = 0, wrongAddrDiv = 0, wrongDiversity = 0, stubAuthBad = 0;
+      for (const auto &entry : stubSlots) {
+        const StubSlot &s = entry.second;
+        if (!s.found) { ++notChain; continue; }
+        ++checked;
+        if (!(s.raw >> 63)) { ++notAuth; continue; }
+        wrongKey += (s.raw >> 51) & 1;
+        wrongAddrDiv += !((s.raw >> 50) & 1);
+        wrongDiversity += ((s.raw >> 34) & 0xffff) != 0;
+        if (authenticate(0, *(const uint64_t *)entry.first, entry.first & 0x0000ffffffffffffULL) != s.valueAdd + (s.raw & 0x3ffffffffULL)) ++stubAuthBad;
+      }
+      uint64_t violations = notAuth + wrongKey + wrongAddrDiv + wrongDiversity + stubAuthBad;
+      printf("auth stubs: stubs=%llu slots=%zu checked=%llu not-chain-entries=%llu violations=%llu (not-auth=%llu wrong-key=%llu no-addr-div=%llu diversity-not-0=%llu autia-failures=%llu)\\n",
+             (unsigned long long)stubs, stubSlots.size(), (unsigned long long)checked, (unsigned long long)notChain, (unsigned long long)violations,
+             (unsigned long long)notAuth, (unsigned long long)wrongKey, (unsigned long long)wrongAddrDiv, (unsigned long long)wrongDiversity, (unsigned long long)stubAuthBad);
+      assert(checked > 0 && violations == 0);
 
       const DyldSharedCache *cache = result.loadAddress;
       if (image) {
@@ -146,5 +230,5 @@ Dir.mktmpdir('real-cache-check-') do |dir|
   out, st = Open3.capture2e("#{dir}/test", *args)
   puts out
   abort 'real-cache check failed' unless st.success? && out.include?('RESULT ok')
-  puts 'PASS real cache mapped, every slide-info slot matches an independent walk, image helpers agree'
+  puts 'PASS real cache mapped, plain slots match an independent walk, every authenticated slot authenticates to its target, auth stubs agree with the key and diversity bits, image helpers agree'
 end
