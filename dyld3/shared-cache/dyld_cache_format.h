@@ -633,6 +633,134 @@ struct dyld_cache_patchable_location
                 discriminator           : 16;
 };
 
+// Version 4 patch info of a split macOS cache (patchInfoAddr points at dyld_cache_patch_info_v4, whose first word
+// is the version; the version 1 struct above has no version word). The layout was derived from a real macOS 26
+// arm64e cache, not from an Apple header, so every reader must validate it (DyldSharedCache::checkPatchInfoV4*).
+// Tables are per EXPORTING image (the index of the cache's image table). The GOT tables describe the cache's
+// coalesced GOT: one slot per bound symbol shared by all images, listed under the exporter, naming no client.
+struct dyld_cache_patch_info_v4
+{
+    uint32_t    patchTableVersion;          // 4
+    uint32_t    patchLocationVersion;       // 0
+    uint64_t    patchTableArrayAddr;        // (unslid) dyld_cache_image_patches_v4 per image
+    uint64_t    patchTableArrayCount;
+    uint64_t    imageExportsArrayAddr;      // dyld_cache_patchable_export_v4
+    uint64_t    imageExportsArrayCount;
+    uint64_t    clientsArrayAddr;           // dyld_cache_patch_client_v4
+    uint64_t    clientsArrayCount;
+    uint64_t    clientExportsArrayAddr;     // dyld_cache_patch_client_export_v4
+    uint64_t    clientExportsArrayCount;
+    uint64_t    locationArrayAddr;          // dyld_cache_patchable_location_v4
+    uint64_t    locationArrayCount;
+    uint64_t    exportNamesAddr;            // NUL-terminated strings
+    uint64_t    exportNamesSize;
+    uint64_t    gotClientsArrayAddr;        // dyld_cache_image_got_clients_v4 per image
+    uint64_t    gotClientsArrayCount;
+    uint64_t    gotClientExportsArrayAddr;  // dyld_cache_got_client_export_v4
+    uint64_t    gotClientExportsArrayCount;
+    uint64_t    gotLocationArrayAddr;       // dyld_cache_patchable_got_location_v4
+    uint64_t    gotLocationArrayCount;
+};
+
+struct dyld_cache_image_patches_v4              // slices tile their arrays in image order
+{
+    uint32_t    clientsStartIndex;
+    uint32_t    clientsCount;
+    uint32_t    exportsStartIndex;
+    uint32_t    exportsCount;
+};
+
+struct dyld_cache_patchable_export_v4
+{
+    uint32_t    dylibOffsetOfImpl;          // from the exporting image's mach header
+    uint32_t    nameKind;                   // bits 0-27 offset into the names, bits 28-31 kind (not interpreted)
+};
+
+struct dyld_cache_patch_client_v4
+{
+    uint32_t    clientDylibIndex;
+    uint32_t    exportsStartIndex;          // slice of clientExports
+    uint32_t    exportsCount;
+};
+
+struct dyld_cache_patch_client_export_v4
+{
+    uint32_t    imageExportIndex;           // absolute index into imageExports, inside the exporter's slice
+    uint32_t    locationsStartIndex;        // slice of locations
+    uint32_t    locationsCount;
+};
+
+struct dyld_cache_patchable_location_v4
+{
+    uint32_t    dylibOffsetOfUse;           // from the CLIENT image's mach header
+    uint32_t    flags;                      // see decodeCachePatchFlagsV4
+};
+
+struct dyld_cache_image_got_clients_v4
+{
+    uint32_t    exportsStartIndex;          // slice of gotClientExports
+    uint32_t    exportsCount;
+};
+
+struct dyld_cache_got_client_export_v4
+{
+    uint32_t    imageExportIndex;
+    uint32_t    locationsStartIndex;        // slice of gotLocations
+    uint32_t    locationsCount;
+};
+
+struct dyld_cache_patchable_got_location_v4
+{
+    uint32_t    cacheOffsetLo;              // 64-bit offset of the slot from the cache base
+    uint32_t    cacheOffsetHi;
+    uint32_t    flags;
+    uint32_t    reserved;                   // always 0
+};
+
+#ifdef __cplusplus
+static_assert(sizeof(dyld_cache_patch_info_v4) == 152, "patch info v4 size");
+static_assert(sizeof(dyld_cache_image_patches_v4) == 16, "patch info v4 patchTable record");
+static_assert(sizeof(dyld_cache_patchable_export_v4) == 8, "patch info v4 export record");
+static_assert(sizeof(dyld_cache_patch_client_v4) == 12, "patch info v4 client record");
+static_assert(sizeof(dyld_cache_patch_client_export_v4) == 12, "patch info v4 clientExport record");
+static_assert(sizeof(dyld_cache_patchable_location_v4) == 8, "patch info v4 location record");
+static_assert(sizeof(dyld_cache_image_got_clients_v4) == 8, "patch info v4 gotClients record");
+static_assert(sizeof(dyld_cache_got_client_export_v4) == 12, "patch info v4 gotClientExport record");
+static_assert(sizeof(dyld_cache_patchable_got_location_v4) == 16, "patch info v4 gotLocation record");
+static_assert(offsetof(dyld_cache_patch_info_v4, exportNamesAddr) == 0x58, "patch info v4 exportNamesAddr");
+static_assert(offsetof(dyld_cache_patch_info_v4, gotLocationArrayCount) == 0x90, "patch info v4 gotLocationArrayCount");
+
+// The meaning of a patch location's flags word, the same for both location tables:
+//   bit 0 authenticated; bits 1-7 high7 (the top byte of an unauthenticated pointer is high7 << 1);
+//   bit 8 not understood (set on about 0.1% of locations, no effect on key, diversity, addend or target);
+//   bits 9-13 addend, bits 9-15 for an unauthenticated pointer; bit 14 address diversity; bit 15 key (1 = DA, 0 = IA);
+//   bits 16-31 discriminator. The slot holds exporter mach header + dylibOffsetOfImpl + addend.
+struct dyld_cache_patch_encoding_v4
+{
+    bool        authenticated;
+    bool        usesAddressDiversity;
+    bool        keyIsData;
+    bool        bit8;
+    uint8_t     high7;
+    uint8_t     addend;
+    uint16_t    discriminator;
+};
+
+// False when the word has a bit set that the layout above does not explain: an authenticated pointer with a
+// high7 (its top byte is the signature) or an unauthenticated pointer with a discriminator. Nobody may guess then.
+static inline bool decodeCachePatchFlagsV4(uint32_t flags, dyld_cache_patch_encoding_v4* out)
+{
+    out->authenticated        = (flags & 1) != 0;
+    out->high7                = (uint8_t)((flags >> 1) & 0x7f);
+    out->bit8                 = (flags & (1u << 8)) != 0;
+    out->addend               = (uint8_t)(out->authenticated ? (flags >> 9) & 0x1f : (flags >> 9) & 0x7f);
+    out->usesAddressDiversity = out->authenticated && ((flags >> 14) & 1);
+    out->keyIsData            = out->authenticated && ((flags >> 15) & 1);
+    out->discriminator        = (uint16_t)(out->authenticated ? flags >> 16 : 0);
+    return out->authenticated ? (out->high7 == 0) : ((flags >> 16) == 0);
+}
+#endif
+
 
 // This is the  location of the macOS shared cache on macOS 11.0 and later
 #define MACOSX_MRM_DYLD_SHARED_CACHE_DIR   "/System/Library/dyld/"
