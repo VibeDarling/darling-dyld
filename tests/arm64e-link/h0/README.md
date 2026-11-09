@@ -126,6 +126,40 @@ Check first that the variables reach the guest process (the launcher may filter
 the environment) and that no `*linkonly*` file exists under `<priv>`. Never kill
 darling, darlingserver or mldr; use `darling shutdown`.
 
+## PAC-leaf test (libexpat)
+
+The same recipe with libexpat as the leaf: `build_h0.py build --out DIR --leaf libexpat`
+builds `h0_expat_main` and a link-only `libexpat.1.linkonly.dylib` (install name
+`/usr/lib/libexpat.1.dylib`, compat 7.0.0, current 8.0.0 as in the cache; the same
+rule applies: never install a stub). `arm64e-link-pac-leaf.rb` checks it.
+
+`expat_main.c` exits 0 only if: the version starts with `expat_`; a UTF-8 document (DOCTYPE with an
+internal entity, comment, processing instruction, CDATA, character and predefined references,
+attributes, a multi-byte character) parses whole with the expected element, attribute and text
+counts; the same document parses one byte per call; a UTF-16LE document with a byte order mark
+parses; and a mismatched tag returns `XML_ERROR_TAG_MISMATCH`. It prints
+`h0 expat OK <expat version>` through `write`, so the log shows which libexpat ran (Darling's own
+copy is on disk too).
+
+Why libexpat. Candidates were counted in the split cache by walking the slide-info-v5 chains of
+each image's data segments (authenticated / plain slots) and by reading the dependencies and imports:
+
+| image | auth slots | plain slots | dependencies | imports with callbacks into libSystem |
+|---|---|---|---|---|
+| libsqlite3 | 918 | 919 | libSystem | yes: `dispatch_once` with a block |
+| libexpat | 260 | 338 | libSystem | none |
+| libcompression | 522 | 55 | liblzma, libSystem | yes: `dispatch_apply`, `pthread_create` |
+| libxml2 | 247 | 3215 | libicucore, libz, libSystem | not examined (libicucore) |
+| libz | 10 | 15 | libSystem | none |
+| libbz2 | 0 | 16 | libSystem | none |
+
+An image whose imports take a function pointer or block from Darling's plain arm64 libSystem family
+cannot work: the arm64e caller signs the pointer and the plain callee branches to it unauthenticated.
+libsqlite3 was run in a guest first and died exactly there (SIGSEGV in Darling's
+`_dispatch_client_callout` under `_dispatch_once_f` under libsqlite3). libexpat's 20 imports are
+plain data functions (malloc, memmove, fprintf, getenv, arc4random_buf, ...) and all are exported by
+Darling's libSystem family (checked with llvm-nm against the private prefix).
+
 ## What a guest run still needs beyond this task
 
 - 3.1 allow-list (libz served from the cache although a disk copy exists) and 3.2
