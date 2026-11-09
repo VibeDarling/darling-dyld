@@ -8,8 +8,8 @@ libSystem family stays on disk. Built with the 3.3a recipe (`../arm64e_link.py`,
 reused as a module, not copied).
 
 ```
-LD64=/path/to/aarch64-apple-darwin20-ld SDKROOT=/path/to/MacOSX.sdk \
-  ruby tests/arm64e-link/h0/arm64e-link-h0.rb          # test, prints SKIP without both variables
+LD64=/path/to/aarch64-apple-darwin20-ld [SDKROOT=/path/to/MacOSX.sdk] [LIBZ_EXP=.../src/external/zlib/libz.exp] \
+  ruby tests/arm64e-link/h0/arm64e-link-h0.rb   # SKIP without LD64; SDKROOT and LIBZ_EXP enable two extra checks
 LD64=... python3 -I tests/arm64e-link/h0/build_h0.py build --out DIR    # just build and check
 ```
 
@@ -39,10 +39,14 @@ prefix and image.
 
 ## Choices
 
-- libz stub: compatibility 1.0.0 (any libz 1.x satisfies it, and compatibility is
-  what dyld compares), current 1.2.12 (macOS's libz as far as I remember; not
-  verified, never compared). Exports the public zlib 1.x API listed in
-  `libz_symbols.txt` (81 names; the test uses 11).
+- libz stub: compatibility 1.0.0 and current 1.2.11, as in Darling's own libz
+  (`src/external/zlib/CMakeLists.txt`). Both are cosmetic here: dyld2 skips the
+  compatibility check when the loaded dylib was built for macOS 10.14 or later
+  (`ImageLoader.cpp` ~787-788, `enforceCompatVersion()` in `dyld3/MachOFile.cpp`
+  ~931-938), which the cache's libz is, so neither the recorded nor the real
+  version is compared. The stub exports exactly the 11 libz names the program
+  imports (`libz_symbols.txt`); all are in Darling's `libz.exp`, and the test
+  checks that when `LIBZ_EXP` points at that file.
 - libSystem: what the Darling SDK offers was probed. `usr/lib/libSystem.dylib` is
   a symlink into the Darling build tree (`build/src/external/libsystem/libSystem.B.dylib`).
   It is a real dylib, not a `.tbd`, plain arm64 (cpusubtype ALL, no arm64e slice),
@@ -52,8 +56,8 @@ prefix and image.
   (it finds the re-exports under the SDK root), but not by bare path (it fails on
   `/usr/lib/system/libsystem_sandbox.dylib`). Because the file is plain arm64 and
   depends on whatever the build tree holds, the default is a link-only arm64e stub
-  exporting `_write`, with compat 1.0.0 like Darling's, current 1351.0.0 (from
-  memory, unverified). `--libsystem sdk` links the SDK file instead; the test
+  exporting `_write`, with compat 1.0.0 like Darling's, current 1281.0.0 (like the SDK
+  file; cosmetic for the same reason). `--libsystem sdk` links the SDK file instead; the test
   asserts the same dependencies and import table either way. The SDK is only read.
 - Entry: `-e _main` is enough. With chained fixups ld64 needs no `start`, no
   `dyld_stub_binder` and no `__mh_execute_header`; it emits `LC_MAIN`, dyld hands
@@ -72,10 +76,11 @@ diversity set and diversity 0, with calls through `__auth_stubs`; dyld signs
 them at load time (MachOLoaded.cpp ~1226-1253). The stubs export exactly their
 symbol lists with the expected install name and versions, no dependencies, and a
 `brk #1` at each entry. The test program's logic is also run natively against the
-host libz, with injected failures for exit codes 1, 2, 4, 7 and 8. Failure paths
-and seven mutation probes (wrong install name, wrong ordinal, caps byte not
-cleared, missing export, undefined extra symbol, extra provided import, stub
-without trap) each must fail.
+host libz, with injected failures for exit codes 1, 2, 4, 7, 8 and 13 (a deflate()
+that truncates its output). The executable's `LC_BUILD_VERSION` must be minos and
+sdk 13.0. Failure paths and nine mutation probes (wrong install name, wrong ordinal,
+caps byte not cleared, missing export, undefined extra symbol, extra provided
+import, stub without trap, minos 11.0, sdk 11.0) each must fail.
 
 It does not prove that Darling's dyld loads the image, signs the binds, or serves
 libz from the cache.
@@ -121,8 +126,22 @@ Check first that the variables reach the guest process (the launcher may filter
 the environment) and that no `*linkonly*` file exists under `<priv>`. Never kill
 darling, darlingserver or mldr; use `darling shutdown`.
 
+## What a guest run still needs beyond this task
+
+- 3.1 allow-list (libz served from the cache although a disk copy exists) and 3.2
+  GOT override, both landed on their own branches.
+- 1.5 cache source (the cache directory for `DYLD_SHARED_CACHE_SPLIT_DIR`) and the
+  D1 private Darling build.
+- Confirmation that `DYLD_SHARED_CACHE_SPLIT_DIR` and the `DYLD_PRINT_*` variables
+  reach the guest process.
+- Confirmation that Darling's plain-arm64 libSystem loads into an arm64e process
+  (`src/dyld2.cpp` ~2878-2923; the check at ~3471 is off without `ptrauth_calls`).
+- Confirmation that the run signs the binds: PAC signing is inline asm in
+  `MachOLoaded.cpp` ~1015-1053, and `main` uses `pacibsp`/`retab`, so the IA and IB
+  keys must both work.
+
 ## Not verified
 
-Compat and current versions of the real cache libz and libSystem (no cache access);
-that `darling` forwards the `DYLD_*` variables; the exact bind log wording; that
-dyld loads or runs the executable at all.
+The real cache libz and libSystem versions (no cache access; they do not matter
+for the load, see above); that `darling` forwards the `DYLD_*` variables; the exact
+bind log wording; that dyld loads or runs the executable at all.
