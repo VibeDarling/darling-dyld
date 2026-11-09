@@ -131,6 +131,13 @@ static_assert(offsetof(dyld_cache_header, imagesOffsetSplit) == 0x1c0, "dyld_cac
 static_assert(offsetof(dyld_cache_header, imagesCountSplit) == 0x1c4, "dyld_cache_header::imagesCountSplit");
 static_assert(sizeof(dyld_cache_header) == 0x228, "dyld_cache_header size");
 
+// [address, address + size) lies inside [start, start + length), without any of the sums wrapping.
+static inline bool dyld_cache_range_contains(uint64_t start, uint64_t length, uint64_t address, uint64_t size)
+{
+    return length <= UINT64_MAX - start && address >= start
+        && address - start <= length && size <= length - (address - start);
+}
+
 // The main file of a split cache: its header has the split fields and lists the images there (a legacy
 // header with a grown mappingOffset has zeros in them). Such a file holds anywhere from one mapping up.
 static inline bool dyld_cache_header_is_split(const dyld_cache_header& header)

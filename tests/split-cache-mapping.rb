@@ -1,4 +1,4 @@
-# Actual mapSplitCachePrivate and slide-info-v5 rebase, run against
+# Actual mapSplitCachePrivate, slide-info-v5 rebase and the DyldSharedCache image helpers, run against
 # a synthetic 3-file split cache (tests/gen-split-cache-fixture.py). No Apple cache content is used.
 # Requires Linux (MAP_FIXED, /proc/self/maps), Ruby, python3 and clang++.
 # Usage: ruby tests/split-cache-mapping.rb [checkout] [base-address]
@@ -15,6 +15,13 @@ reservation = runtime[/static int mmapProtection\(.*?^\}/m].to_s + "\n" + (runti
 range_helper = runtime[/static bool cacheRangeContains\(.*?(?=^static bool preflightCacheFile)/m] or abort 'range helpers missing'
 split_code = runtime[/^static const uint32_t kSplitMaxFileMappings.*?^bool mapSplitCachePrivate\(.*?^\}/m] or abort 'split mapper missing'
 stats_struct = runtime_h[/struct SplitCacheMapStats \{.*?^\};/m] or abort 'stats struct missing'
+image_funcs = %w[imageTable isSplitCache forEachRegion forEachImage getIndexedImageEntry getIndexedImagePath
+                 findMachHeaderImageIndex hasImagePath mappedSize].map do |name|
+  cache_src[/^[^\n]*\bDyldSharedCache::#{name}\(.*?^\}/m] or abort "#{name} missing"
+end
+image_helper = cache_src[/^static const uint32_t kMaxSplitSubCaches.*?^static bool splitCacheTables\(.*?^\}/m] or abort 'split region walk missing'
+image_helper += "\n" + (cache_src[/^static const dyld_cache_image_info\* cacheImageTable\(.*?^\}/m] or abort 'image table helper missing')
+
 # variant => nil (maps) or the substring the error message must contain
 host_page = `getconf PAGESIZE`.to_i
 VARIANTS = {
@@ -65,6 +72,7 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
     #include <assert.h>
     #include <errno.h>
     #include <string>
+    #include <vector>
     #define DARLING 1
     #define TARGET_OS_SIMULATOR 0
     #define __offsetof offsetof
@@ -73,7 +81,30 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
     #if !__GLIBC_PREREQ(2, 38)
     static size_t strlcpy(char *d, const char *s, size_t n) { size_t l=strlen(s); if (n) { size_t c=l<n-1?l:n-1; memcpy(d,s,c); d[c]=0; } return l; }
     #endif
-    struct DyldSharedCache { dyld_cache_header header; };
+    // The block runtime is not linked: these blocks are never copied or escaped.
+    extern "C" { void *_NSConcreteStackBlock[32]; void *_NSConcreteGlobalBlock[32];
+                 void _Block_object_assign(void*, const void*, const int) {}
+                 void _Block_object_dispose(const void*, const int) {} }
+    struct mach_header { uint32_t magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags; };
+    struct Diagnostics {};
+    namespace dyld3 {
+      struct MachOLoaded { static const uint8_t *trieWalk(Diagnostics&, const uint8_t*, const uint8_t*, const char*) { return nullptr; } };
+      struct MachOFile { static uint64_t read_uleb128(Diagnostics&, const uint8_t*&, const uint8_t*) { return 0; } };
+    }
+    struct DyldSharedCache {
+      dyld_cache_header header;
+      const dyld_cache_image_info *imageTable(uint32_t&) const;
+      bool isSplitCache() const;
+      void forEachRegion(void (^)(const void*, uint64_t, uint64_t, uint32_t, uint32_t, uint64_t)) const;
+      void forEachImage(void (^)(const mach_header*, const char*)) const;
+      const mach_header *getIndexedImageEntry(uint32_t, uint64_t&, uint64_t&) const;
+      const char *getIndexedImagePath(uint32_t) const;
+      bool findMachHeaderImageIndex(const mach_header*, uint32_t&) const;
+      bool hasImagePath(const char*, uint32_t&) const;
+      uint64_t mappedSize() const;
+    };
+    #{image_helper}
+    #{image_funcs.join("\n")}
     namespace dyld { static void log(const char *format, ...) { va_list a; va_start(a, format); printf("LOG "); vprintf(format, a); va_end(a); } }
     namespace dyld3 {
       struct SharedCacheLoadInfo { const DyldSharedCache *loadAddress; long slide; const char *errorMessage; char path[256]; };
@@ -95,6 +126,25 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
       }
       fclose(maps); return perms;
     }
+    static const char *current;
+    static unsigned seenImages; static char seenName[128];
+    static unsigned regionCount; static uint64_t regionAddress[8]; static const void *regionContent[8]; static uint32_t regionProt[8];
+
+    static unsigned countRegions(const DyldSharedCache *cache) {
+      regionCount = 0;
+      cache->forEachRegion(^(const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint64_t) { ++regionCount; });
+      return regionCount;
+    }
+    // Overwrites a word of a mapped header (private pages), checks the region walk gives up, then restores it.
+    template <typename T> static void corruptAndCheck(const DyldSharedCache *cache, uint64_t address, T value) {
+      uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+      assert(mprotect((void *)(address & ~(page - 1)), page, PROT_READ | PROT_WRITE) == 0);
+      T saved = *(T *)address; *(T *)address = value;
+      assert(countRegions(cache) == 0);
+      *(T *)address = saved;
+      assert(countRegions(cache) == 3);
+    }
+
     int main(int argc, char **argv) {
       assert(argc == 2);
       std::string dir = argv[1];
@@ -140,11 +190,68 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
       assert(permissions(base + 0x10000) == "rw-p" && permissions(base + 0x1C000) == "rw-p");
       assert(permissions(base + 0x4000) == "r-xp" && permissions(base + 0x20000) == "---p");
 
+      // image helpers over the mapped main header
+      const DyldSharedCache *cache = result.loadAddress;
+      uint32_t index = 99;
+      assert(cache->hasImagePath(installName, index) && index == 0);
+      assert(!cache->hasImagePath("/usr/lib/libnothere.dylib", index));
+      assert(strcmp(cache->getIndexedImagePath(0), installName) == 0);
+      uint64_t mTime, inode;
+      const mach_header *mh = cache->getIndexedImageEntry(0, mTime, inode);
+      assert((uint64_t)mh == imageAddress && mh->magic == 0xFEEDFACF);
+      const uint32_t *idCommand = (const uint32_t *)((const char *)mh + 32);
+      assert(idCommand[0] == 0xD && strcmp((const char *)idCommand + idCommand[2], installName) == 0);
+      uint32_t found = 99; assert(cache->findMachHeaderImageIndex(mh, found) && found == 0);
+      cache->forEachImage(^(const mach_header *header, const char *name) {
+        ++seenImages; strncpy(seenName, name, sizeof seenName - 1); assert(header == (const mach_header *)imageAddress);
+      });
+      assert(seenImages == 1 && strcmp(seenName, installName) == 0);
+      assert(cache->mappedSize() == regionSize);
+      // all three files' mappings are enumerated, with content at the mapped VM address
+      cache->forEachRegion(^(const void *content, uint64_t address, uint64_t, uint32_t initProt, uint32_t, uint64_t) {
+        regionAddress[regionCount] = address; regionContent[regionCount] = content; regionProt[regionCount++] = initProt;
+      });
+      assert(regionCount == 3);
+      assert(regionAddress[0] == base && regionAddress[1] == base + 0x8000 && regionAddress[2] == base + 0x10000);
+      for (unsigned i = 0; i < 3; ++i) assert(regionContent[i] == (const void *)regionAddress[i]);
+      assert(regionProt[0] == 5 && regionProt[1] == 5 && regionProt[2] == 3);
+      uint32_t tableCount = 0; assert(cache->isSplitCache() && cache->imageTable(tableCount) && tableCount == 1);
+      // The walk reads the mapped headers: a table that is not inside its header's first mapping, an
+      // entry that does not point at a header, or a first mapping that does not start the file each make
+      // it enumerate nothing.
+      assert(countRegions(cache) == 3);
+      corruptAndCheck<uint32_t>(cache, base + 0x8000 + 0x138, 0x8000);        // .01 table offset outside its first mapping
+      corruptAndCheck<uint32_t>(cache, base + 0x8000 + 0x138, 0x100000);     // .01 table offset past the region: must not be read
+      corruptAndCheck<uint32_t>(cache, base + 0x8000 + 0x13c, 0);             // .01 mapping count 0
+      corruptAndCheck<uint32_t>(cache, base + 0x8000 + 0x13c, 21);            // .01 mapping count too large
+      corruptAndCheck<uint32_t>(cache, base + 0x10000 + 0x138, 3);            // .02 table offset misaligned
+      corruptAndCheck<uint64_t>(cache, base + 0x8000 + 0x280, base + 0x9000); // .01 first mapping elsewhere than its header
+      corruptAndCheck<uint32_t>(cache, base + 0x18c, 33);                     // main sub-cache count too large
+      corruptAndCheck<uint32_t>(cache, base + 0x188, 0x7ff8);                 // main sub-cache array outside its first mapping
+      corruptAndCheck<uint32_t>(cache, base + 0x188, 0x100000);               // ... far outside: must not be read
+      corruptAndCheck<uint64_t>(cache, base + 0x300 + 16, regionSize);        // sub-cache entry outside the region
+      corruptAndCheck<uint64_t>(cache, base + 0x280 + 16, 0x4000);            // main first mapping not at file offset 0
+      // a table at a misaligned offset, otherwise valid (a copy of .01's own table)
+      {
+        uint8_t *header = (uint8_t *)(base + 0x8000);
+        assert(mprotect(header, (size_t)sysconf(_SC_PAGESIZE), PROT_READ | PROT_WRITE) == 0);
+        memcpy(header + 0x3c1, header + 0x280, 56);
+        corruptAndCheck<uint32_t>(cache, base + 0x8000 + 0x138, 0x3c1);
+      }
+      // more sub-caches than the walk allows, all of them well formed (entries pointing back at the main header)
+      {
+        uint8_t *entries = (uint8_t *)(base + 0x300);
+        std::vector<uint8_t> saved(entries + 112, entries + 33 * 56);
+        memset(entries + 112, 0, saved.size());
+        corruptAndCheck<uint32_t>(cache, base + 0x18c, 33);
+        memcpy(entries + 112, saved.data(), saved.size());
+        assert(countRegions(cache) == 3);
+      }
       printf("RESULT ok\\n");
       return 0;
     }
   CPP
-  out, st = Open3.capture2e('clang++', '-std=c++17', '-fsanitize=undefined', '-Wno-unused-value',
+  out, st = Open3.capture2e('clang++', '-std=c++17', '-fblocks', '-fsanitize=address,undefined', '-Wno-unused-value',
                             "-I#{root}/dyld3/shared-cache", "#{dir}/test.cpp", '-o', "#{dir}/test")
   abort out unless st.success?
   failures = 0
@@ -163,6 +270,13 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
       puts out.lines.last(8).join
     end
   end
+  # a second cache at another base, mapped by a fresh process, enumerates its own regions
+  other = '0x1c0000000'
+  out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/other", '--base', other)
+  abort out unless st.success?
+  out, st = Open3.capture2e("#{dir}/test", "#{dir}/other")
+  puts "#{out[/^RESULT .*$/] == 'RESULT ok' && st.success? ? 'ok  ' : 'FAIL'} valid at #{other}"
+  failures += 1 unless out[/^RESULT .*$/] == 'RESULT ok' && st.success?
   abort "#{failures} split-cache mapping scenario(s) failed" unless failures.zero?
-  puts 'PASS split cache mapping, plain rebase, authenticated entries untouched and counted'
+  puts 'PASS split cache mapping, plain rebase, authenticated entries untouched and counted, and image lookup'
 end

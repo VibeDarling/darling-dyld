@@ -12,7 +12,7 @@ header = File.read("#{root}/dyld3/shared-cache/dyld_cache_format.h")
 max_mappings = File.read("#{root}/dyld3/shared-cache/DyldSharedCache.h")[/MaxMappings = (\d+)/, 1] or abort 'mapping limit missing'
 structs = %w[dyld_cache_header dyld_cache_mapping_info dyld_cache_mapping_and_slide_info dyld_cache_image_info].map do |name|
   header[/struct #{name}\s*\{.*?^\};/m] or abort "missing #{name}"
-end.join("\n") + "\n" + (header[/static inline bool dyld_cache_header_is_split\(.*?^\}/m] or abort 'split predicate missing')
+end.join("\n") + "\n" + (header.scan(/static inline bool dyld_cache_\w+\(.*?^\}/m).join("\n") or abort 'split predicate missing')
 
 # variant => true when the main file must be accepted, else the error it must be rejected with
 VARIANTS = {

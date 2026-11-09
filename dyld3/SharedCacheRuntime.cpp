@@ -391,8 +391,7 @@ static void verboseSharedCacheMappingsToConsole(const shared_file_mapping_slide_
 static bool cacheRangeContains(uint64_t start, uint64_t length,
                                uint64_t address, uint64_t size)
 {
-    return length <= UINT64_MAX - start && address >= start
-        && address - start <= length && size <= length - (address - start);
+    return dyld_cache_range_contains(start, length, address, size);
 }
 
 // A mapping protection must be non-empty, within read/write/execute and never writable and executable at once.
@@ -1601,15 +1600,17 @@ bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dyl
         return false;
 
     if ( (loadInfo.loadAddress->header.formatVersion != dyld3::closure::kFormatVersion)
-      || (loadInfo.loadAddress->header.dylibsImageArrayAddr == 0) ) {
+      || (loadInfo.loadAddress->header.dylibsImageArrayAddr == 0)
+      || loadInfo.loadAddress->isSplitCache() ) {
         // support for older cache with a different Image* format
 #if TARGET_OS_IPHONE
         uint64_t hash = 0;
         for (const char* s=dylibPathToFind; *s != '\0'; ++s)
                 hash += hash*4 + *s;
 #endif
-        const dyld_cache_image_info* const start = (dyld_cache_image_info*)((uint8_t*)loadInfo.loadAddress + loadInfo.loadAddress->header.imagesOffset);
-        const dyld_cache_image_info* const end = &start[loadInfo.loadAddress->header.imagesCount];
+        uint32_t imagesCount;
+        const dyld_cache_image_info* const start = loadInfo.loadAddress->imageTable(imagesCount);
+        const dyld_cache_image_info* const end = &start[imagesCount];
         // The path trie can outlive the dyld3 ImageArray format. Use recorded
         // aliases (including framework Current paths), not guessed versions.
         uint32_t aliasIndex = 0;
@@ -1617,7 +1618,7 @@ bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dyl
           && loadInfo.loadAddress->header.dylibsTrieAddr != 0
           && loadInfo.loadAddress->header.dylibsTrieSize != 0
           && loadInfo.loadAddress->hasImagePath(dylibPathToFind, aliasIndex)
-          && aliasIndex < loadInfo.loadAddress->header.imagesCount ) {
+          && aliasIndex < imagesCount ) {
             const dyld_cache_image_info* p = &start[aliasIndex];
             results->mhInCache = (const mach_header*)(p->address + loadInfo.slide);
             results->pathInCache = (const char*)loadInfo.loadAddress + p->pathFileOffset;
