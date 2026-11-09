@@ -6932,6 +6932,8 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 #else
 	// Off unless DYLD_SHARED_CACHE_SPLIT_DIR names a split macOS cache. Prebuilt closures do not exist for a split cache.
 	if ( sSharedCacheSplitDir != nullptr ) {
+		// the cache is private to this process, and addImage only records its dylibs' UUIDs in that mode
+		gLinkContext.sharedRegionMode = ImageLoader::kUsePrivateSharedRegion;
 		mapSplitSharedCache(mainExecutableMH);
 		sClosureMode = ClosureMode::Off;
 		// mapSplitCachePrivate maps __DATA_CONST read-only whatever this process wants, so that is the state to match

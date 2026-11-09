@@ -412,7 +412,7 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
   abort "split wiring outside a DARLING-only region at dyld2.cpp lines #{stray}" unless stray.empty?
   abort 'mapSplitSharedCache has an unexpected number of uses' unless dyld2.scan(/\bmapSplitSharedCache\(/).size == 2
   entry = dyld2[/^#else\n(\t\/\/ Off unless DYLD_SHARED_CACHE_SPLIT_DIR.*?)^#endif \/\/ !DARLING/m, 1] or abort 'DARLING branch of the cache block missing'
-  abort 'the call is not guarded by the variable' unless entry =~ /\A[^\n]*\n\s*if \( sSharedCacheSplitDir != nullptr \) \{\n\s*mapSplitSharedCache\(mainExecutableMH\);/
+  abort 'the call is not guarded by the variable' unless entry =~ /\A[^\n]*\n\s*if \( sSharedCacheSplitDir != nullptr \) \{\n(?:\s*\/\/[^\n]*\n)?\s*gLinkContext\.sharedRegionMode = ImageLoader::kUsePrivateSharedRegion;\n\s*mapSplitSharedCache\(mainExecutableMH\);/
   abort 'more than the guarded block' unless entry.scan(/^\t\S/).size == 3  # comment line, the if, its closing brace
 
   run_cpp(dir, 'entry', <<~CPP, root)
@@ -423,7 +423,10 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
     static ClosureMode sClosureMode = ClosureMode::PreBuiltOnly;
     static const char* sSharedCacheSplitDir;
     static std::vector<std::string> calls;
-    static void mapSplitSharedCache(const macho_header*) { calls.push_back("map"); }
+    struct ImageLoader { enum SharedRegionMode { kUseSharedRegion, kUsePrivateSharedRegion, kDontUseSharedRegion }; };
+    static struct { ImageLoader::SharedRegionMode sharedRegionMode = ImageLoader::kUseSharedRegion; } gLinkContext;
+    // the mapper is called with the process already in private-region mode
+    static void mapSplitSharedCache(const macho_header*) { calls.push_back(gLinkContext.sharedRegionMode == ImageLoader::kUsePrivateSharedRegion ? "map" : "map-not-private"); }
     static void matchSharedCacheDataConstState(bool enabled) { calls.push_back(enabled ? "match1" : "match0"); }
     static void entry(const macho_header* mainExecutableMH, bool sharedCacheDataConstIsEnabled) {
       #{entry}
@@ -432,14 +435,15 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
       macho_header mh = { 0, 0, 0 };
       // variable not set: nothing runs and nothing changes
       sSharedCacheSplitDir = nullptr; entry(&mh, true);
-      CHECK(calls.empty() && sClosureMode == ClosureMode::PreBuiltOnly);
+      CHECK(calls.empty() && sClosureMode == ClosureMode::PreBuiltOnly && gLinkContext.sharedRegionMode == ImageLoader::kUseSharedRegion);
       // set (even to an empty string): the cache is mapped first, then the closures are turned off, then DATA_CONST is
       // matched against what the mapper produced (read-only), whatever the process's own snapshot says
       for (const char* value : { "/d", "" }) {
         for (bool snapshot : { true, false }) {
-          calls.clear(); sClosureMode = ClosureMode::PreBuiltOnly; sSharedCacheSplitDir = value;
+          calls.clear(); sClosureMode = ClosureMode::PreBuiltOnly; sSharedCacheSplitDir = value; gLinkContext.sharedRegionMode = ImageLoader::kUseSharedRegion;
           entry(&mh, snapshot);
-          CHECK(calls.size() == 2 && calls[0] == "map" && calls[1] == "match1" && sClosureMode == ClosureMode::Off);
+          CHECK(calls.size() == 2 && calls[0] == "map" && calls[1] == "match1" && sClosureMode == ClosureMode::Off
+                && gLinkContext.sharedRegionMode == ImageLoader::kUsePrivateSharedRegion);
         }
       }
       if (failures) { printf("%d failure(s)\\n", failures); return 1; }
