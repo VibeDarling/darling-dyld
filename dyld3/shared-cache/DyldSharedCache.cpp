@@ -231,8 +231,74 @@ const T DyldSharedCache::getAddrField(uint64_t addr) const {
 
 uint64_t DyldSharedCache::getCodeSignAddress() const
 {
+    // The main file lists only its own mappings; the address after the last sub-cache is the end of the region.
+    if ( dyld_cache_header_is_split(header) )
+        return header.sharedRegionStart + header.sharedRegionSize;
     auto mappings = (const dyld_cache_mapping_info*)((uint8_t*)this + header.mappingOffset);
     return mappings[header.mappingCount-1].address + mappings[header.mappingCount-1].size;
+}
+
+// The mapping tables of the main file and every sub-cache file of a split cache, read where the mapper put
+// the files' headers (the main header at the cache address, a sub-cache's at its cacheVMOffset). Every table
+// has to lie inside its header's first mapping, which has to start at the header: if any does not, there is
+// no usable answer and false is returned.
+static const uint32_t kMaxSplitSubCaches = 32;       // as in the mapper
+static const uint32_t kMaxSplitFileMappings = 20;
+static const uint64_t kMinMappingSize = 0x1000;      // a header's first table entry is read before its size is known
+
+static bool splitFileMappingTable(const dyld_cache_header* header, uint64_t firstAddress,
+                                  const dyld_cache_mapping_and_slide_info** table, uint32_t* count)
+{
+    const uint64_t offset = header->mappingWithSlideOffset;
+    *count = header->mappingWithSlideCount;
+    if ( (*count == 0) || (*count > kMaxSplitFileMappings) || (offset % alignof(dyld_cache_mapping_and_slide_info) != 0)
+      || !dyld_cache_range_contains(0, kMinMappingSize, offset, sizeof(dyld_cache_mapping_and_slide_info)) )
+        return false;
+    *table = (const dyld_cache_mapping_and_slide_info*)((const char*)header + offset);
+    return ((*table)[0].address == firstAddress) && ((*table)[0].fileOffset == 0)
+        && dyld_cache_range_contains(0, (*table)[0].size, offset, uint64_t(*count) * sizeof(dyld_cache_mapping_and_slide_info));
+}
+
+static bool splitCacheTables(const DyldSharedCache* cache, const dyld_cache_mapping_and_slide_info* tables[],
+                             uint32_t counts[], uint32_t* files)
+{
+    const dyld_cache_header& main = cache->header;
+    const uint32_t subCaches = main.subCacheArrayCount;
+    if ( !splitFileMappingTable(&main, main.sharedRegionStart, &tables[0], &counts[0]) || (subCaches > kMaxSplitSubCaches)
+      || (main.subCacheArrayOffset % alignof(dyld_subcache_entry) != 0)
+      || !dyld_cache_range_contains(0, tables[0][0].size, main.subCacheArrayOffset, uint64_t(subCaches) * sizeof(dyld_subcache_entry)) )
+        return false;
+    const dyld_subcache_entry* entries = (const dyld_subcache_entry*)((const char*)cache + main.subCacheArrayOffset);
+    for (uint32_t i = 0; i != subCaches; ++i) {
+        if ( !dyld_cache_range_contains(0, main.sharedRegionSize, entries[i].cacheVMOffset, kMinMappingSize) )
+            return false;
+        const dyld_cache_header* header = (const dyld_cache_header*)((const char*)cache + entries[i].cacheVMOffset);
+        if ( !splitFileMappingTable(header, main.sharedRegionStart + entries[i].cacheVMOffset, &tables[i + 1], &counts[i + 1]) )
+            return false;
+    }
+    *files = subCaches + 1;
+    return true;
+}
+
+// A split cache lists its images in the main file at imagesOffsetSplit; the legacy table is empty then.
+static const dyld_cache_image_info* cacheImageTable(const dyld_cache_header& header, const void* cacheBase, uint32_t& count)
+{
+    if ( dyld_cache_header_is_split(header) ) {
+        count = header.imagesCountSplit;
+        return (const dyld_cache_image_info*)((const char*)cacheBase + header.imagesOffsetSplit);
+    }
+    count = header.imagesCount;
+    return (const dyld_cache_image_info*)((const char*)cacheBase + header.imagesOffset);
+}
+
+const dyld_cache_image_info* DyldSharedCache::imageTable(uint32_t& count) const
+{
+    return cacheImageTable(header, this, count);
+}
+
+bool DyldSharedCache::isSplitCache() const
+{
+    return dyld_cache_header_is_split(header);
 }
 
 void DyldSharedCache::forEachRegion(void (^handler)(const void* content, uint64_t vmAddr, uint64_t size,
@@ -252,6 +318,21 @@ void DyldSharedCache::forEachRegion(void (^handler)(const void* content, uint64_
             handler((char*)this + m->fileOffset, m->address, m->size, m->initProt, m->maxProt, 0);
         }
     } else {
+        if ( dyld_cache_header_is_split(header) ) {
+            // Sub-cache files are mapped at their VM address, so their content is found there, not at a file offset.
+            const dyld_cache_mapping_and_slide_info* tables[kMaxSplitSubCaches + 1];
+            uint32_t counts[kMaxSplitSubCaches + 1];
+            uint32_t files;
+            if ( !splitCacheTables(this, tables, counts, &files) )
+                return;
+            for (uint32_t f = 0; f != files; ++f) {
+                for (uint32_t i = 0; i != counts[f]; ++i) {
+                    const dyld_cache_mapping_and_slide_info* m = &tables[f][i];
+                    handler((const char*)this + (m->address - tables[0][0].address), m->address, m->size, m->initProt, m->maxProt, m->flags);
+                }
+            }
+            return;
+        }
         const dyld_cache_mapping_and_slide_info* mappings = (const dyld_cache_mapping_and_slide_info*)((char*)this + header.mappingWithSlideOffset);
         const dyld_cache_mapping_and_slide_info* mappingsEnd = &mappings[header.mappingCount];
         for (const dyld_cache_mapping_and_slide_info* m=mappings; m < mappingsEnd; ++m) {
@@ -297,19 +378,20 @@ bool DyldSharedCache::isAlias(const char* path) const {
 
 void DyldSharedCache::forEachImage(void (^handler)(const mach_header* mh, const char* installName)) const
 {
-    const dyld_cache_image_info*   dylibs   = (dyld_cache_image_info*)((char*)this + header.imagesOffset);
+    uint32_t imagesCount;
+    const dyld_cache_image_info*   dylibs   = cacheImageTable(header, this, imagesCount);
     const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
     if ( mappings[0].fileOffset != 0 )
         return;
     uint64_t firstImageOffset = 0;
     uint64_t firstRegionAddress = mappings[0].address;
-    for (uint32_t i=0; i < header.imagesCount; ++i) {
+    for (uint32_t i=0; i < imagesCount; ++i) {
         const char* dylibPath  = (char*)this + dylibs[i].pathFileOffset;
         uint64_t offset = dylibs[i].address - firstRegionAddress;
         if ( firstImageOffset == 0 )
             firstImageOffset = offset;
-        // skip over aliases
-        if ( dylibs[i].pathFileOffset < firstImageOffset)
+        // skip over aliases (a split cache's table has none, and all its paths are in the main file's header area)
+        if ( !dyld_cache_header_is_split(header) && (dylibs[i].pathFileOffset < firstImageOffset) )
             continue;
         const mach_header* mh = (mach_header*)((char*)this + offset);
         handler(mh, dylibPath);
@@ -318,19 +400,20 @@ void DyldSharedCache::forEachImage(void (^handler)(const mach_header* mh, const 
 
 void DyldSharedCache::forEachImageEntry(void (^handler)(const char* path, uint64_t mTime, uint64_t inode)) const
 {
-    const dyld_cache_image_info*   dylibs   = (dyld_cache_image_info*)((char*)this + header.imagesOffset);
+    uint32_t imagesCount;
+    const dyld_cache_image_info*   dylibs   = cacheImageTable(header, this, imagesCount);
     const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
     if ( mappings[0].fileOffset != 0 )
         return;
     uint64_t firstImageOffset = 0;
     uint64_t firstRegionAddress = mappings[0].address;
-    for (uint32_t i=0; i < header.imagesCount; ++i) {
+    for (uint32_t i=0; i < imagesCount; ++i) {
         const char* dylibPath  = (char*)this + dylibs[i].pathFileOffset;
         uint64_t offset = dylibs[i].address - firstRegionAddress;
         if ( firstImageOffset == 0 )
             firstImageOffset = offset;
-        // skip over aliases
-        if ( dylibs[i].pathFileOffset < firstImageOffset)
+        // skip over aliases (a split cache's table has none, and all its paths are in the main file's header area)
+        if ( !dyld_cache_header_is_split(header) && (dylibs[i].pathFileOffset < firstImageOffset) )
             continue;
         handler(dylibPath, dylibs[i].modTime, dylibs[i].inode);
     }
@@ -394,7 +477,8 @@ const uint32_t DyldSharedCache::getLocalStringsSize() const
 
 const mach_header* DyldSharedCache::getIndexedImageEntry(uint32_t index, uint64_t& mTime, uint64_t& inode) const
 {
-    const dyld_cache_image_info*   dylibs   = (dyld_cache_image_info*)((char*)this + header.imagesOffset);
+    uint32_t imagesCount;
+    const dyld_cache_image_info*   dylibs   = cacheImageTable(header, this, imagesCount);
     const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
     mTime = dylibs[index].modTime;
     inode = dylibs[index].inode;
@@ -404,7 +488,8 @@ const mach_header* DyldSharedCache::getIndexedImageEntry(uint32_t index, uint64_
 
  const char* DyldSharedCache::getIndexedImagePath(uint32_t index) const
 {
-    auto dylibs = (const dyld_cache_image_info*)((char*)this + header.imagesOffset);
+    uint32_t imagesCount;
+    auto dylibs = cacheImageTable(header, this, imagesCount);
     return (char*)this + dylibs[index].pathFileOffset;
 }
 
@@ -514,6 +599,9 @@ void DyldSharedCache::getUUID(uuid_t uuid) const
 
 uint64_t DyldSharedCache::mappedSize() const
 {
+    // The main file lists only its own mappings, but the sub-cache files fill the rest of the region.
+    if ( dyld_cache_header_is_split(header) )
+        return header.sharedRegionSize;
     __block uint64_t startAddr = 0;
     __block uint64_t endAddr = 0;
     forEachRegion(^(const void* content, uint64_t vmAddr, uint64_t size,
@@ -532,8 +620,9 @@ bool DyldSharedCache::findMachHeaderImageIndex(const mach_header* mh, uint32_t& 
     const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
     uintptr_t slide = (uintptr_t)this - (uintptr_t)(mappings[0].address);
     uint64_t unslidMh = (uintptr_t)mh - slide;
-    const dyld_cache_image_info* dylibs = (dyld_cache_image_info*)((char*)this + header.imagesOffset);
-    for (uint32_t i=0; i < header.imagesCount; ++i) {
+    uint32_t imagesCount;
+    const dyld_cache_image_info* dylibs = cacheImageTable(header, this, imagesCount);
+    for (uint32_t i=0; i < imagesCount; ++i) {
         if ( dylibs[i].address == unslidMh ) {
             imageIndex = i;
             return true;
@@ -547,7 +636,7 @@ bool DyldSharedCache::hasImagePath(const char* dylibPath, uint32_t& imageIndex) 
     const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
     if ( mappings[0].fileOffset != 0 )
         return false;
-    if ( header.mappingOffset >= 0x118 ) {
+    if ( (header.mappingOffset >= 0x118) && !(dyld_cache_header_is_split(header) && (header.dylibsTrieSize == 0)) ) {
         uintptr_t      slide           = (uintptr_t)this - (uintptr_t)(mappings[0].address);
         const uint8_t* dylibTrieStart  = (uint8_t*)(this->header.dylibsTrieAddr + slide);
         const uint8_t* dylibTrieEnd    = dylibTrieStart + this->header.dylibsTrieSize;
@@ -560,10 +649,11 @@ bool DyldSharedCache::hasImagePath(const char* dylibPath, uint32_t& imageIndex) 
         }
     }
     else {
-        const dyld_cache_image_info* dylibs = (dyld_cache_image_info*)((char*)this + header.imagesOffset);
+        uint32_t imagesCount;
+        const dyld_cache_image_info* dylibs = cacheImageTable(header, this, imagesCount);
         uint64_t firstImageOffset = 0;
         uint64_t firstRegionAddress = mappings[0].address;
-        for (uint32_t i=0; i < header.imagesCount; ++i) {
+        for (uint32_t i=0; i < imagesCount; ++i) {
             const char* aPath  = (char*)this + dylibs[i].pathFileOffset;
             if ( strcmp(aPath, dylibPath) == 0 ) {
                 imageIndex = i;
@@ -986,6 +1076,10 @@ const uint8_t* DyldSharedCache::legacyCacheDataRegionBuffer() const
 
 #if !BUILDING_LIBDSC
 const objc_opt::objc_opt_t* DyldSharedCache::objcOpt() const {
+    // A split cache has no dyld3 image array to find libobjc through, and libdyld asks every mapped cache.
+    if ( isSplitCache() )
+        return nullptr;
+
     // Find the objc image
     const dyld3::MachOAnalyzer* objcMA = nullptr;
 
@@ -1058,6 +1152,9 @@ const void* DyldSharedCache::objcOptPtrs() const {
 #endif
 
 std::pair<const void*, uint64_t> DyldSharedCache::getObjCConstantRange() const {
+    if ( isSplitCache() )
+        return { nullptr, 0 };
+
     const dyld3::MachOAnalyzer* libDyldMA = nullptr;
     uint32_t imageIndex;
     if ( hasImagePath("/usr/lib/system/libdyld.dylib", imageIndex) ) {
