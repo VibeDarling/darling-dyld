@@ -80,6 +80,10 @@ VALIDATION_MAIN = <<~CPP
     refuse("locations array one record too long", H + 8 + 16 * 4 + 8, 8, f.arrays.at("locations").second + 1, "location slices", 1, CLEAN);
     refuse("gotClientExports array one record too long", H + 8 + 16 * 7 + 8, 8, f.arrays.at("gotClientExports").second + 1, "GOT client slices", 1, CLEAN);
     refuse("gotLocations array one record too long", H + 8 + 16 * 8 + 8, 8, f.arrays.at("gotLocations").second + 1, "GOT location slices", 1, CLEAN);
+    // a slice that ends exactly one past its array, on the whole-table and on the per-exporter path
+    refuse("export slice ends one past its array", PT + 32 + 12, 4, 4, "export slices", 2, SAME);
+    refuse("GOT client slice ends one past its array", GC + 8 + 4, 4, f.arrays.at("gotClientExports").second + 1, "GOT client slices", 1, SAME);
+    refuse("GOT location slice ends one past its array", GE + 12 + 8, 4, f.arrays.at("gotLocations").second, "GOT location slices", 1, SAME);
     refuse("client slices do not tile", PT + 16, 4, 1, "client slices", 1, CLEAN);
     refuse("client slice outside the clients array", PT + 16 + 4, 4, 50, "client slices", 1, SAME);
     refuse("export slices do not tile", PT + 32 + 8, 4, 4, "export slices", 2, "GOT export lies outside");
@@ -117,6 +121,13 @@ VALIDATION_MAIN = <<~CPP
       printf("absent: %s\\n", c.label);
     }
     poke(ADDR, 8, savedAddr); poke(SIZE, 8, savedSize);
+    // a cache with an older patch info (macOS 13 has version 2) is not a patch info version 4: absent, so nothing runs and nothing halts
+    for (uint32_t version : {1u, 2u, 3u, 5u}) {
+      poke(H, 4, version);
+      CHECK(!gCache->hasPatchInfoV4());
+      printf("absent: patch info version %u\\n", version);
+    }
+    poke(H, 4, 4);
     CHECK(gCache->hasPatchInfoV4() && gCache->checkPatchInfoV4(&counts) == nullptr);
     printf(failures ? "RESULT failed (%d)\\n" : "RESULT ok\\n", failures);
     return failures != 0;

@@ -81,11 +81,14 @@ Dir.mktmpdir('patch-info-v4-reader-') do |dir|
   File.write("#{dir}/test.cpp", "#{SplitCacheHarness.prefix(root)}\n#{PatchFixtureProgram::PREFIX}\n#{READER_MAIN}")
   failed_build = SplitCacheHarness.compile(root, dir)
   abort failed_build if failed_build
-  out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/fx", '--variant', 'patch', '--base', base)
-  abort out unless st.success?
-  out, st = Open3.capture2e("#{dir}/test", "#{dir}/fx")
-  puts out
-  abort 'patch info v4 reader test failed' unless st.success? && out.include?('RESULT ok')
+  # patch_high puts the GOT 4 GiB above the cache base, so the high word of every GOT offset is used
+  %w[patch patch_high].each do |variant|
+    out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/fx-#{variant}", '--variant', variant, '--base', base)
+    abort out unless st.success?
+    out, st = Open3.capture2e("#{dir}/test", "#{dir}/fx-#{variant}")
+    puts out
+    abort "patch info v4 reader test (#{variant}) failed" unless st.success? && out.include?('RESULT ok')
+  end
 
   # a cache without patch info: nothing is present, nothing is read
   File.write("#{dir}/test.cpp", "#{SplitCacheHarness.prefix(root)}\n#{PatchFixtureProgram::PREFIX}\n" + <<~CPP)
