@@ -7,6 +7,14 @@
 #
 #   DYLD_REAL_CACHE_DIR   directory holding dyld_shared_cache_arm64e and its sub-cache files
 #   DYLD_REAL_CACHE_IMAGE install name to look up (optional; without it only the image count is checked)
+#   DYLD_REAL_CACHE_OVERRIDE_IMAGES comma-separated install names of the exporters whose coalesced GOT slots the version 4
+#                         patch info override is applied to, with a stub resolver that gives every symbol a fake address
+#                         (optional; default: the five libSystem exporters under /usr/lib/system/)
+#
+# The patch info part prints counts only, never cache values: the whole-table check (every tiling relation, name and
+# location), then per exporter the GOT symbols and slots, how many the override patched, left unexplained or missed,
+# and an independent walk of the raw tables that checks every patched slot with autia/autda and every other slot of the
+# whole GOT for being byte-identical to before.
 #
 # Usage: DYLD_REAL_CACHE_DIR=... [DYLD_REAL_CACHE_IMAGE=...] ruby tests/real-cache-check.rb [checkout]
 # The cache is mapped at its own preferred address (0x180000000 for an arm64e macOS cache), which must be free.
@@ -21,10 +29,106 @@ unless main_file && File.file?(main_file)
 end
 require_relative 'split-cache-harness'
 
+# The patch info part of the check, a block of main(): see the header comment. The raw walker below reads the mapped
+# tables through its own offsets and decoder, sharing nothing with DyldSharedCache::forEachPatchGotLocation.
+PATCH_CHECK = <<~'CPP'
+  if (!cache->hasPatchInfoV4()) {
+    printf("patch info v4: absent in this cache, nothing to check\n");
+  } else {
+    DyldSharedCache::PatchInfoV4Counts counts;
+    const char *tableError = cache->checkPatchInfoV4(&counts);
+    printf("patch info v4 whole-table check: %s images=%llu exports=%llu clients=%llu plain-locations=%llu got-exports=%llu got-locations=%llu\n",
+           tableError ? tableError : "ok", (unsigned long long)counts.images, (unsigned long long)counts.exports, (unsigned long long)counts.clients,
+           (unsigned long long)counts.plainLocations, (unsigned long long)counts.gotExports, (unsigned long long)counts.gotLocations);
+    assert(tableError == nullptr);
+
+    // --- raw walker: header words at 8 + 16 * n (address, count); strides 16, 8, 12, 12, 8, 1, 8, 12, 16 ---
+    const uint64_t slide = (uint64_t)cache - regionStart, info = cache->header.patchInfoAddr + slide;
+    auto arrayAt = [&](unsigned n) { return le64((const uint8_t *)(info + 8 + 16 * n)) + slide; };
+    auto arrayCount = [&](unsigned n) { return le64((const uint8_t *)(info + 8 + 16 * n + 8)); };
+    const uint64_t exportsArray = arrayAt(1), namesArray = arrayAt(5), gotClientsArray = arrayAt(6), gotExportsArray = arrayAt(7), gotLocsArray = arrayAt(8);
+    struct RawSlot { uint64_t address, was; uint32_t flags, exporter, exportIndex; };
+    std::vector<RawSlot> allSlots; allSlots.reserve(arrayCount(8));
+    std::map<uint32_t, std::vector<size_t>> slotsOf;
+    uint64_t rawUnexplained = 0, rawBit8 = 0;
+    for (uint32_t image = 0; image < arrayCount(6); ++image) {
+      const uint8_t *g = (const uint8_t *)(gotClientsArray + 8ull * image);
+      for (uint64_t k = le32(g); k < (uint64_t)le32(g) + le32(g + 4); ++k) {
+        const uint8_t *e = (const uint8_t *)(gotExportsArray + 12 * k);
+        for (uint64_t l = le32(e + 4); l < (uint64_t)le32(e + 4) + le32(e + 8); ++l) {
+          const uint8_t *loc = (const uint8_t *)(gotLocsArray + 16 * l);
+          const uint64_t address = regionStart + slide + ((uint64_t)le32(loc + 4) << 32 | le32(loc)); const uint32_t flags = le32(loc + 8);
+          const bool authentic = flags & 1;
+          rawUnexplained += authentic ? (((flags >> 1) & 0x7f) != 0) : ((flags >> 16) != 0);
+          rawBit8 += (flags >> 8) & 1;
+          slotsOf[image].push_back(allSlots.size());
+          allSlots.push_back({address, *(const uint64_t *)address, flags, image, le32(e)});
+        }
+      }
+    }
+    printf("patch info v4 raw walk of the whole GOT: slots=%zu exporters-with-slots=%zu unexplained-encodings=%llu bit8-set=%llu\n",
+           allSlots.size(), slotsOf.size(), (unsigned long long)rawUnexplained, (unsigned long long)rawBit8);
+    assert(allSlots.size() == counts.gotLocations);
+
+    // --- the override, with a stub resolver: a fake, deterministic address for every symbol ---
+    auto stub = [](const char *symbol) { uint64_t h = 1469598103934665603ull; for (const char *c = symbol; *c; ++c) h = (h ^ (uint8_t)*c) * 1099511628211ull; return 0x0000600000000000ull | (h & 0x00000000fffffff0ull); };
+    std::vector<std::string> exporterNames;
+    const char *listEnv = getenv("DYLD_REAL_CACHE_OVERRIDE_IMAGES");
+    std::string list = (listEnv && *listEnv) ? listEnv : "/usr/lib/system/libsystem_c.dylib,/usr/lib/system/libsystem_kernel.dylib,/usr/lib/system/libsystem_malloc.dylib,/usr/lib/system/libsystem_platform.dylib,/usr/lib/system/libsystem_pthread.dylib";
+    for (size_t at = 0; at <= list.size();) { size_t comma = list.find(',', at); if (comma == std::string::npos) comma = list.size(); if (comma > at) exporterNames.push_back(list.substr(at, comma - at)); at = comma + 1; }
+    std::set<uint32_t> patched; uint64_t totalSlots = 0, totalPatched = 0, totalUnexplained = 0, totalMissing = 0;
+    for (const std::string &name : exporterNames) {
+      uint32_t index;
+      if (!cache->hasImagePath(name.c_str(), index)) { printf("override %s: not in the cache\n", name.c_str()); assert(false); }
+      DyldSharedCache::PatchOverrideStats stats;
+      const char *error = cache->overridePatchGotSlots(index, ^bool(const char *symbol, uint64_t *address) { *address = stub(symbol); return true; }, nullptr, &stats);
+      if (error) { printf("override %s: error: %s\n", name.c_str(), error); assert(false); }
+      std::set<uint32_t> symbols; for (size_t i : slotsOf[index]) symbols.insert(allSlots[i].exportIndex);
+      __block uint64_t plainLocations = 0;
+      assert(cache->forEachPatchPlainLocation(index, ^(const DyldSharedCache::PatchLocationV4 &, uint32_t) { ++plainLocations; }) == nullptr);
+      // the kind bits of the export name word are not interpreted: show how the GOT slots spread over them
+      __block std::map<uint32_t, uint64_t> kinds;
+      assert(cache->forEachPatchGotLocation(index, ^(const DyldSharedCache::PatchLocationV4 &l) { ++kinds[l.kind]; }) == nullptr);
+      std::string kindText; for (const auto &k : kinds) kindText += " kind" + std::to_string(k.first) + "=" + std::to_string(k.second);
+      printf("override %s: image=%u got-exports=%zu export-entries=%llu got-slots=%llu patched=%llu unexplained=%llu missing-symbols=%llu missing-slots=%llu (plain-table locations, not applied: %llu; got slots by kind:%s)\n",
+             name.c_str(), index, symbols.size(), (unsigned long long)stats.exports, (unsigned long long)stats.slots, (unsigned long long)stats.patched, (unsigned long long)stats.unexplained,
+             (unsigned long long)stats.missingExports, (unsigned long long)stats.missingSlots, (unsigned long long)plainLocations, kindText.c_str());
+      assert(stats.exports >= symbols.size() && stats.slots == slotsOf[index].size() && stats.missingExports == 0 && stats.missingSlots == 0);
+      assert(stats.patched + stats.unexplained == stats.slots);
+      DyldSharedCache::PatchOverrideStats again;
+      assert(cache->overridePatchGotSlots(index, ^bool(const char *, uint64_t *) { assert(false); return false; }, nullptr, &again) == nullptr && again.alreadyApplied);
+      patched.insert(index); totalSlots += stats.slots; totalPatched += stats.patched; totalUnexplained += stats.unexplained; totalMissing += stats.missingSlots;
+    }
+
+    // --- independent verification of the whole GOT: patched slots authenticate to their stub, every other slot is unchanged ---
+    uint64_t authOk = 0, plainOk = 0, unchanged = 0, wrong = 0, shown = 0;
+    for (const RawSlot &s : allSlots) {
+      const uint64_t now = *(const uint64_t *)s.address; const uint32_t f = s.flags; const bool authentic = f & 1;
+      const bool explained = authentic ? (((f >> 1) & 0x7f) == 0) : ((f >> 16) == 0);
+      bool ok;
+      if (!patched.count(s.exporter) || !explained) { ok = (now == s.was); unchanged += ok; }
+      else {
+        const char *symbol = (const char *)(namesArray + (le32((const uint8_t *)(exportsArray + 8ull * s.exportIndex) + 4) & 0x0fffffffu));
+        const uint64_t addend = authentic ? (f >> 9) & 0x1f : (f >> 9) & 0x7f, target = stub(symbol) + addend;
+        if (authentic) {
+          const uint64_t disc = f >> 16, modifier = ((f >> 14) & 1) ? ((s.address & 0x0000ffffffffffffull) | (disc << 48)) : disc;
+          ok = authenticate((f >> 15) & 1, now, modifier) == target; authOk += ok;
+        } else { ok = now == (target | ((uint64_t)((f >> 1) & 0x7f) << 57)); plainOk += ok; }
+      }
+      if (!ok) { ++wrong; if (shown++ < 5) printf("PATCH MISMATCH at region offset %#llx flags %#x\n", (unsigned long long)(s.address - regionStart - slide), f); }
+    }
+    printf("patch override verified: slots=%llu patched=%llu unexplained=%llu missing=%llu | independent: authenticate-ok=%llu plain-ok=%llu unchanged=%llu wrong=%llu\n",
+           (unsigned long long)totalSlots, (unsigned long long)totalPatched, (unsigned long long)totalUnexplained, (unsigned long long)totalMissing,
+           (unsigned long long)authOk, (unsigned long long)plainOk, (unsigned long long)unchanged, (unsigned long long)wrong);
+    assert(wrong == 0 && authOk + plainOk == totalPatched && authOk + plainOk + unchanged == allSlots.size());
+  }
+CPP
+
 Dir.mktmpdir('real-cache-check-') do |dir|
   File.write("#{dir}/test.cpp", <<~CPP)
     #{SplitCacheHarness.prefix(root, real_trie: true)}
     #include <unordered_map>
+    #include <map>
 
     // Standard export-trie walk (the tests stub the dyld one): the terminal info of symbol, or null.
     const uint8_t *dyld3::MachOLoaded::trieWalk(Diagnostics&, const uint8_t *start, const uint8_t *end, const char *symbol) {
@@ -213,6 +317,7 @@ Dir.mktmpdir('real-cache-check-') do |dir|
         printf("hasImagePath(%s) index %u, header magic %#x\\n", image, index, mh->magic);
         assert(mh->magic == 0xFEEDFACF && strcmp(cache->getIndexedImagePath(index), image) == 0);
       }
+      #{PATCH_CHECK}
       cache->forEachImage(^(const mach_header *, const char *) { ++gImages; });
       cache->forEachRegion(^(const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint64_t) { ++gRegions; });
       uint32_t tableImages = 0; cache->imageTable(tableImages);
@@ -230,5 +335,5 @@ Dir.mktmpdir('real-cache-check-') do |dir|
   out, st = Open3.capture2e("#{dir}/test", *args)
   puts out
   abort 'real-cache check failed' unless st.success? && out.include?('RESULT ok')
-  puts 'PASS real cache mapped, plain slots match an independent walk, every authenticated slot authenticates to its target, auth stubs agree with the key and diversity bits, image helpers agree'
+  puts 'PASS real cache mapped, plain slots match an independent walk, every authenticated slot authenticates to its target, auth stubs agree with the key and diversity bits, the patch info validates and its GOT override (stub resolver) authenticates, image helpers agree'
 end
