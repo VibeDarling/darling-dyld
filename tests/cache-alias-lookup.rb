@@ -7,6 +7,8 @@ if ENV['LOOKUP_SOURCE_REF']
   source,ok=Open3.capture2('git','-C',root,'show',"#{ENV.fetch('LOOKUP_SOURCE_REF')}:dyld3/SharedCacheRuntime.cpp")
   abort 'source unavailable' unless ok.success?
 end
+header=File.read("#{root}/dyld3/SharedCacheRuntime.h")
+results=header[/^static const uint32_t kNoCacheImageIndex.*?^\};/m] or abort 'results struct missing'
 lookup=source[/bool findInSharedCacheImage\(.*?^\}/m] or abort 'lookup missing'
 Dir.mktmpdir('cache-alias-lookup-') do |dir|
   File.write("#{dir}/test.cpp", <<~CPP)
@@ -43,8 +45,10 @@ Dir.mktmpdir('cache-alias-lookup-') do |dir|
       const dyld3::closure::ImageArray *cachedDylibsImageArray() const { return header.dylibsImageArrayAddr?&array:nullptr; }
     };
     struct SharedCacheLoadInfo { const DyldSharedCache *loadAddress; long slide; };
-    static const uint32_t kNoCacheImageIndex = 0xFFFFFFFF;
-    struct SharedCacheFindDylibResults { const mach_header *mhInCache; const char *pathInCache; long slideInCache; const dyld3::closure::Image *image; uint32_t cacheImageIndex; };
+    namespace dyld3 {
+    #{results}
+    }
+    using namespace dyld3;
     #{lookup}
     struct Fixture { DyldSharedCache cache; dyld_cache_image_info images[2]; char canonical[32]; char second[32]; };
     int main() {
