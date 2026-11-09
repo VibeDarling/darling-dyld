@@ -52,6 +52,21 @@ struct SharedCacheLoadInfo {
 
 bool loadDyldCache(const SharedCacheOptions& options, SharedCacheLoadInfo* results);
 
+#if defined(DARLING)
+// Counts reported by mapSplitCachePrivate().
+struct SplitCacheMapStats {
+    uint32_t    files;
+    uint32_t    mappings;
+    uint64_t    pagesWithChains;
+    uint64_t    plainRebased;
+    uint64_t    authLeftAlone;      // authenticated pointers, still in their on-disk form
+};
+
+// Maps a split cache (the main file at mainCachePath plus the sub-cache files its header lists, found by
+// appending each suffix to that path) privately at its preferred address. Not called by dyld yet.
+bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLoadInfo* results, SplitCacheMapStats* stats);
+#endif
+
 
 struct SharedCacheFindDylibResults {
     const mach_header*          mhInCache;
