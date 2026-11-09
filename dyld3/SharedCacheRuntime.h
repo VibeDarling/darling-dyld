@@ -92,6 +92,34 @@ bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dyl
 
 bool pathIsInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dylibPathToFind);
 
+// Which copy of a library dyld loads when the cache and/or a file on disk can serve its path.
+enum SharedCacheLoadSource {
+    kSharedCacheLoadFromDisk,
+    kSharedCacheLoadFromCache,
+    kSharedCacheLoadInvalidPath,    // an image of a split cache whose canonical path is NULL, empty, relative or too long
+};
+
+// Canonical cache paths that a split cache serves even when a file exists at the same path on disk. Exact
+// string matches only: no globs and no environment override.
+struct SharedCacheAllowList {
+    const char* const*          paths;
+    size_t                      count;
+};
+
+const SharedCacheAllowList& sharedCacheAllowList();
+
+bool sharedCachePathIsAllowListed(const char* canonicalPath, const SharedCacheAllowList& allowList);
+
+// A split cache image is found with no closure Image, so dyld cannot ask the cache whether a disk copy may
+// override it. Old caches keep the rule that a file on disk wins; a split cache serves an allow-listed path from
+// the cache and otherwise lets the disk win. canonicalPath is the path of the cache image, not the path asked for.
+SharedCacheLoadSource chooseSharedCacheLoadSource(bool isSplitCache, bool inCache, bool existsOnDisk,
+                                                  const char* canonicalPath, const SharedCacheAllowList& allowList);
+
+// True when path (or an alias of it) is an allow-listed image of a split cache, so no search-path override
+// may replace it either.
+bool pathIsPinnedToSharedCache(const SharedCacheLoadInfo& loadInfo, const char* path);
+
 void deallocateExistingSharedCache();
 
 } // namespace dyld3

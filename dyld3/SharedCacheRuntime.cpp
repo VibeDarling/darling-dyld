@@ -1741,6 +1741,59 @@ bool pathIsInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* d
     return loadInfo.loadAddress->hasImagePath(dylibPathToFind, imageIndex);
 }
 
+// libz is a leaf library: the first one to come from the cache while Darling's libSystem family stays on disk.
+static const char* const kSharedCacheServedOverDisk[] = {
+    "/usr/lib/libz.1.dylib",
+};
+static const SharedCacheAllowList kSharedCacheAllowList = { kSharedCacheServedOverDisk,
+                                                            sizeof(kSharedCacheServedOverDisk)/sizeof(kSharedCacheServedOverDisk[0]) };
+
+const SharedCacheAllowList& sharedCacheAllowList()
+{
+    return kSharedCacheAllowList;
+}
+
+static const size_t kSharedCacheMaxPath = 1024;
+
+static bool canonicalPathIsUsable(const char* path)
+{
+    return (path != nullptr) && (path[0] == '/') && (memchr(path, '\0', kSharedCacheMaxPath) != nullptr);
+}
+
+bool sharedCachePathIsAllowListed(const char* canonicalPath, const SharedCacheAllowList& allowList)
+{
+    if ( !canonicalPathIsUsable(canonicalPath) )
+        return false;
+    for (size_t i = 0; i < allowList.count; ++i) {
+        if ( strcmp(canonicalPath, allowList.paths[i]) == 0 )
+            return true;
+    }
+    return false;
+}
+
+SharedCacheLoadSource chooseSharedCacheLoadSource(bool isSplitCache, bool inCache, bool existsOnDisk,
+                                                  const char* canonicalPath, const SharedCacheAllowList& allowList)
+{
+    if ( !isSplitCache )
+        return ( inCache && !existsOnDisk ) ? kSharedCacheLoadFromCache : kSharedCacheLoadFromDisk;
+    if ( !inCache )
+        return kSharedCacheLoadFromDisk;
+    if ( !canonicalPathIsUsable(canonicalPath) )
+        return kSharedCacheLoadInvalidPath;
+    if ( sharedCachePathIsAllowListed(canonicalPath, allowList) )
+        return kSharedCacheLoadFromCache;
+    return existsOnDisk ? kSharedCacheLoadFromDisk : kSharedCacheLoadFromCache;
+}
+
+bool pathIsPinnedToSharedCache(const SharedCacheLoadInfo& loadInfo, const char* path)
+{
+    if ( (loadInfo.loadAddress == nullptr) || !loadInfo.loadAddress->isSplitCache() )
+        return false;
+    SharedCacheFindDylibResults results;
+    return findInSharedCacheImage(loadInfo, path, &results)
+        && sharedCachePathIsAllowListed(results.pathInCache, sharedCacheAllowList());
+}
+
 void deallocateExistingSharedCache()
 {
 #if TARGET_OS_SIMULATOR
