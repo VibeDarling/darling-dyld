@@ -4,7 +4,7 @@
 Usage: python3 -I tests/gen-split-cache-fixture.py OUTDIR [--base 0x180000000] [--variant NAME]
 
 Writes OUTDIR/cache (main), OUTDIR/cache.01 (text), OUTDIR/cache.02.dylddata (data with slide info v5)
-and OUTDIR/manifest.txt, which holds the values the tests expect. The variant "patch" adds a fourth file,
+and OUTDIR/manifest.txt, which holds the values the tests expect. The variants "patch" and "patch_high" (the same with the GOT above 4 GiB) add a fourth file,
 cache.03.patch: three more images, a coalesced GOT mapping (DATA_CONST, read-only) and a version-4 patch info. The offsets below are written
 independently of dyld_cache_format.h so that the header's static_asserts are checked against them.
 """
@@ -34,7 +34,7 @@ VARIANTS = [
     "sub_first_mapping_offset", "bad_alignment", "sub_bad_magic", "sub_bad_platform", "sub_wx_prot", "sub_bad_prot_bits",
     "main_wx", "slide_outside_file", "sub_outside_region", "chain_start_unaligned", "main_count_mismatch", "page_starts_range",
     "page_starts_truncated", "chain_leaves_page", "chain_start_outside", "unknown_slide_version",
-    "target_outside_region", "bad_page_size", "auth_target_outside_region", "no_auth", "patch",
+    "target_outside_region", "bad_page_size", "auth_target_outside_region", "no_auth", "patch", "patch_high",
 ]
 
 
@@ -62,7 +62,7 @@ def auth(runtime_offset, diversity, addr_div, key_is_data, nxt=0):
 
 
 PATCH_VM = 0x40000          # cache.03.patch: text, GOT and patch-info mappings
-PATCH_REGION_SIZE = 0x80000
+PATCH_VM_HIGH = 0x100040000  # variant patch_high: the GOT lies 4 GiB or more above the cache base (cacheOffsetHi != 0)
 PATCH_SUFFIX = b".03.patch"
 PATCH_IMAGES = [            # index 1.. (index 0 is libmini); each header sits in its own page of the text mapping
     "/usr/lib/system/libexpa.dylib", "/usr/lib/system/libexpb.dylib", "/usr/lib/libclient.dylib",
@@ -102,15 +102,15 @@ PATCH_PLAIN = [
     (0x10, 1, "_plain_only", 3, dict(auth_=0)),
     (0x18, 1, "_alpha", 3, dict(auth_=1, addr_div=1)),
     (0x20, 1, "_alpha", 3, dict(auth_=0)),
-    (0x28, 2, "_bravo", 0, dict(auth_=1, addr_div=1, key_data=1)),
+    (0x28, 2, "_bravo", 3, dict(auth_=1, addr_div=1, key_data=1)),
 ]
 GOT_SLOT_OFF = 0x40         # slot i of the GOT page is at GOT_SLOT_OFF + 8 * i
 CONTROL_OFFS = (0x200, 0x208)   # chain entries in the GOT mapping that the patch info does not list
 
 
-def build_patch(base, value_add, rt, image0_addr, image0_path):
+def build_patch(base, value_add, rt, image0_addr, image0_path, patch_vm):
     """The extra sub-cache file plus what the main file and the manifest need. Layout written independently of the C header."""
-    text_addr = base + PATCH_VM
+    text_addr = base + patch_vm
     got_addr = text_addr + 4 * PAGE
     plain_page = got_addr + PAGE
     blob_addr = got_addr + 3 * PAGE
@@ -266,7 +266,7 @@ def build_patch(base, value_add, rt, image0_addr, image0_path):
         lines.append("pplain 0x%x %d %s %d 0x%x" % (plain_page + off, exp, sym, client, flags_word(**fl)))
     for off in CONTROL_OFFS:
         lines.append("pcontrol 0x%x" % (got_addr + 2 * PAGE + off))
-    entry = struct.pack("<16sQ32s", uuid_for("sub3"), PATCH_VM, PATCH_SUFFIX)
+    entry = struct.pack("<16sQ32s", uuid_for("sub3"), patch_vm, PATCH_SUFFIX)
     images = [(image_addr[i], paths[i]) for i in range(1, 4)]
     return dict(file=bytes(f), entry=entry, images=images, lines=lines, blob_addr=blob_addr, blob_size=len(blob),
                 pages=3, plain=slots_in_chains - n_auth, auth=n_auth, mappings=3)
@@ -275,8 +275,9 @@ def build_patch(base, value_add, rt, image0_addr, image0_path):
 def build(base, variant):
     files = {}
     v = variant
-    patch = (v == "patch")
-    region_size = PATCH_REGION_SIZE if patch else REGION_SIZE
+    patch = v in ("patch", "patch_high")
+    patch_vm = PATCH_VM_HIGH if v == "patch_high" else PATCH_VM
+    region_size = patch_vm + 0x40000 if patch else REGION_SIZE
     # Real caches have value_add == region start; the fixture offsets it so that code which ignored
     # value_add would produce wrong targets.
     value_add_delta = 0x4000
@@ -415,7 +416,7 @@ def build(base, variant):
     struct.pack_into("<II", h, H_MAPSLIDE_OFF, 0x280, slide_count)
     extra = None
     if patch:
-        extra = build_patch(base, value_add, rt, image_addr, INSTALL_NAME.decode())
+        extra = build_patch(base, value_add, rt, image_addr, INSTALL_NAME.decode(), patch_vm)
         struct.pack_into("<QQ", h, 0x98, extra["blob_addr"], extra["blob_size"])
     struct.pack_into("<II", h, H_SUBCACHE_OFF, 0x300, 3 if patch else 2)
     struct.pack_into("<II", h, H_IMAGES_OFF_SPLIT, main_len - 16 if v == "image_table_outside" else 0x400,

@@ -35,13 +35,9 @@ module SplitCacheHarness
     image_helper = cache_src[/^static const uint32_t kMaxSplitSubCaches.*?^static bool splitCacheTables\(.*?^\}/m] or abort 'split region walk missing'
     image_helper += "\n" + (cache_src[/^static const dyld_cache_image_info\* cacheImageTable\(.*?^\}/m] or abort 'image table helper missing')
     cache_h = File.read("#{root}/dyld3/shared-cache/DyldSharedCache.h")
-    # The version 4 patch info reader and the DATA_CONST writer it uses, taken from the sources.
+    # The version 4 patch info reader, taken from the sources.
     patch_decls = (cache_h[/^    \/\/ Version 4 patch info of a split macOS cache.*?(?=^#endif)/m] or abort 'patch info declarations missing')
-    writer_decls = (cache_h[/^    typedef void \(\*DataConstLogFunc\).*?;/m] or abort 'DataConstLogFunc missing') + "\n" +
-                   (cache_h[/^    struct DataConstLazyScopedWriter \{.*?^    \};/m] or abort 'DataConstLazyScopedWriter missing')
-    writer_funcs = [/^void DyldSharedCache::changeDataConstPermissions\(.*?^\}/m, /^DyldSharedCache::DataConstLazyScopedWriter::DataConstLazyScopedWriter\(.*?^\}/m,
-                    /^DyldSharedCache::DataConstLazyScopedWriter::~DataConstLazyScopedWriter\(.*?^\}/m,
-                    /^void DyldSharedCache::DataConstLazyScopedWriter::makeWriteable\(.*?^\}/m].map { |re| cache_src[re] or abort "DATA_CONST writer #{re} missing" }
+    log_func = cache_h[/^    typedef void \(\*DataConstLogFunc\).*?;/m] or abort 'DataConstLogFunc missing'
     patch_reader = cache_src[/^\/\/ ---- version 4 patch info of a split cache \(reader\) ----.*?^\/\/ ---- end of the patch info reader[^\n]*/m] or abort 'patch info reader missing'
     <<~CPP
     #include <sys/mman.h>
@@ -96,13 +92,11 @@ module SplitCacheHarness
       bool hasImagePath(const char*, uint32_t&) const;
       uint64_t mappedSize() const;
       uint64_t unslidLoadAddress() const;
-      #{writer_decls}
-      void changeDataConstPermissions(mach_port_t, uint32_t, DataConstLogFunc) const;
+      #{log_func}
       #{patch_decls}
     };
     #{image_helper}
     #{image_funcs.join("\n")}
-    #{writer_funcs.join("\n")}
     #{patch_reader}
     namespace dyld { static void log(const char *format, ...) { va_list a; va_start(a, format); printf("LOG "); vprintf(format, a); va_end(a); } }
     namespace dyld3 {

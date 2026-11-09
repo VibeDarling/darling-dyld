@@ -488,6 +488,7 @@ public:
 
     // A split cache whose patch info is version 4 and lies in a mapping. Nothing below is meaningful without it.
     bool        hasPatchInfoV4() const;
+    #if !BUILDING_DYLD
     // The header and the extents, bounds and alignment of the nine arrays: cheap, what the runtime does on every use.
     const char* checkPatchInfoV4Headers() const;
     // The headers plus everything one exporter's GOT slices and exports reach.
@@ -497,10 +498,12 @@ public:
     // These check the exporter's slices first and call the handler only on success.
     const char* forEachPatchGotLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location)) const;
     const char* forEachPatchPlainLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location, uint32_t clientIndex)) const;
+    #endif
     // Overwrites the exporter's coalesced GOT slots with the address resolve() gives for the slot's symbol, signed as
     // the slot's encoding says. Does nothing a second time for the same exporter. Leaves a slot alone (and counts it)
-    // when resolve() has no address for its symbol or the encoding is unexplained; the plain table is never applied.
-    // Makes the DATA_CONST mappings writable only around the first write. Returns nullptr or why it stopped.
+    // when resolve() has no address for its symbol (missing), or the encoding or the export kind is not understood
+    // (unexplained); the plain table is never applied. Only the DATA_CONST mappings that a slot is written into are made
+    // writable, each around its writes. Not thread safe: the caller holds dyld's lock. Returns nullptr or why it stopped.
     const char* overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, uint64_t* address),
                                       DataConstLogFunc logFunc, PatchOverrideStats* stats) const;
 #endif

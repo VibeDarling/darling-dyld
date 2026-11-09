@@ -1190,6 +1190,8 @@ bool DyldSharedCache::hasPatchInfoV4() const
     return version == 4;
 }
 
+#if !BUILDING_DYLD
+// Checks and enumeration for tools and tests: dyld itself only needs hasPatchInfoV4() and the override.
 const char* DyldSharedCache::checkPatchInfoV4Headers() const
 {
     PatchMappings maps;
@@ -1247,6 +1249,8 @@ const char* DyldSharedCache::checkPatchInfoV4(PatchInfoV4Counts* counts) const
     return nullptr;
 }
 
+#endif
+
 static DyldSharedCache::PatchLocationV4 patchLocation(const PatchTablesV4& t, uint32_t exportIndex, uint64_t slotUnslid, uint32_t flags)
 {
     DyldSharedCache::PatchLocationV4 loc;
@@ -1260,6 +1264,8 @@ static DyldSharedCache::PatchLocationV4 patchLocation(const PatchTablesV4& t, ui
     return loc;
 }
 
+#if !BUILDING_DYLD
+// Checks and enumeration for tools and tests: dyld itself only needs hasPatchInfoV4() and the override.
 const char* DyldSharedCache::forEachPatchGotLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location)) const
 {
     PatchMappings maps;
@@ -1309,9 +1315,42 @@ const char* DyldSharedCache::forEachPatchPlainLocation(uint32_t imageIndex,
     return nullptr;
 }
 
+#endif
+
 // ---- override of the coalesced GOT slots of an exporter that the process provides itself ----
 static const char* const kPatchErrSign     = "patch override: the address of an exported symbol does not fit a pointer of the slot's kind";
 static const char* const kPatchErrSlot     = "patch override: a GOT slot is misaligned or lies in a mapping that cannot be made writable";
+static const char* const kPatchErrProtect  = "patch override: could not make a DATA_CONST mapping writable";
+
+namespace {
+// Makes the DATA_CONST mappings that a slot is written into writable, each on its first write, and puts them back to
+// read-only on the way out, however that happens. Mappings without a write are never touched.
+struct PatchWriter {
+    const PatchMappings&                maps;
+    uint64_t                            slide;
+    DyldSharedCache::DataConstLogFunc   logFunc;
+    bool                                writable[(kMaxSplitSubCaches + 1) * kMaxSplitFileMappings] = {};
+
+    PatchWriter(const PatchMappings& m, uint64_t s, DyldSharedCache::DataConstLogFunc log) : maps(m), slide(s), logFunc(log) { }
+    ~PatchWriter() {
+        for (uint32_t i = 0; i != maps.count; ++i) {
+            if ( writable[i] && (vm_protect(mach_task_self(), (vm_address_t)(maps.all[i].address + slide), (vm_size_t)maps.all[i].size, false, VM_PROT_READ) != KERN_SUCCESS)
+              && (logFunc != nullptr) )
+                logFunc("dyld: failed to make the shared cache GOT read-only again\n");
+        }
+    }
+    // A mapping that is not DATA_CONST, or that this process keeps writable (gEnableSharedCacheDataConst is false), needs nothing.
+    bool prepare(const PatchMapping* m) {
+        const uint32_t index = (uint32_t)(m - maps.all);
+        if ( writable[index] || ((m->flags & DYLD_CACHE_MAPPING_CONST_DATA) == 0) || !gEnableSharedCacheDataConst )
+            return true;
+        if ( vm_protect(mach_task_self(), (vm_address_t)(m->address + slide), (vm_size_t)m->size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS )
+            return false;
+        writable[index] = true;
+        return true;
+    }
+};
+}
 
 // This file is also built into libdyld, which has no C++ library: a bitmap of the exporters done, for the one cache of the process.
 static const uint32_t kMaxPatchableImages = 8192;
@@ -1342,7 +1381,7 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
     if ( const char* error = checkPatchExporterV4(t, maps, imageIndex, false, &cursors) )
         return error;
 
-    DataConstLazyScopedWriter writer(this, mach_task_self(), logFunc);
+    PatchWriter writer(maps, t.slide, logFunc);
     const dyld_cache_image_got_clients_v4& g = t.gotClients[imageIndex];
     for (uint64_t i = g.exportsStartIndex; i != (uint64_t)g.exportsStartIndex + g.exportsCount; ++i) {
         const dyld_cache_got_client_export_v4& e = t.gotExports[i];
@@ -1350,6 +1389,13 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
         uint64_t address = 0;
         ++stats->exports;
         stats->slots += e.locationsCount;
+        // the kind bits of the name word are not understood (the cache's other images treat some exports specially): leave those alone
+        if ( (t.exports[e.imageExportIndex].nameKind >> 28) != 0 ) {
+            stats->unexplained += e.locationsCount;
+            if ( logFunc != nullptr )
+                logFunc("dyld: GOT slots of '%s' have an export kind that is not understood, left as the cache's pointers\n", symbol);
+            continue;
+        }
         if ( !resolve(symbol, &address) ) {
             ++stats->missingExports;
             stats->missingSlots += e.locationsCount;
@@ -1373,7 +1419,8 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
             if ( (slotUnslid % sizeof(uint64_t) != 0) || (mapping == nullptr)
               || (((mapping->flags & DYLD_CACHE_MAPPING_CONST_DATA) == 0) && ((mapping->initProt & VM_PROT_WRITE) == 0)) )
                 return kPatchErrSlot;
-            writer.makeWriteable();
+            if ( !writer.prepare(mapping) )
+                return kPatchErrProtect;
             if ( loc.encoding.authenticated ) {
                 // signPointer() numbers the keys IA, IB, DA, DB
                 *loc.slot = dyld3::MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(target, loc.slot, loc.encoding.usesAddressDiversity,

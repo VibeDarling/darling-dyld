@@ -45,7 +45,7 @@ OVERRIDE_MAIN = <<~CPP
   }
   static uint64_t stubAddress(const std::string &symbol) {
     static const std::map<std::string, uint64_t> stubs = {{"_alpha", 0x111100001000ull}, {"_gamma", 0x111100002000ull}, {"_delta_data", 0x111100003000ull},
-      {"_bravo", 0x111100004000ull}, {"_charlie", 0x111100005000ull}, {"_unexplained", 0x111100006000ull}};   // _beta has none: missing
+      {"_bravo", 0x111100004000ull}, {"_unexplained", 0x111100006000ull}};   // _charlie has none: missing; _beta is of an export kind that is not understood
     auto it = stubs.find(symbol); return it == stubs.end() ? 0 : it->second;
   }
   struct Snapshot { std::vector<uint64_t> words; };
@@ -59,32 +59,44 @@ OVERRIDE_MAIN = <<~CPP
 
   struct Rejections { unsigned trials = 0, rejected = 0; void add(bool ok) { ++trials; if (!ok) ++rejected; } };
 
+  static void poke(uint64_t address, unsigned bytes, uint64_t value) {
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    assert(mprotect((void *)(address & ~(page - 1)), 2 * page, PROT_READ | PROT_WRITE) == 0);
+    memcpy((void *)address, &value, bytes);
+  }
   static int mainOverride(const std::string &dir) {
     const Fixture f = loadManifest(dir);
     const DyldSharedCache *cache = mapFixture(dir);
     CHECK(permissions(f.gotMapAddr) == "r--p");                 // the mapper left the DATA_CONST mapping read-only
+    // a second DATA_CONST mapping that no slot is written into: it must never be made writable
+    const uint64_t otherData = 0x180000000ull + 0x10000;
+    poke(otherData + 0x280 + 40, 8, 5);                          // the .02 header: its mapping's flags AUTH_DATA | CONST_DATA
+    assert(mprotect((void *)otherData, 4 * 0x4000, PROT_READ) == 0);
+    CHECK(permissions(otherData) == "r--p");
     const Snapshot before = snapshot(f);
 
-    // --- exporter 1 (libexpa): _beta is not provided, everything else is ---
-    __block unsigned calls = 0; __block std::vector<std::string> seenSymbols; __block std::vector<std::string> permsAtResolve;
+    // --- exporter 1 (libexpa): _beta has an export kind that is not understood, everything else is provided ---
+    __block unsigned calls = 0; __block std::vector<std::string> seenSymbols; __block std::vector<std::string> permsAtResolve, otherAtResolve;
     auto resolver = ^bool(const char *symbol, uint64_t *address) {
-      ++calls; seenSymbols.push_back(symbol); permsAtResolve.push_back(permissions(f.gotMapAddr));
+      ++calls; seenSymbols.push_back(symbol); permsAtResolve.push_back(permissions(f.gotMapAddr)); otherAtResolve.push_back(permissions(otherData));
       *address = stubAddress(symbol); return *address != 0;
     };
     DyldSharedCache::PatchOverrideStats stats;
     CHECK(cache->overridePatchGotSlots(1, resolver, nullptr, &stats) == nullptr);
-    CHECK(stats.exports == 4 && stats.slots == 7 && stats.patched == 6 && stats.unexplained == 0 && stats.missingExports == 1 && stats.missingSlots == 1);
+    CHECK(stats.exports == 4 && stats.slots == 7 && stats.patched == 6 && stats.unexplained == 1 && stats.missingExports == 0 && stats.missingSlots == 0);
     CHECK(stats.patched + stats.unexplained + stats.missingSlots == stats.slots && !stats.alreadyApplied);
-    CHECK(seenSymbols == (std::vector<std::string>{"_alpha", "_beta", "_gamma", "_delta_data"}));
+    CHECK(seenSymbols == (std::vector<std::string>{"_alpha", "_gamma", "_delta_data"}));     // _beta is not even looked up
     // writable only once the first write is about to happen: the first lookup still sees read-only, a later one sees writable
     CHECK(permsAtResolve[0] == "r--p" && permsAtResolve[2] == "rw-p");
     CHECK(permissions(f.gotMapAddr) == "r--p");                 // restored on return
+    CHECK(otherAtResolve == (std::vector<std::string>{"r--p", "r--p", "r--p"}) && permissions(otherData) == "r--p");
 
-    // --- exporter 2 (libexpb): _unexplained has an encoding nobody can explain ---
+    // --- exporter 2 (libexpb): _charlie is not provided, _unexplained has an encoding nobody can explain ---
     DyldSharedCache::PatchOverrideStats stats2;
     permsAtResolve.clear();
     CHECK(cache->overridePatchGotSlots(2, resolver, nullptr, &stats2) == nullptr);
-    CHECK(stats2.exports == 3 && stats2.slots == 3 && stats2.patched == 2 && stats2.unexplained == 1 && stats2.missingExports == 0 && stats2.missingSlots == 0);
+    CHECK(stats2.exports == 3 && stats2.slots == 3 && stats2.patched == 1 && stats2.unexplained == 1 && stats2.missingExports == 1 && stats2.missingSlots == 1);
+    CHECK(stats2.patched + stats2.unexplained + stats2.missingSlots == stats2.slots);
     CHECK(permissions(f.gotMapAddr) == "r--p");
 
     // --- an independent walk of the whole GOT mapping ---
@@ -95,7 +107,7 @@ OVERRIDE_MAIN = <<~CPP
     for (uint64_t slot = f.gotMapAddr; slot < f.gotMapAddr + f.gotMapSize; slot += 8) {
       const uint64_t was = word(before, f, slot), now = word(after, f, slot);
       auto it = listed.find(slot);
-      const bool shouldPatch = it != listed.end() && it->second->explained && it->second->symbol != "_beta";
+      const bool shouldPatch = it != listed.end() && it->second->explained && it->second->symbol != "_beta" && it->second->symbol != "_charlie";
       if (!shouldPatch) { CHECK(now == was); ++untouchedSeen; continue; }
       const Got &g = *it->second; const uint64_t target = stubAddress(g.symbol) + g.addend; ++patchedSeen;
       if (g.auth) {
@@ -107,11 +119,11 @@ OVERRIDE_MAIN = <<~CPP
         CHECK(now == (target | ((uint64_t)g.high7 << 57)));
       }
     }
-    CHECK(patchedSeen == 8);
+    CHECK(patchedSeen == 7);
     printf("rejected with a wrong modifier: %u of %u\\n", wrongModifier.rejected, wrongModifier.trials);
     CHECK(wrongModifier.trials >= 4 && wrongModifier.rejected * 2 > wrongModifier.trials);
     // the missing and the unexplained slot keep the cache's own pointer, and so do the client (plain table) slots and the control slots
-    for (const Got &g : f.got) if (g.symbol == "_beta" || !g.explained) CHECK(word(after, f, g.slot) == word(before, f, g.slot));
+    for (const Got &g : f.got) if (g.symbol == "_beta" || g.symbol == "_charlie" || !g.explained) CHECK(word(after, f, g.slot) == word(before, f, g.slot));
     for (const Plain &p : f.plain) CHECK(word(after, f, p.slot) == word(before, f, p.slot));
     for (uint64_t c : f.control) CHECK(word(after, f, c) == word(before, f, c));
 
@@ -134,11 +146,6 @@ OVERRIDE_MAIN = <<~CPP
     return failures != 0;
   }
 
-  static void poke(uint64_t address, unsigned bytes, uint64_t value) {
-    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-    assert(mprotect((void *)(address & ~(page - 1)), 2 * page, PROT_READ | PROT_WRITE) == 0);
-    memcpy((void *)address, &value, bytes);
-  }
   // Refusals that stop the override before it writes: each must leave the GOT mapping read-only and untouched.
   static int mainErrors(const std::string &dir) {
     const Fixture f = loadManifest(dir);
@@ -146,8 +153,10 @@ OVERRIDE_MAIN = <<~CPP
     const Snapshot before = snapshot(f);
     DyldSharedCache::PatchOverrideStats stats;
     auto good = ^bool(const char *symbol, uint64_t *address) { *address = stubAddress(symbol); return *address != 0; };
-    // an address that does not fit the pointer field of an authenticated pointer
-    CHECK_ERR(cache->overridePatchGotSlots(2, ^bool(const char *, uint64_t *address) { *address = 1ull << 60; return true; }, nullptr, &stats), "does not fit");
+    // an address that does not fit the 48-bit pointer field of an authenticated pointer, however high its first stray bit is
+    for (uint64_t stray : {1ull << 48, 1ull << 50, 1ull << 55, 1ull << 60}) {
+      CHECK_ERR(cache->overridePatchGotSlots(2, ^bool(const char *, uint64_t *address) { *address = stray; return true; }, nullptr, &stats), "does not fit");
+    }
     CHECK(snapshot(f).words == before.words && permissions(f.gotMapAddr) == "r--p");
     // a GOT slot that is misaligned (the table check accepts it: it only needs the 8 bytes inside a mapping)
     const uint64_t gotLocations = f.arrays.at("gotLocations").first, bravo = gotLocations + 16 * 7;
@@ -166,7 +175,7 @@ OVERRIDE_MAIN = <<~CPP
     // a process that keeps DATA_CONST writable (gEnableSharedCacheDataConst false) is not toggled either way
     assert(mprotect((void *)f.gotMapAddr, f.gotMapSize, PROT_READ | PROT_WRITE) == 0);
     gEnableSharedCacheDataConst = false;
-    CHECK(cache->overridePatchGotSlots(2, good, nullptr, &stats) == nullptr && stats.patched == 2);
+    CHECK(cache->overridePatchGotSlots(2, good, nullptr, &stats) == nullptr && stats.patched == 1);
     CHECK(permissions(f.gotMapAddr) == "rw-p");
     printf(failures ? "RESULT failed (%d)\\n" : "RESULT ok\\n", failures);
     return failures != 0;
@@ -196,10 +205,13 @@ Dir.mktmpdir('patch-info-v4-override-') do |dir|
   abort failed_build if failed_build
   out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/fx", '--variant', 'patch', '--base', base)
   abort out unless st.success?
-  %w[override errors].each do |mode|
-    out, st = Open3.capture2e("#{dir}/test", "#{dir}/fx", mode)
+  # patch_high puts the GOT 4 GiB above the cache base, so the high word of every GOT offset is used
+  out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/fxh", '--variant', 'patch_high', '--base', base)
+  abort out unless st.success?
+  [%w[fx override], %w[fx errors], %w[fxh override]].each do |fixture, mode|
+    out, st = Open3.capture2e("#{dir}/test", "#{dir}/#{fixture}", mode)
     puts out
-    abort "patch info v4 override test (#{mode}) failed" unless st.success? && out.include?('RESULT ok')
+    abort "patch info v4 override test (#{fixture} #{mode}) failed" unless st.success? && out.include?('RESULT ok')
   end
   out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/fx0", '--base', base)
   abort out unless st.success?

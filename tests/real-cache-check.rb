@@ -50,7 +50,7 @@ PATCH_CHECK = <<~'CPP'
     struct RawSlot { uint64_t address, was; uint32_t flags, exporter, exportIndex; };
     std::vector<RawSlot> allSlots; allSlots.reserve(arrayCount(8));
     std::map<uint32_t, std::vector<size_t>> slotsOf;
-    uint64_t rawUnexplained = 0, rawBit8 = 0;
+    uint64_t rawUnexplained = 0, rawBit8 = 0, rawKinds = 0;
     for (uint32_t image = 0; image < arrayCount(6); ++image) {
       const uint8_t *g = (const uint8_t *)(gotClientsArray + 8ull * image);
       for (uint64_t k = le32(g); k < (uint64_t)le32(g) + le32(g + 4); ++k) {
@@ -61,13 +61,14 @@ PATCH_CHECK = <<~'CPP'
           const bool authentic = flags & 1;
           rawUnexplained += authentic ? (((flags >> 1) & 0x7f) != 0) : ((flags >> 16) != 0);
           rawBit8 += (flags >> 8) & 1;
+          rawKinds += (le32((const uint8_t *)(exportsArray + 8ull * le32(e)) + 4) >> 28) != 0;   // refused as well: the kind is not understood
           slotsOf[image].push_back(allSlots.size());
           allSlots.push_back({address, *(const uint64_t *)address, flags, image, le32(e)});
         }
       }
     }
-    printf("patch info v4 raw walk of the whole GOT: slots=%zu exporters-with-slots=%zu unexplained-encodings=%llu bit8-set=%llu\n",
-           allSlots.size(), slotsOf.size(), (unsigned long long)rawUnexplained, (unsigned long long)rawBit8);
+    printf("patch info v4 raw walk of the whole GOT: slots=%zu exporters-with-slots=%zu unexplained-encodings=%llu bit8-set=%llu slots-of-nonzero-kind=%llu\n",
+           allSlots.size(), slotsOf.size(), (unsigned long long)rawUnexplained, (unsigned long long)rawBit8, (unsigned long long)rawKinds);
     assert(allSlots.size() == counts.gotLocations);
 
     // --- the override, with a stub resolver: a fake, deterministic address for every symbol ---
@@ -104,7 +105,8 @@ PATCH_CHECK = <<~'CPP'
     uint64_t authOk = 0, plainOk = 0, unchanged = 0, wrong = 0, shown = 0;
     for (const RawSlot &s : allSlots) {
       const uint64_t now = *(const uint64_t *)s.address; const uint32_t f = s.flags; const bool authentic = f & 1;
-      const bool explained = authentic ? (((f >> 1) & 0x7f) == 0) : ((f >> 16) == 0);
+      const bool kindZero = (le32((const uint8_t *)(exportsArray + 8ull * s.exportIndex) + 4) >> 28) == 0;
+      const bool explained = kindZero && (authentic ? (((f >> 1) & 0x7f) == 0) : ((f >> 16) == 0));
       bool ok;
       if (!patched.count(s.exporter) || !explained) { ok = (now == s.was); unchanged += ok; }
       else {
