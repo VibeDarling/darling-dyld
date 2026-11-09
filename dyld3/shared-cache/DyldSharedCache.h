@@ -265,6 +265,13 @@ public:
 
 
     //
+    // The table of dyld_cache_image_info entries: the split table of a split cache, else the legacy one
+    //
+    const dyld_cache_image_info* imageTable(uint32_t& count) const;
+    bool                isSplitCache() const;
+
+
+    //
     // Get local symbols nlist entries
     //
     const void*         getLocalNlistEntries() const;

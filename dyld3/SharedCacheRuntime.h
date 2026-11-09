@@ -52,17 +52,72 @@ struct SharedCacheLoadInfo {
 
 bool loadDyldCache(const SharedCacheOptions& options, SharedCacheLoadInfo* results);
 
+#if defined(DARLING)
+// What mapSplitCachePrivate() does with authenticated slide-info entries. Signing is the production behaviour and
+// the default; kSplitCacheAuthLeaveAlone exists only for the host tests on machines without pointer
+// authentication and has no other caller.
+enum SplitCacheAuthMode {
+    kSplitCacheAuthSign,        // sign them with this process's own keys; fails when the host has no pointer authentication
+    kSplitCacheAuthLeaveAlone,  // keep them in their on-disk chain form (hosts without pointer authentication)
+};
+
+// Counts reported by mapSplitCachePrivate().
+struct SplitCacheMapStats {
+    uint32_t    files;
+    uint32_t    mappings;
+    uint64_t    pagesWithChains;
+    uint64_t    plainRebased;
+    uint64_t    authSigned;         // authenticated pointers, signed with this process's keys
+    uint64_t    authLeftAlone;      // authenticated pointers, still in their on-disk form
+};
+
+// Maps a split cache (the main file at mainCachePath plus the sub-cache files its header lists, found by
+// appending each suffix to that path) privately at its preferred address. Not called by dyld yet.
+bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLoadInfo* results, SplitCacheMapStats* stats,
+                          SplitCacheAuthMode authMode = kSplitCacheAuthSign);
+#endif
+
+
+static const uint32_t kNoCacheImageIndex = 0xFFFFFFFF;
 
 struct SharedCacheFindDylibResults {
     const mach_header*          mhInCache;
-    const char*                 pathInCache;
+    const char*                 pathInCache;    // the canonical path: aliases resolve to it
     long                        slideInCache;
-    const closure::Image*       image;
+    const closure::Image*       image;          // null for split and old caches
+    uint32_t                    cacheImageIndex;// index in the cache's image table, kNoCacheImageIndex when not found
 };
 
 bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dylibPathToFind, SharedCacheFindDylibResults* results);
 
 bool pathIsInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dylibPathToFind);
+
+// Which copy of a library dyld loads when the cache and/or a file on disk can serve its path.
+enum SharedCacheLoadSource {
+    kSharedCacheLoadFromDisk,
+    kSharedCacheLoadFromCache,
+};
+
+// Canonical cache paths that a split cache serves even when a file exists at the same path on disk. Exact
+// string matches only: no globs and no environment override.
+struct SharedCacheAllowList {
+    const char* const*          paths;
+    size_t                      count;
+};
+
+const SharedCacheAllowList& sharedCacheAllowList();
+
+bool sharedCachePathIsAllowListed(const char* canonicalPath, const SharedCacheAllowList& allowList);
+
+// A split cache image is found with no closure Image, so dyld cannot ask the cache whether a disk copy may
+// override it. Old caches keep the rule that a file on disk wins; a split cache serves an allow-listed path from
+// the cache and otherwise lets the disk win. canonicalPath is the path of the cache image, not the path asked for.
+SharedCacheLoadSource chooseSharedCacheLoadSource(bool isSplitCache, bool inCache, bool existsOnDisk,
+                                                  const char* canonicalPath, const SharedCacheAllowList& allowList);
+
+// True when path (or an alias of it) is an allow-listed image of a split cache, so no search-path override
+// may replace it either.
+bool pathIsPinnedToSharedCache(const SharedCacheLoadInfo& loadInfo, const char* path);
 
 void deallocateExistingSharedCache();
 
