@@ -10,9 +10,12 @@ chained fixups. clang has no flag that omits the byte, so the object is patched.
 Usage:
   arm64e_link.py build --out FILE [--kind dylib|exe] [options] SRC.c...
   arm64e_link.py patch IN.o OUT.o
+  arm64e_link.py verify FILE [--kind dylib|exe]
+  arm64e_link.py dump FILE            (JSON)
 ld64 comes from --ld64 or the LD64 environment variable. Run with python3 -I.
 """
 import argparse
+import json
 import os
 import struct
 import subprocess
@@ -23,7 +26,7 @@ CPU_TYPE_ARM64 = 0x0100000C
 CPU_SUBTYPE_ARM64E = 0x2
 CAPS_MASK = 0xFF000000
 CAPS_ARM64E_VERSIONED = 0x80000000
-MH_OBJECT = 1
+MH_OBJECT, MH_EXECUTE, MH_DYLIB = 1, 2, 6
 
 LC_SEGMENT_64 = 0x19
 LC_SYMTAB = 0x2
@@ -378,6 +381,55 @@ class MachO:
         return fix
 
 
+# ---------------------------------------------------------------------- verify
+
+def load_macho(path):
+    try:
+        with open(path, "rb") as f:
+            return MachO(f.read(), path)
+    except OSError as e:
+        raise RecipeError("cannot read %s: %s" % (path, e))
+
+
+def verify_output(path, kind=None):
+    """Check a linked file is arm64e with chained fixups; return the decode."""
+    m = load_macho(path)
+    if m.cputype != CPU_TYPE_ARM64:
+        raise RecipeError("%s: cputype 0x%08x is not ARM64" % (path, m.cputype))
+    if m.cpusubtype != CPU_SUBTYPE_ARM64E:
+        raise RecipeError("%s: cpusubtype 0x%08x is not arm64e (0x%08x)" %
+                          (path, m.cpusubtype, CPU_SUBTYPE_ARM64E))
+    want = {"dylib": MH_DYLIB, "exe": MH_EXECUTE}.get(kind)
+    if kind is not None and want is None:
+        raise RecipeError("unknown kind %r" % kind)
+    if want is not None and m.filetype != want:
+        raise RecipeError("%s: filetype %d, expected %d for %s" % (path, m.filetype, want, kind))
+    if m.build_platform != PLATFORM_MACOS:
+        raise RecipeError("%s: build platform %r is not macOS" % (path, m.build_platform))
+    if kind == "dylib" and not m.install_name:
+        raise RecipeError("%s: dylib has no LC_ID_DYLIB" % path)
+    if m.chained is None:
+        raise RecipeError("%s: no LC_DYLD_CHAINED_FIXUPS (was -fixup_chains passed?)" % path)
+    if m.dyld_info is not None and any(m.dyld_info[i] for i in (1, 3, 5, 7)):
+        raise RecipeError("%s: LC_DYLD_INFO carries rebase/bind opcodes next to chained fixups" % path)
+    decoded = m.chained_fixups()
+    for imp in decoded["imports"]:
+        if imp["ordinal"] < 0:
+            raise RecipeError("%s: import %s has special lib ordinal %d (main executable or flat "
+                              "lookup), not a real dylib" % (path, imp["name"], imp["ordinal"]))
+    return m, decoded
+
+
+def dump(path):
+    m, decoded = verify_output(path)
+    base = m.image_base()
+    return {
+        "file": os.path.basename(path), "cputype": m.cputype, "cpusubtype": m.cpusubtype,
+        "filetype": m.filetype, "image_base": base, "install_name": m.install_name,
+        "load_dylibs": [p for _c, p in m.dylibs], "segments": m.segments,
+        "symbols": m.symbols(), "chained": decoded,
+    }
+
 
 # ----------------------------------------------------------------------- build
 
@@ -441,6 +493,7 @@ def build(sources, out, kind="dylib", target=DEFAULT_TARGET, clang=None, cflags=
     run(cmd, verbose)
     if not os.path.isfile(out) or os.path.getsize(out) == 0:
         raise RecipeError("ld64 reported success but %s is missing or empty" % out)
+    return verify_output(out, kind)
 
 
 def main(argv):
@@ -467,15 +520,26 @@ def main(argv):
     p = sub.add_parser("patch")
     p.add_argument("src")
     p.add_argument("dst")
+    v = sub.add_parser("verify")
+    v.add_argument("file")
+    v.add_argument("--kind", choices=("dylib", "exe"))
+    d = sub.add_parser("dump")
+    d.add_argument("file")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "build":
-            build(a.sources, a.out, a.kind, a.target, a.clang, a.cflags, a.ld64, a.min_os,
-                  a.sdk, a.install_name, a.entry, a.no_implicit_dylibs, a.lib, a.lib_dir,
-                  a.ld_args, a.workdir, a.verbose)
-            print("OK %s" % a.out)
-        else:
+            _m, dec = build(a.sources, a.out, a.kind, a.target, a.clang, a.cflags, a.ld64, a.min_os,
+                            a.sdk, a.install_name, a.entry, a.no_implicit_dylibs, a.lib, a.lib_dir,
+                            a.ld_args, a.workdir, a.verbose)
+            print("OK %s: %d fixups, %d imports" % (a.out, len(dec["fixups"]), len(dec["imports"])))
+        elif a.cmd == "patch":
             patch_file(a.src, a.dst)
+        elif a.cmd == "verify":
+            _m, dec = verify_output(a.file, a.kind)
+            print("OK %s: %d fixups, %d imports" % (a.file, len(dec["fixups"]), len(dec["imports"])))
+        else:
+            json.dump(dump(a.file), sys.stdout, indent=1, sort_keys=True)
+            print()
     except (RecipeError, OSError) as e:
         print("arm64e_link: error: %s" % e, file=sys.stderr)
         return 1
