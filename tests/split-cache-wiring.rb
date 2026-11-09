@@ -527,4 +527,62 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
       return 0;
     }
   CPP
+
+  # --- interposing must not patch a split cache with the old patch table layout ---
+  loader = File.read("#{root}/src/ImageLoader.cpp")
+  interpose_fn = loader[/^void ImageLoader::applyInterposingToDyldCache\(.*?^\}/m] or abort 'applyInterposingToDyldCache missing'
+  run_cpp(dir, 'interpose', <<~CPP, root)
+    #{COMMON}
+    #include <vector>
+    #include <stdarg.h>
+    typedef int mach_port_t;
+    static int mach_task_self() { return 1; }
+    struct dyld_cache_patchable_location { uint32_t cacheOffset; bool authenticated, usesAddressDiversity; uint16_t discriminator; uint8_t key; };
+    namespace dyld3 { namespace closure { typedef uint32_t ImageNum; struct Image { const char* path() const { return ""; } };
+                                          struct ImageArray { const Image* imageForNum(uint32_t) const { return nullptr; } }; } }
+    static int writers = 0, tableReads = 0, imageArrayReads = 0;
+    typedef int (*LogFunc)(const char*, ...);
+    struct DyldSharedCache {
+      struct { bool builtFromChainedFixups = true; } header;
+      bool split = false;
+      bool isSplitCache() const { return split; }
+      struct DataConstScopedWriter { DataConstScopedWriter(const DyldSharedCache*, mach_port_t, void (*)(const char*, ...)) { ++writers; } };
+      bool addressInText(uint32_t, uint32_t* i) const { ++tableReads; *i = 0; return true; }
+      void forEachPatchableExport(uint32_t, void (^cb)(uint32_t, const char*)) const { ++tableReads; }
+      void forEachPatchableUseOfExport(uint32_t, uint32_t, void (^cb)(dyld_cache_patchable_location)) const { ++tableReads; }
+      const dyld3::closure::ImageArray* cachedDylibsImageArray() const { ++imageArrayReads; return nullptr; }
+      static uint64_t getAddend(dyld_cache_patchable_location) { return 0; }
+      static const char* keyName(dyld_cache_patchable_location) { return ""; }
+    };
+    static std::vector<std::string> logs;
+    namespace dyld { static void log(const char* f, ...) { char b[256]; va_list a; va_start(a, f); vsnprintf(b, sizeof b, f, a); va_end(a); logs.push_back(b); } }
+    class ImageLoader {
+    public:
+      struct LinkContext { const DyldSharedCache* dyldCache = nullptr; bool verboseMapping = false, verboseInterposing = false; };
+      struct InterposeTuple { uintptr_t replacement, neverImage, onlyImage, replacee; };
+      static std::vector<InterposeTuple> fgInterposingTuples;
+      static void applyInterposingToDyldCache(const LinkContext&);
+    };
+    std::vector<ImageLoader::InterposeTuple> ImageLoader::fgInterposingTuples;
+    #{interpose_fn}
+    int main() {
+      DyldSharedCache cache; ImageLoader::LinkContext ctx; ctx.dyldCache = &cache;
+      ImageLoader::fgInterposingTuples.push_back({ 0x2000, 0, 0, (uintptr_t)&cache + 0x100 });
+      // an ordinary cache keeps being patched
+      ImageLoader::applyInterposingToDyldCache(ctx);
+      CHECK(writers == 1 && tableReads > 0);
+      // a split cache is left alone, loudly when asked: nothing is made writable and no patch table is read
+      writers = tableReads = imageArrayReads = 0; cache.split = true; ctx.verboseInterposing = true;
+      ImageLoader::applyInterposingToDyldCache(ctx);
+      CHECK(writers == 0 && tableReads == 0 && imageArrayReads == 0);
+      CHECK(!logs.empty() && logs.back().find("split shared cache") != std::string::npos);
+      // quiet unless verbose, and a cache that was not built from chained fixups is still skipped
+      logs.clear(); ctx.verboseInterposing = false;
+      ImageLoader::applyInterposingToDyldCache(ctx);
+      CHECK(logs.empty() && writers == 0 && tableReads == 0);
+      if (failures) { printf("%d failure(s)\\n", failures); return 1; }
+      puts("PASS interposing leaves a split cache's patch table alone");
+      return 0;
+    }
+  CPP
 end
