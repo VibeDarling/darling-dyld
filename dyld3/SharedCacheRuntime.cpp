@@ -395,6 +395,59 @@ static bool cacheRangeContains(uint64_t start, uint64_t length,
         && address - start <= length && size <= length - (address - start);
 }
 
+// A mapping protection must be non-empty, within read/write/execute and never writable and executable at once.
+static bool cacheProtectionIsValid(uint32_t prot)
+{
+    return (prot != 0) && ((prot & ~(VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE)) == 0)
+        && !((prot & VM_PROT_WRITE) && (prot & VM_PROT_EXECUTE));
+}
+
+static bool cacheMappingTableFits(const dyld_cache_header& header, uint64_t headerPageSize)
+{
+    if ( !dyld_cache_header_is_split(header) )
+        return header.mappingOffset <= 0x168;
+    return cacheRangeContains(0, headerPageSize, header.mappingOffset,
+                              uint64_t(header.mappingCount) * sizeof(dyld_cache_mapping_info));
+}
+
+// Mappings of one file of a split cache must be sane and in ascending, non-overlapping VM order.
+// Which one is text, data or linkedit is not known from its position there.
+static bool splitFileMappingsAreValid(const dyld_cache_mapping_info* mappings, uint32_t count)
+{
+    for (uint32_t i = 0; i != count; ++i) {
+        if ( !cacheProtectionIsValid(mappings[i].maxProt) )
+            return false;
+        if ( (i + 1 != count) && (mappings[i].address + mappings[i].size > mappings[i + 1].address) )
+            return false;
+    }
+    return true;
+}
+
+// DyldSharedCache reads the header and its tables through the first mapping of the main file, so that
+// mapping has to start the region at file offset 0 and hold every table the header points to.
+static bool splitHeaderIsMapped(const dyld_cache_header& header, uint64_t address, uint64_t fileOffset, uint64_t size)
+{
+    return address == header.sharedRegionStart && fileOffset == 0
+        && cacheRangeContains(0, size, header.mappingOffset, uint64_t(header.mappingCount) * sizeof(dyld_cache_mapping_info))
+        && cacheRangeContains(0, size, header.mappingWithSlideOffset, uint64_t(header.mappingWithSlideCount) * sizeof(dyld_cache_mapping_and_slide_info))
+        && cacheRangeContains(0, size, header.imagesOffsetSplit, uint64_t(header.imagesCountSplit) * sizeof(dyld_cache_image_info));
+}
+
+// The signature blob must end the file (an unsigned file has offset == length and size 0, and fails the
+// registration that follows) and no mapping may reach into it, so every mapped byte is signed.
+static bool splitSignatureCoversMappings(const dyld_cache_header& header, const dyld_cache_mapping_info* mappings,
+                                         uint32_t count, uint64_t fileLength)
+{
+    if ( !cacheRangeContains(0, fileLength, header.codeSignatureOffset, header.codeSignatureSize)
+      || (header.codeSignatureOffset + header.codeSignatureSize != fileLength) )
+        return false;
+    for (uint32_t i = 0; i != count; ++i) {
+        if ( mappings[i].fileOffset + mappings[i].size > header.codeSignatureOffset )
+            return false;
+    }
+    return true;
+}
+
 static bool preflightCacheFile(const SharedCacheOptions& options, SharedCacheLoadInfo* results, CacheInfo* info)
 {
     
@@ -431,7 +484,9 @@ static bool preflightCacheFile(const SharedCacheOptions& options, SharedCacheLoa
         ::close(fd);
         return false;
     }
-    if ( (cache->header.mappingCount < 3) || (cache->header.mappingCount > DyldSharedCache::MaxMappings) || (cache->header.mappingOffset > 0x168) ) {
+    if ( (cache->header.mappingCount < (dyld_cache_header_is_split(cache->header) ? 1 : 3))
+      || (cache->header.mappingCount > DyldSharedCache::MaxMappings)
+      || !cacheMappingTableFits(cache->header, sizeof(firstPage)) ) {
         results->errorMessage = "shared cache file mappings are invalid";
         ::close(fd);
         return false;
@@ -451,33 +506,53 @@ static bool preflightCacheFile(const SharedCacheOptions& options, SharedCacheLoa
             return false;
         }
     }
-    if (  (textMapping->fileOffset != 0)
-      || ((fileMappings[0].address + fileMappings[0].size) > firstDataMapping->address)
-      || ((fileMappings[0].fileOffset + fileMappings[0].size) != firstDataMapping->fileOffset)
-      || (cache->header.codeSignatureOffset > cacheFileLength)
-      || (cache->header.codeSignatureSize != cacheFileLength - cache->header.codeSignatureOffset)
-      || (textMapping->maxProt != (VM_PROT_READ|VM_PROT_EXECUTE))
-      || (linkeditMapping->maxProt != VM_PROT_READ) ) {
-        results->errorMessage = "shared cache text/linkedit mappings are invalid";
-        ::close(fd);
-        return false;
-    }
-
-    // Check the __DATA mappings
-    for (unsigned i = 1; i != (cache->header.mappingCount - 1); ++i) {
-        if ( ((fileMappings[i].address + fileMappings[i].size) > fileMappings[i + 1].address)
-          || ((fileMappings[i].fileOffset + fileMappings[i].size) != fileMappings[i + 1].fileOffset)
-          || (fileMappings[i].maxProt != (VM_PROT_READ|VM_PROT_WRITE)) ) {
-            results->errorMessage = "shared cache data mappings are invalid";
+    if ( dyld_cache_header_is_split(cache->header) ) {
+        // Extents were validated above, so the sums in the checks below cannot wrap.
+        if ( !splitFileMappingsAreValid(fileMappings, cache->header.mappingCount) ) {
+            results->errorMessage = "shared cache split mappings are invalid";
+            ::close(fd);
+            return false;
+        }
+        if ( !splitHeaderIsMapped(cache->header, fileMappings[0].address, fileMappings[0].fileOffset, fileMappings[0].size) ) {
+            results->errorMessage = "shared cache split header is not mapped at the region start";
+            ::close(fd);
+            return false;
+        }
+        if ( !splitSignatureCoversMappings(cache->header, fileMappings, cache->header.mappingCount, cacheFileLength) ) {
+            results->errorMessage = "shared cache split signature does not cover its mappings";
             ::close(fd);
             return false;
         }
     }
+    else {
+        if (  (textMapping->fileOffset != 0)
+          || ((fileMappings[0].address + fileMappings[0].size) > firstDataMapping->address)
+          || ((fileMappings[0].fileOffset + fileMappings[0].size) != firstDataMapping->fileOffset)
+          || (cache->header.codeSignatureOffset > cacheFileLength)
+          || (cache->header.codeSignatureSize != cacheFileLength - cache->header.codeSignatureOffset)
+          || (textMapping->maxProt != (VM_PROT_READ|VM_PROT_EXECUTE))
+          || (linkeditMapping->maxProt != VM_PROT_READ) ) {
+            results->errorMessage = "shared cache text/linkedit mappings are invalid";
+            ::close(fd);
+            return false;
+        }
 
-    if ( (textMapping->address != cache->header.sharedRegionStart) || ((linkeditMapping->address + linkeditMapping->size) > (cache->header.sharedRegionStart+cache->header.sharedRegionSize)) ) {
-        results->errorMessage = "shared cache file mapping addressses invalid";
-        ::close(fd);
-        return false;
+        // Check the __DATA mappings
+        for (unsigned i = 1; i != (cache->header.mappingCount - 1); ++i) {
+            if ( ((fileMappings[i].address + fileMappings[i].size) > fileMappings[i + 1].address)
+              || ((fileMappings[i].fileOffset + fileMappings[i].size) != fileMappings[i + 1].fileOffset)
+              || (fileMappings[i].maxProt != (VM_PROT_READ|VM_PROT_WRITE)) ) {
+                results->errorMessage = "shared cache data mappings are invalid";
+                ::close(fd);
+                return false;
+            }
+        }
+
+        if ( (textMapping->address != cache->header.sharedRegionStart) || ((linkeditMapping->address + linkeditMapping->size) > (cache->header.sharedRegionStart+cache->header.sharedRegionSize)) ) {
+            results->errorMessage = "shared cache file mapping addressses invalid";
+            ::close(fd);
+            return false;
+        }
     }
 
     // Use the same format discriminator as the slide-table consumer below.
