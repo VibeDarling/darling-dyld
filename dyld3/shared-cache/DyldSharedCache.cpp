@@ -1309,7 +1309,86 @@ const char* DyldSharedCache::forEachPatchPlainLocation(uint32_t imageIndex,
     return nullptr;
 }
 
-// ---- end of the patch info reader ----
+// ---- override of the coalesced GOT slots of an exporter that the process provides itself ----
+static const char* const kPatchErrSign     = "patch override: the address of an exported symbol does not fit a pointer of the slot's kind";
+static const char* const kPatchErrSlot     = "patch override: a GOT slot is misaligned or lies in a mapping that cannot be made writable";
+
+// This file is also built into libdyld, which has no C++ library: a bitmap of the exporters done, for the one cache of the process.
+static const uint32_t kMaxPatchableImages = 8192;
+static uint64_t sPatchedExporters[kMaxPatchableImages / 64];
+static const DyldSharedCache* sPatchedCache;
+
+const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, uint64_t* address),
+                                                    DataConstLogFunc logFunc, PatchOverrideStats* stats) const
+{
+    memset(stats, 0, sizeof(*stats));
+    if ( imageIndex >= kMaxPatchableImages )
+        return kPatchErrImage;
+    if ( sPatchedCache != this ) {
+        memset(sPatchedExporters, 0, sizeof(sPatchedExporters));
+        sPatchedCache = this;
+    }
+    if ( (sPatchedExporters[imageIndex / 64] & (1ULL << (imageIndex % 64))) != 0 ) {
+        stats->alreadyApplied = true;
+        return nullptr;
+    }
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    if ( const char* error = openPatchTablesV4(this, maps, &t) )
+        return error;
+    PatchCursors cursors(UINT64_MAX);
+    if ( const char* error = checkPatchExporterV4(t, maps, imageIndex, false, &cursors) )
+        return error;
+
+    DataConstLazyScopedWriter writer(this, mach_task_self(), logFunc);
+    const dyld_cache_image_got_clients_v4& g = t.gotClients[imageIndex];
+    for (uint64_t i = g.exportsStartIndex; i != (uint64_t)g.exportsStartIndex + g.exportsCount; ++i) {
+        const dyld_cache_got_client_export_v4& e = t.gotExports[i];
+        const char* symbol = t.names + (t.exports[e.imageExportIndex].nameKind & 0x0fffffffu);
+        uint64_t address = 0;
+        ++stats->exports;
+        stats->slots += e.locationsCount;
+        if ( !resolve(symbol, &address) ) {
+            ++stats->missingExports;
+            stats->missingSlots += e.locationsCount;
+            continue;
+        }
+        for (uint64_t k = e.locationsStartIndex; k != (uint64_t)e.locationsStartIndex + e.locationsCount; ++k) {
+            const dyld_cache_patchable_got_location_v4& l = t.gotLocations[k];
+            const uint64_t slotUnslid = t.unslidBase + (((uint64_t)l.cacheOffsetHi << 32) | l.cacheOffsetLo);
+            const PatchLocationV4 loc = patchLocation(t, e.imageExportIndex, slotUnslid, l.flags);
+            if ( !loc.explained ) {
+                ++stats->unexplained;
+                if ( logFunc != nullptr )
+                    logFunc("dyld: GOT slot of '%s' has an encoding that cannot be explained (flags 0x%x), left as the cache's pointer\n", symbol, l.flags);
+                continue;
+            }
+            // the signer only has the 48-bit pointer field of an authenticated pointer, and an unauthenticated one keeps its top byte for high7
+            if ( (address >> (loc.encoding.authenticated ? 48 : 56)) != 0 )
+                return kPatchErrSign;
+            const uint64_t target = address + loc.encoding.addend;
+            const PatchMapping* mapping = patchMappingContaining(maps, slotUnslid, sizeof(uint64_t), true);
+            if ( (slotUnslid % sizeof(uint64_t) != 0) || (mapping == nullptr)
+              || (((mapping->flags & DYLD_CACHE_MAPPING_CONST_DATA) == 0) && ((mapping->initProt & VM_PROT_WRITE) == 0)) )
+                return kPatchErrSlot;
+            writer.makeWriteable();
+            if ( loc.encoding.authenticated ) {
+                // signPointer() numbers the keys IA, IB, DA, DB
+                *loc.slot = dyld3::MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(target, loc.slot, loc.encoding.usesAddressDiversity,
+                                loc.encoding.discriminator, loc.encoding.keyIsData ? 2 : 0);
+            }
+            else {
+                *loc.slot = target | ((uint64_t)loc.encoding.high7 << 57);
+            }
+            ++stats->patched;
+        }
+    }
+    sPatchedExporters[imageIndex / 64] |= 1ULL << (imageIndex % 64);
+    return nullptr;
+}
+// ---- end of the patch info reader and override ----
 #endif
 
 #if !(BUILDING_LIBDYLD || BUILDING_DYLD)
