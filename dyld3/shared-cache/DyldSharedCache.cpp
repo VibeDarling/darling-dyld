@@ -1247,6 +1247,68 @@ const char* DyldSharedCache::checkPatchInfoV4(PatchInfoV4Counts* counts) const
     return nullptr;
 }
 
+static DyldSharedCache::PatchLocationV4 patchLocation(const PatchTablesV4& t, uint32_t exportIndex, uint64_t slotUnslid, uint32_t flags)
+{
+    DyldSharedCache::PatchLocationV4 loc;
+    loc.symbol      = t.names + (t.exports[exportIndex].nameKind & 0x0fffffffu);
+    loc.exportIndex = exportIndex;
+    loc.kind        = t.exports[exportIndex].nameKind >> 28;
+    loc.implOffset  = t.exports[exportIndex].dylibOffsetOfImpl;
+    loc.slot        = (uint64_t*)(uintptr_t)(slotUnslid + t.slide);
+    loc.flags       = flags;
+    loc.explained   = decodeCachePatchFlagsV4(flags, &loc.encoding);
+    return loc;
+}
+
+const char* DyldSharedCache::forEachPatchGotLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location)) const
+{
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    if ( const char* error = openPatchTablesV4(this, maps, &t) )
+        return error;
+    PatchCursors cursors(UINT64_MAX);
+    if ( const char* error = checkPatchExporterV4(t, maps, imageIndex, false, &cursors) )
+        return error;
+    const dyld_cache_image_got_clients_v4& g = t.gotClients[imageIndex];
+    for (uint64_t i = g.exportsStartIndex; i != (uint64_t)g.exportsStartIndex + g.exportsCount; ++i) {
+        const dyld_cache_got_client_export_v4& e = t.gotExports[i];
+        for (uint64_t k = e.locationsStartIndex; k != (uint64_t)e.locationsStartIndex + e.locationsCount; ++k) {
+            const dyld_cache_patchable_got_location_v4& l = t.gotLocations[k];
+            handler(patchLocation(t, e.imageExportIndex, t.unslidBase + (((uint64_t)l.cacheOffsetHi << 32) | l.cacheOffsetLo), l.flags));
+        }
+    }
+    return nullptr;
+}
+
+const char* DyldSharedCache::forEachPatchPlainLocation(uint32_t imageIndex,
+                                                       void (^handler)(const PatchLocationV4& location, uint32_t clientIndex)) const
+{
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    if ( const char* error = openPatchTablesV4(this, maps, &t) )
+        return error;
+    // the plain part is only checked for this exporter, which for libobjc is most of the table
+    PatchCursors cursors(UINT64_MAX);
+    if ( const char* error = checkPatchExporterV4(t, maps, imageIndex, true, &cursors) )
+        return error;
+    const dyld_cache_image_patches_v4& p = t.patches[imageIndex];
+    for (uint64_t i = p.clientsStartIndex; i != (uint64_t)p.clientsStartIndex + p.clientsCount; ++i) {
+        const dyld_cache_patch_client_v4& client = t.clients[i];
+        for (uint64_t j = client.exportsStartIndex; j != (uint64_t)client.exportsStartIndex + client.exportsCount; ++j) {
+            const dyld_cache_patch_client_export_v4& e = t.clientExports[j];
+            for (uint64_t k = e.locationsStartIndex; k != (uint64_t)e.locationsStartIndex + e.locationsCount; ++k) {
+                handler(patchLocation(t, e.imageExportIndex, t.images[client.clientDylibIndex].address + t.locations[k].dylibOffsetOfUse,
+                                      t.locations[k].flags), client.clientDylibIndex);
+            }
+        }
+    }
+    return nullptr;
+}
+
 // ---- end of the patch info reader ----
 #endif
 

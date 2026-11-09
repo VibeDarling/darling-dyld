@@ -468,6 +468,18 @@ public:
         uint64_t    images, exports, clients, plainLocations, gotExports, gotLocations;
     };
 
+    // One patch location of an exporter's symbol, decoded.
+    struct PatchLocationV4 {
+        const char*                     symbol;
+        uint32_t                        exportIndex;
+        uint32_t                        kind;           // bits 28-31 of the table's name word, not interpreted
+        uint32_t                        implOffset;     // from the exporter's mach header
+        uint64_t*                       slot;           // mapped address of the pointer
+        uint32_t                        flags;
+        dyld_cache_patch_encoding_v4    encoding;
+        bool                            explained;      // false: the flags have a bit the decoder cannot explain
+    };
+
     // A split cache whose patch info is version 4 and lies in a mapping. Nothing below is meaningful without it.
     bool        hasPatchInfoV4() const;
     // The header and the extents, bounds and alignment of the nine arrays: cheap, what the runtime does on every use.
@@ -476,6 +488,9 @@ public:
     const char* checkPatchInfoV4Exporter(uint32_t imageIndex) const;
     // The whole table, including every plain location: for tools and tests (88 MB in a real cache).
     const char* checkPatchInfoV4(PatchInfoV4Counts* counts) const;
+    // These check the exporter's slices first and call the handler only on success.
+    const char* forEachPatchGotLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location)) const;
+    const char* forEachPatchPlainLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location, uint32_t clientIndex)) const;
 #endif
 
 #if !(BUILDING_LIBDYLD || BUILDING_DYLD)

@@ -29,11 +29,20 @@ module SplitCacheHarness
                    (runtime_h[/struct SplitCacheMapStats \{.*?^\};/m] or abort 'stats struct missing') + "\n" +
                    (runtime_h[/^bool mapSplitCachePrivate\(.*?;/m] or abort 'mapper declaration missing')
     image_funcs = %w[imageTable isSplitCache forEachRegion forEachImage getIndexedImageEntry getIndexedImagePath
-                     findMachHeaderImageIndex hasImagePath mappedSize].map do |name|
+                     findMachHeaderImageIndex hasImagePath mappedSize unslidLoadAddress].map do |name|
       cache_src[/^[^\n]*\bDyldSharedCache::#{name}\(.*?^\}/m] or abort "#{name} missing"
     end
     image_helper = cache_src[/^static const uint32_t kMaxSplitSubCaches.*?^static bool splitCacheTables\(.*?^\}/m] or abort 'split region walk missing'
     image_helper += "\n" + (cache_src[/^static const dyld_cache_image_info\* cacheImageTable\(.*?^\}/m] or abort 'image table helper missing')
+    cache_h = File.read("#{root}/dyld3/shared-cache/DyldSharedCache.h")
+    # The version 4 patch info reader and the DATA_CONST writer it uses, taken from the sources.
+    patch_decls = (cache_h[/^    \/\/ Version 4 patch info of a split macOS cache.*?(?=^#endif)/m] or abort 'patch info declarations missing')
+    writer_decls = (cache_h[/^    typedef void \(\*DataConstLogFunc\).*?;/m] or abort 'DataConstLogFunc missing') + "\n" +
+                   (cache_h[/^    struct DataConstLazyScopedWriter \{.*?^    \};/m] or abort 'DataConstLazyScopedWriter missing')
+    writer_funcs = [/^void DyldSharedCache::changeDataConstPermissions\(.*?^\}/m, /^DyldSharedCache::DataConstLazyScopedWriter::DataConstLazyScopedWriter\(.*?^\}/m,
+                    /^DyldSharedCache::DataConstLazyScopedWriter::~DataConstLazyScopedWriter\(.*?^\}/m,
+                    /^void DyldSharedCache::DataConstLazyScopedWriter::makeWriteable\(.*?^\}/m].map { |re| cache_src[re] or abort "DATA_CONST writer #{re} missing" }
+    patch_reader = cache_src[/^\/\/ ---- version 4 patch info of a split cache \(reader\) ----.*?^\/\/ ---- end of the patch info reader[^\n]*/m] or abort 'patch info reader missing'
     <<~CPP
     #include <sys/mman.h>
     #include <sys/stat.h>
@@ -49,10 +58,18 @@ module SplitCacheHarness
     #include <errno.h>
     #include <string>
     #include <vector>
+    #include <set>
     #define DARLING 1
     #define TARGET_OS_SIMULATOR 0
     #define __offsetof offsetof
-    enum { VM_PROT_READ=1, VM_PROT_WRITE=2, VM_PROT_EXECUTE=4 };
+    enum { VM_PROT_READ=1, VM_PROT_WRITE=2, VM_PROT_EXECUTE=4, VM_PROT_COPY=0x10 };
+    // Mach calls of the DATA_CONST writer, on the host's mprotect (the whole cache is this process's own memory).
+    typedef int mach_port_t; typedef int kern_return_t; typedef uintptr_t vm_address_t; typedef size_t vm_size_t;
+    #define KERN_SUCCESS 0
+    #define MACH_PORT_NULL 0
+    static mach_port_t mach_task_self() { return 1; }
+    bool gEnableSharedCacheDataConst = true;
+    static kern_return_t vm_protect(mach_port_t, vm_address_t address, vm_size_t size, int, int prot) { return mprotect((void *)address, size, prot & 7) == 0 ? 0 : 1; }
     #include "dyld_cache_format.h"
     #if !__GLIBC_PREREQ(2, 38)
     static size_t strlcpy(char *d, const char *s, size_t n) { size_t l=strlen(s); if (n) { size_t c=l<n-1?l:n-1; memcpy(d,s,c); d[c]=0; } return l; }
@@ -78,9 +95,15 @@ module SplitCacheHarness
       bool findMachHeaderImageIndex(const mach_header*, uint32_t&) const;
       bool hasImagePath(const char*, uint32_t&) const;
       uint64_t mappedSize() const;
+      uint64_t unslidLoadAddress() const;
+      #{writer_decls}
+      void changeDataConstPermissions(mach_port_t, uint32_t, DataConstLogFunc) const;
+      #{patch_decls}
     };
     #{image_helper}
     #{image_funcs.join("\n")}
+    #{writer_funcs.join("\n")}
+    #{patch_reader}
     namespace dyld { static void log(const char *format, ...) { va_list a; va_start(a, format); printf("LOG "); vprintf(format, a); va_end(a); } }
     namespace dyld3 {
       struct SharedCacheLoadInfo { const DyldSharedCache *loadAddress; long slide; const char *errorMessage; char path[256]; };
