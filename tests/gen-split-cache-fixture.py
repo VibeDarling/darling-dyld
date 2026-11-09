@@ -4,7 +4,8 @@
 Usage: python3 -I tests/gen-split-cache-fixture.py OUTDIR [--base 0x180000000] [--variant NAME]
 
 Writes OUTDIR/cache (main), OUTDIR/cache.01 (text), OUTDIR/cache.02.dylddata (data with slide info v5)
-and OUTDIR/manifest.txt, which holds the values the tests expect. The offsets below are written
+and OUTDIR/manifest.txt, which holds the values the tests expect. The variant "patch" adds a fourth file,
+cache.03.patch: three more images, a coalesced GOT mapping (DATA_CONST, read-only) and a version-4 patch info. The offsets below are written
 independently of dyld_cache_format.h so that the header's static_asserts are checked against them.
 """
 import argparse
@@ -33,7 +34,7 @@ VARIANTS = [
     "sub_first_mapping_offset", "bad_alignment", "sub_bad_magic", "sub_bad_platform", "sub_wx_prot", "sub_bad_prot_bits",
     "main_wx", "slide_outside_file", "sub_outside_region", "chain_start_unaligned", "main_count_mismatch", "page_starts_range",
     "page_starts_truncated", "chain_leaves_page", "chain_start_outside", "unknown_slide_version",
-    "target_outside_region", "bad_page_size", "auth_target_outside_region", "no_auth",
+    "target_outside_region", "bad_page_size", "auth_target_outside_region", "no_auth", "patch",
 ]
 
 
@@ -60,9 +61,222 @@ def auth(runtime_offset, diversity, addr_div, key_is_data, nxt=0):
     return runtime_offset | (diversity << 34) | (addr_div << 50) | (key_is_data << 51) | (nxt << 52) | (1 << 63)
 
 
+PATCH_VM = 0x40000          # cache.03.patch: text, GOT and patch-info mappings
+PATCH_REGION_SIZE = 0x80000
+PATCH_SUFFIX = b".03.patch"
+PATCH_IMAGES = [            # index 1.. (index 0 is libmini); each header sits in its own page of the text mapping
+    "/usr/lib/system/libexpa.dylib", "/usr/lib/system/libexpb.dylib", "/usr/lib/libclient.dylib",
+]
+# Exports per exporter image index: (name, implementation offset from the exporter's header, kind)
+PATCH_EXPORTS = {
+    1: [("_alpha", 0x1000, 0), ("_beta", 0x1040, 8), ("_gamma", 0x1080, 0), ("_delta_data", 0x2000, 0), ("_plain_only", 0x1100, 0)],
+    2: [("_bravo", 0x1000, 0), ("_charlie", 0x1010, 0), ("_unexplained", 0x1020, 0)],
+}
+
+
+def flags_word(auth_, high7=0, bit8=0, addend=0, addr_div=0, key_data=0, disc=0):
+    f = 1 if auth_ else 0
+    f |= high7 << 1 | bit8 << 8
+    if auth_:
+        f |= addend << 9 | addr_div << 14 | key_data << 15 | disc << 16
+    else:
+        f |= addend << 9
+    return f
+
+
+# GOT locations in table order: (slot index in the GOT page, exporter, symbol, flags fields)
+PATCH_GOT = [
+    (0, 1, "_alpha", dict(auth_=1, addr_div=1)),
+    (1, 1, "_beta", dict(auth_=1, key_data=1, disc=1)),
+    (2, 1, "_gamma", dict(auth_=1, addr_div=1, disc=0xFFFF)),
+    (3, 1, "_gamma", dict(auth_=1, addr_div=1, key_data=1, addend=3)),
+    (4, 1, "_gamma", dict(auth_=1, bit8=1, disc=0x1234)),
+    (5, 1, "_delta_data", dict(auth_=0, high7=0x20, addend=5)),
+    (6, 1, "_delta_data", dict(auth_=0, addend=100)),
+    (7, 2, "_bravo", dict(auth_=1, addr_div=1, key_data=1, disc=0xFFFF)),
+    (8, 2, "_charlie", dict(auth_=1, addend=31)),
+    (9, 2, "_unexplained", dict(auth_=1, high7=1)),      # an authenticated pointer has no high7: refused
+]
+# Client (plain table) locations: (slot offset in the plain page, exporter, symbol, client image index, flags fields)
+PATCH_PLAIN = [
+    (0x10, 1, "_plain_only", 3, dict(auth_=0)),
+    (0x18, 1, "_alpha", 3, dict(auth_=1, addr_div=1)),
+    (0x20, 1, "_alpha", 3, dict(auth_=0)),
+    (0x28, 2, "_bravo", 0, dict(auth_=1, addr_div=1, key_data=1)),
+]
+GOT_SLOT_OFF = 0x40         # slot i of the GOT page is at GOT_SLOT_OFF + 8 * i
+CONTROL_OFFS = (0x200, 0x208)   # chain entries in the GOT mapping that the patch info does not list
+
+
+def build_patch(base, value_add, rt, image0_addr, image0_path):
+    """The extra sub-cache file plus what the main file and the manifest need. Layout written independently of the C header."""
+    text_addr = base + PATCH_VM
+    got_addr = text_addr + 4 * PAGE
+    plain_page = got_addr + PAGE
+    blob_addr = got_addr + 3 * PAGE
+    image_addr = {0: image0_addr}
+    for i in range(1, 4):
+        image_addr[i] = text_addr + i * PAGE
+    paths = {0: image0_path, 1: PATCH_IMAGES[0], 2: PATCH_IMAGES[1], 3: PATCH_IMAGES[2]}
+    slot_addr = lambda k: got_addr + GOT_SLOT_OFF + 8 * k
+
+    # exports: absolute index = position in the flat array, slices per exporter
+    exports, export_slice, export_index = [], {}, {}
+    for img in range(4):
+        start = len(exports)
+        for name, impl, kind in PATCH_EXPORTS.get(img, []):
+            export_index[(img, name)] = len(exports)
+            exports.append((img, name, impl, kind))
+        export_slice[img] = (start, len(exports) - start)
+    names, name_off = bytearray(b"\0"), {}
+    for _, name, _, _ in exports:
+        name_off[name] = len(names)
+        names += name.encode() + b"\0"
+
+    # plain table: clients -> clientExports -> locations, grouped per exporter then client
+    clients, client_exports, locations, client_slice = [], [], [], {}
+    for img in range(4):
+        cstart = len(clients)
+        by_client = {}
+        for off, exp, sym, client, fl in PATCH_PLAIN:
+            if exp == img:
+                by_client.setdefault(client, []).append((off, sym, fl))
+        for client, items in by_client.items():
+            ce_start = len(client_exports)
+            for sym in dict.fromkeys(i[1] for i in items):
+                l_start = len(locations)
+                for off, s2, fl in items:
+                    if s2 == sym:
+                        locations.append((plain_page + off - image_addr[client], flags_word(**fl)))
+                client_exports.append((export_index[(img, sym)], l_start, len(locations) - l_start))
+            clients.append((client, ce_start, len(client_exports) - ce_start))
+        client_slice[img] = (cstart, len(clients) - cstart)
+
+    # GOT table: per exporter, per symbol (first-appearance order), its locations are contiguous
+    got_clients, got_exports, got_locs = [], [], []
+    for img in range(4):
+        gstart = len(got_exports)
+        entries = [g for g in PATCH_GOT if g[1] == img]
+        for sym in dict.fromkeys(g[2] for g in entries):
+            l_start = len(got_locs)
+            for k, _, s2, fl in entries:
+                if s2 == sym:
+                    off = slot_addr(k) - base
+                    got_locs.append((off & 0xFFFFFFFF, off >> 32, flags_word(**fl), 0))
+            got_exports.append((export_index[(img, sym)], l_start, len(got_locs) - l_start))
+        got_clients.append((gstart, len(got_exports) - gstart))
+    # the table order of GOT locations must equal PATCH_GOT order for the manifest to be simple
+    assert [g[0] for g in PATCH_GOT] == sorted(g[0] for g in PATCH_GOT)
+
+    # patch info blob: header (152 bytes) then the arrays, each 4-byte aligned
+    blob = bytearray(152)
+    arrays = {}
+
+    def put(name, count, data):
+        while len(blob) % 4:
+            blob.append(0)
+        arrays[name] = (blob_addr + len(blob), count)
+        blob.extend(data)
+        blob.extend(bytes(16))      # slack: a count one too high stays inside the blob and does not overlap the next array
+
+    put("patchTable", 4, b"".join(struct.pack("<IIII", *client_slice[i], *export_slice[i]) for i in range(4)))
+    put("imageExports", len(exports), b"".join(struct.pack("<II", impl, kind << 28 | name_off[name]) for _, name, impl, kind in exports))
+    put("clients", len(clients), b"".join(struct.pack("<III", *c) for c in clients))
+    put("clientExports", len(client_exports), b"".join(struct.pack("<III", *c) for c in client_exports))
+    put("locations", len(locations), b"".join(struct.pack("<II", *l) for l in locations))
+    put("gotClients", 4, b"".join(struct.pack("<II", *g) for g in got_clients))
+    put("gotClientExports", len(got_exports), b"".join(struct.pack("<III", *g) for g in got_exports))
+    put("gotLocations", len(got_locs), b"".join(struct.pack("<IIII", *g) for g in got_locs))
+    put("exportNames", len(names), bytes(names))
+    order = ["patchTable", "imageExports", "clients", "clientExports", "locations", "exportNames", "gotClients", "gotClientExports", "gotLocations"]
+    struct.pack_into("<II", blob, 0, 4, 0)
+    for n, name in enumerate(order):
+        struct.pack_into("<QQ", blob, 8 + 16 * n, *arrays[name])
+    assert len(blob) <= 3 * PAGE
+
+    # GOT mapping content: page 0 slots, page 1 client slots, page 2 control slots, all chained
+    data = bytearray(3 * PAGE)
+    for slot in range(0, len(data) // 8):
+        struct.pack_into("<Q", data, slot * 8, 0x2222222200000000 + slot)
+    chains = {0: [], 1: [], 2: []}
+    impl_of = {(e[0], e[1]): e[2] for e in exports}
+
+    def cache_target(exp, sym):
+        return image_addr[exp] + impl_of[(exp, sym)] - base      # slide info targets are offsets from the cache base
+
+    def chain_entry(fl, target, nxt):
+        a = flags_word(**fl)
+        if a & 1:
+            return auth(rt(target), (a >> 16), (a >> 14) & 1, (a >> 15) & 1, nxt)
+        return plain(rt(target), 0, nxt)
+
+    for k, exp, sym, fl in PATCH_GOT:
+        chains[0].append((GOT_SLOT_OFF + 8 * k, chain_entry(fl, cache_target(exp, sym), 1)))
+    for off, exp, sym, client, fl in PATCH_PLAIN:
+        chains[1].append((off, chain_entry(fl, cache_target(exp, sym), 1)))
+    for n, off in enumerate(CONTROL_OFFS):
+        chains[2].append((off, auth(rt(image_addr[1] + 0x1200 + 0x40 * n - base), 0x0777, 1, 0, 1)))
+    starts, slots_in_chains = [], 0
+    for page in range(3):
+        items = sorted(chains[page])
+        for n, (off, raw) in enumerate(items):
+            if n + 1 == len(items):
+                raw &= ~(0x7FF << 52)
+            struct.pack_into("<Q", data, page * PAGE + off, raw)
+        starts.append(items[0][0])
+        slots_in_chains += len(items)
+    n_auth = sum(1 for page in chains.values() for _, raw in page if raw >> 63)
+    slide = struct.pack("<IIIIQ", 5, PAGE, 3, 0, value_add) + struct.pack("<3H", *starts)
+
+    # the file: header page + 3 text pages | GOT mapping (3 pages) | blob mapping (3 pages) | slide info
+    h = header(text_addr, 0)
+    h[H_UUID:H_UUID + 16] = uuid_for("sub3")
+    struct.pack_into("<II", h, H_MAPPING_OFF, HEADER_SIZE, 3)
+    struct.pack_into("<II", h, H_MAPSLIDE_OFF, 0x280, 3)
+    text = bytearray(4 * PAGE)
+    text[:HEADER_SIZE] = h
+    for i in range(1, 4):   # a bare mach_header_64 per image: magic, arm64, dylib
+        struct.pack_into("<IIIIIIII", text, i * PAGE, 0xFEEDFACF, 0x0100000C, 0x80000002, 6, 0, 0, 0, 0)
+    slide_off = 10 * PAGE
+    f = bytearray(10 * PAGE) + slide
+    f[:4 * PAGE] = text
+    f[4 * PAGE:7 * PAGE] = data
+    f[7 * PAGE:7 * PAGE + len(blob)] = blob
+    f[0x280:0x280 + 3 * 56] = (
+        struct.pack("<QQQQQQII", text_addr, 4 * PAGE, 0, 0, 0, 0, 5, 5)
+        + struct.pack("<QQQQQQII", got_addr, 3 * PAGE, 4 * PAGE, slide_off, len(slide), 4 | 1, 3, 1)   # CONST_DATA | AUTH_DATA, read-only
+        + struct.pack("<QQQQQQII", blob_addr, 3 * PAGE, 7 * PAGE, 0, 0, 0, 1, 1))
+    struct.pack_into("<Q", f, H_CODESIG_OFF, len(f))
+
+    lines = ["patchinfo 0x%x %d" % (blob_addr, len(blob))]
+    for name in order:
+        lines.append("parray %s 0x%x %d" % ((name,) + arrays[name]))
+    lines.append("pgotmap 0x%x 0x%x" % (got_addr, 3 * PAGE))
+    for i in range(4):
+        lines.append("pimage %d 0x%x %s" % (i, image_addr[i], paths[i]))
+    for name, (img, sym, impl, kind) in [(e[1], e) for e in exports]:
+        lines.append("pexport %d %s 0x%x %d" % (img, name, impl, kind))
+    for k, exp, sym, fl in PATCH_GOT:
+        f_ = flags_word(**fl)
+        explained = 0 if (fl.get("auth_") and fl.get("high7")) else 1
+        lines.append("pgot 0x%x %d %s 0x%x %d %d %d %d %d %d %d %d" % (
+            slot_addr(k), exp, sym, f_, fl.get("auth_", 0), fl.get("addr_div", 0), fl.get("key_data", 0),
+            fl.get("disc", 0), fl.get("addend", 0), fl.get("high7", 0), fl.get("bit8", 0), explained))
+    for off, exp, sym, client, fl in PATCH_PLAIN:
+        lines.append("pplain 0x%x %d %s %d 0x%x" % (plain_page + off, exp, sym, client, flags_word(**fl)))
+    for off in CONTROL_OFFS:
+        lines.append("pcontrol 0x%x" % (got_addr + 2 * PAGE + off))
+    entry = struct.pack("<16sQ32s", uuid_for("sub3"), PATCH_VM, PATCH_SUFFIX)
+    images = [(image_addr[i], paths[i]) for i in range(1, 4)]
+    return dict(file=bytes(f), entry=entry, images=images, lines=lines, blob_addr=blob_addr, blob_size=len(blob),
+                pages=3, plain=slots_in_chains - n_auth, auth=n_auth, mappings=3)
+
+
 def build(base, variant):
     files = {}
     v = variant
+    patch = (v == "patch")
+    region_size = PATCH_REGION_SIZE if patch else REGION_SIZE
     # Real caches have value_add == region start; the fixture offsets it so that code which ignored
     # value_add would produce wrong targets.
     value_add_delta = 0x4000
@@ -182,7 +396,7 @@ def build(base, variant):
     # ---- main file: header, one text mapping, sub-cache array, image table, path
     main_len = 2 * PAGE
     m = bytearray(main_len)
-    h = header(base, REGION_SIZE)
+    h = header(base, region_size)
     h[H_UUID:H_UUID + 16] = uuid_for("main")
     mappings = [(base, main_len, 0, 7 if v == "main_wx" else 5, 5)]
     if v == "main_overlap":
@@ -199,9 +413,13 @@ def build(base, variant):
     slide_count = 1 if v == "main_count_mismatch" else len(mappings)
     struct.pack_into("<II", h, H_MAPPING_OFF, map_off, len(mappings))
     struct.pack_into("<II", h, H_MAPSLIDE_OFF, 0x280, slide_count)
-    struct.pack_into("<II", h, H_SUBCACHE_OFF, 0x300, 2)
+    extra = None
+    if patch:
+        extra = build_patch(base, value_add, rt, image_addr, INSTALL_NAME.decode())
+        struct.pack_into("<QQ", h, 0x98, extra["blob_addr"], extra["blob_size"])
+    struct.pack_into("<II", h, H_SUBCACHE_OFF, 0x300, 3 if patch else 2)
     struct.pack_into("<II", h, H_IMAGES_OFF_SPLIT, main_len - 16 if v == "image_table_outside" else 0x400,
-                     0 if v == "main_not_split" else 1)
+                     0 if v == "main_not_split" else (1 + len(extra["images"]) if patch else 1))
     struct.pack_into("<I", h, H_TRIE_SIZE, 0)
     sig_off, sig_size = main_len + (0x1000 if v == "bad_codesig" else 0), 0
     if v == "sig_before_eof":
@@ -221,9 +439,18 @@ def build(base, variant):
     vm1 = sub1_addr - base + (0x4000 if v == "bad_vm_offset" else 0)
     m[0x300:0x300 + 56] = struct.pack("<16sQ32s", uuid1, vm1, suffix1)
     m[0x300 + 56:0x300 + 112] = struct.pack("<16sQ32s", uuid2, 0x10000, b".02.dylddata")
+    if patch:
+        m[0x300 + 112:0x300 + 168] = extra["entry"]
     path_off = 0x500
     m[0x400:0x420] = struct.pack("<QQQII", image_addr, 0, 0, path_off, 0)
     m[path_off:path_off + len(INSTALL_NAME) + 1] = INSTALL_NAME + b"\0"
+    if patch:
+        files["cache.03.patch"] = extra["file"]
+        next_path = path_off + 0x20
+        for i, (addr, path) in enumerate(extra["images"]):
+            m[0x420 + 32 * i:0x440 + 32 * i] = struct.pack("<QQQII", addr, 0, 0, next_path, 0)
+            m[next_path:next_path + len(path) + 1] = path.encode() + b"\0"
+            next_path += (len(path) + 8) & ~7
     files["cache"] = bytes(m)
 
     # ---- values the tests expect after mapping
@@ -240,8 +467,12 @@ def build(base, variant):
             expect.append((data_addr + off, (value_add + (raw & (2 ** 34 - 1))) | (((raw >> 34) & 0xFF) << 56)))
     manifest = ["base 0x%x" % base,
                 "image 0x%x %s" % (image_addr, INSTALL_NAME.decode()),
-                "stats files=3 mappings=3 pages=%d plain=%d auth=%d" % (len([x for x in starts if x != 0xFFFF]), plain_n, auth_n),
-                "region 0x%x 0x%x" % (base, REGION_SIZE)]
+                "stats files=%d mappings=%d pages=%d plain=%d auth=%d" % (
+                    4 if patch else 3, 6 if patch else 3, len([x for x in starts if x != 0xFFFF]) + (extra["pages"] if patch else 0),
+                    plain_n + (extra["plain"] if patch else 0), auth_n + (extra["auth"] if patch else 0)),
+                "region 0x%x 0x%x" % (base, region_size)]
+    if patch:
+        manifest += extra["lines"]
     manifest += auth_lines
     manifest += ["expect 0x%x 0x%x" % (a, val) for a, val in expect]
     manifest += ["untouched 0x%x 0x%x" % (a, val) for a, val in sorted(slots.items())]
