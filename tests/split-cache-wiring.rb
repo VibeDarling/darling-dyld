@@ -129,4 +129,145 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
       return 0;
     }
   CPP
+
+  # --- the process-wide state of a mapped cache: one helper, shared by the legacy and the split path ---
+  dyld2 = File.read("#{root}/src/dyld2.cpp")
+  images_h = File.read("#{root}/include/mach-o/dyld_images.h")
+  squash = ->(text) { text.gsub(%r{//[^\n]*}, '').gsub(/\s+/, ' ').strip }
+  state_fn = dyld2[/^static void installSharedCacheGlobalState\(.*?^\}/m] or abort 'installSharedCacheGlobalState missing'
+  const_fn = dyld2[/^static void matchSharedCacheDataConstState\(.*?^\}/m] or abort 'matchSharedCacheDataConstState missing'
+  legacy_fn = dyld2[/^static void mapSharedCache\(.*?^\}/m] or abort 'mapSharedCache missing'
+
+  # The statements mapSharedCache ran inline before the helper existed, verbatim: the legacy path must keep them.
+  legacy_state = <<~'GOLDEN'
+    static void installSharedCacheGlobalState(bool forcePrivate) {
+    if ( sSharedCacheLoadInfo.loadAddress != nullptr ) {
+    gLinkContext.dyldCache = sSharedCacheLoadInfo.loadAddress;
+    dyld::gProcessInfo->processDetachedFromSharedRegion = forcePrivate;
+    dyld::gProcessInfo->sharedCacheSlide = sSharedCacheLoadInfo.slide;
+    dyld::gProcessInfo->sharedCacheBaseAddress = (unsigned long)sSharedCacheLoadInfo.loadAddress;
+    sSharedCacheLoadInfo.loadAddress->getUUID(dyld::gProcessInfo->sharedCacheUUID);
+    dyld3::kdebug_trace_dyld_image(DBG_DYLD_UUID_SHARED_CACHE_A, sSharedCacheLoadInfo.path, (const uuid_t *)&dyld::gProcessInfo->sharedCacheUUID[0], {0,0}, {{ 0, 0 }}, (const mach_header *)sSharedCacheLoadInfo.loadAddress);
+    } }
+  GOLDEN
+  legacy_const = <<~'GOLDEN'
+    static void matchSharedCacheDataConstState(bool sharedCacheDataConstIsEnabled) {
+    if ( (sSharedCacheLoadInfo.loadAddress != nullptr) && (gEnableSharedCacheDataConst != sharedCacheDataConstIsEnabled) ) {
+    uint32_t permissions = gEnableSharedCacheDataConst ? VM_PROT_READ : (VM_PROT_READ | VM_PROT_WRITE);
+    sSharedCacheLoadInfo.loadAddress->changeDataConstPermissions(mach_task_self(), permissions, (gLinkContext.verboseMapping ? &dyld::log : nullptr));
+    } }
+  GOLDEN
+  legacy_map = <<~'GOLDEN'
+    static void mapSharedCache(uintptr_t mainExecutableSlide) {
+    dyld3::SharedCacheOptions opts;
+    opts.cacheDirOverride = sSharedCacheOverrideDir;
+    opts.forcePrivate = (gLinkContext.sharedRegionMode == ImageLoader::kUsePrivateSharedRegion);
+    #if __x86_64__ && !TARGET_OS_SIMULATOR
+    opts.useHaswell = sHaswell;
+    #else
+    opts.useHaswell = false;
+    #endif
+    opts.verbose = gLinkContext.verboseMapping;
+    opts.disableASLR = (mainExecutableSlide == 0) && dyld3::internalInstall();
+    loadDyldCache(opts, &sSharedCacheLoadInfo);
+    installSharedCacheGlobalState(opts.forcePrivate);
+    }
+  GOLDEN
+  abort 'the legacy global-state statements changed' unless squash.(state_fn) == legacy_state.gsub(/\s+/, ' ').strip
+  abort 'the legacy DATA_CONST statements changed' unless squash.(const_fn) == legacy_const.gsub(/\s+/, ' ').strip
+  abort 'mapSharedCache changed' unless squash.(legacy_fn) == legacy_map.gsub(/\s+/, ' ').strip
+
+  # Every field of dyld_all_image_infos that describes the cache is set by the helper: a new one in the header
+  # or a new assignment in the helper breaks this until both agree.
+  all_infos = images_h[/^struct dyld_all_image_infos \{.*?^\};/m] or abort 'dyld_all_image_infos missing'
+  header_fields = all_infos.scan(/^\s*[\w\s\*]*?\b(\w*(?:sharedCache|SharedRegion)\w*)(?:\[\d+\])?;/).flatten.sort
+  assigned = state_fn.scan(/dyld::gProcessInfo->(\w+)/).flatten.uniq.sort
+  assigned_link = state_fn.scan(/gLinkContext\.(\w+)\s*=/).flatten.sort
+  abort "cache fields of dyld_all_image_infos: #{header_fields} versus assigned #{assigned}" unless header_fields == assigned
+  abort 'gLinkContext fields assigned changed' unless assigned_link == ['dyldCache']
+  abort 'header has no cache fields?' if header_fields.size != 4
+
+  # Neither mapper assigns that state itself: the legacy function only calls the helper.
+  abort 'mapSharedCache sets cache state itself' if legacy_fn =~ /gLinkContext\.dyldCache|gProcessInfo->shared|processDetached/
+
+  run_cpp(dir, 'state', <<~CPP, root)
+    #{COMMON}
+    #include <string.h>
+    #define VM_PROT_READ 1
+    #define VM_PROT_WRITE 2
+    #define DBG_DYLD_UUID_SHARED_CACHE_A 77
+    typedef unsigned char uuid_t[16];
+    struct mach_header {};
+    struct DyldSharedCache {
+      uint8_t uuid[16];
+      int dataConstCalls = 0; uint32_t lastPermissions = 0; bool loggerPassed = false;
+      void getUUID(uint8_t* out) const { memcpy(out, uuid, 16); }
+      void changeDataConstPermissions(int, uint32_t permissions, void (*log)(const char*, ...)) const {
+        const_cast<DyldSharedCache*>(this)->dataConstCalls++; const_cast<DyldSharedCache*>(this)->lastPermissions = permissions;
+        const_cast<DyldSharedCache*>(this)->loggerPassed = (log != nullptr);
+      }
+    };
+    namespace dyld3 {
+      struct SharedCacheLoadInfo { const DyldSharedCache* loadAddress; long slide; const char* errorMessage; char path[256]; };
+      struct Trace { int calls = 0; int code = 0; const void* mh = nullptr; const void* uuid = nullptr; const char* path = nullptr; } trace;
+      struct Pair { int a, b; }; struct Pairs { Pair x; };
+      void kdebug_trace_dyld_image(int code, const char* path, const uuid_t* uuid, Pair, Pairs, const mach_header* mh) {
+        ++trace.calls; trace.code = code; trace.mh = mh; trace.uuid = uuid; trace.path = path;
+      }
+    }
+    namespace dyld {
+      struct ProcessInfo { #{(all_infos.scan(/^\s*[\w\s\*]*?\b(\w*(?:sharedCache|SharedRegion)\w*)(\[\d+\])?;/).map { |n, a| n == 'processDetachedFromSharedRegion' ? "bool #{n};" : n == 'sharedCacheUUID' ? "uint8_t #{n}#{a};" : "uintptr_t #{n};" }).join(' ')} } storage, *gProcessInfo = &storage;
+      static void log(const char*, ...) {}
+    }
+    struct { const DyldSharedCache* dyldCache = nullptr; bool verboseMapping = false; } gLinkContext;
+    static bool gEnableSharedCacheDataConst = false;
+    static dyld3::SharedCacheLoadInfo sSharedCacheLoadInfo;
+    static int mach_task_self() { return 5; }
+    #{squash.(state_fn)}
+    #{const_fn}
+
+    static void poison() {
+      memset(&dyld::storage, 0x5a, sizeof dyld::storage); gLinkContext.dyldCache = (const DyldSharedCache*)0x77;
+      dyld3::trace = dyld3::Trace();
+    }
+
+    int main() {
+      static DyldSharedCache cache;
+      for (int i = 0; i < 16; ++i) cache.uuid[i] = (uint8_t)(0xa0 + i);
+      // no cache mapped: nothing is touched
+      poison(); sSharedCacheLoadInfo = {}; installSharedCacheGlobalState(true);
+      CHECK(gLinkContext.dyldCache == (const DyldSharedCache*)0x77 && dyld::storage.sharedCacheSlide == 0x5a5a5a5a5a5a5a5aULL && dyld3::trace.calls == 0);
+
+      for (bool priv : { true, false }) {
+        poison();
+        sSharedCacheLoadInfo.loadAddress = &cache; sSharedCacheLoadInfo.slide = 0x1234;
+        strcpy(sSharedCacheLoadInfo.path, "/cache/dyld_shared_cache_arm64e");
+        installSharedCacheGlobalState(priv);
+        CHECK(gLinkContext.dyldCache == &cache);
+        CHECK(dyld::storage.sharedCacheBaseAddress == (uintptr_t)&cache);
+        CHECK(dyld::storage.sharedCacheSlide == 0x1234);
+        CHECK(memcmp(dyld::storage.sharedCacheUUID, cache.uuid, 16) == 0);
+        CHECK(dyld::storage.processDetachedFromSharedRegion == priv);
+        CHECK(dyld3::trace.calls == 1 && dyld3::trace.code == DBG_DYLD_UUID_SHARED_CACHE_A);
+        CHECK(dyld3::trace.mh == (const void*)&cache && dyld3::trace.uuid == (const void*)dyld::storage.sharedCacheUUID);
+        CHECK(!strcmp(dyld3::trace.path, "/cache/dyld_shared_cache_arm64e"));
+      }
+
+      // __DATA_CONST: only a process whose state differs from the cache's gets its permissions changed
+      cache.dataConstCalls = 0;
+      gEnableSharedCacheDataConst = true;  matchSharedCacheDataConstState(true);
+      gEnableSharedCacheDataConst = false; matchSharedCacheDataConstState(false);
+      CHECK(cache.dataConstCalls == 0);
+      gEnableSharedCacheDataConst = false; matchSharedCacheDataConstState(true);
+      CHECK(cache.dataConstCalls == 1 && cache.lastPermissions == (VM_PROT_READ | VM_PROT_WRITE) && !cache.loggerPassed);
+      gEnableSharedCacheDataConst = true; gLinkContext.verboseMapping = true; matchSharedCacheDataConstState(false);
+      CHECK(cache.dataConstCalls == 2 && cache.lastPermissions == VM_PROT_READ && cache.loggerPassed);
+      sSharedCacheLoadInfo = {}; matchSharedCacheDataConstState(false);
+      CHECK(cache.dataConstCalls == 2);
+
+      if (failures) { printf("%d failure(s)\\n", failures); return 1; }
+      puts("PASS global state of a mapped cache and the __DATA_CONST override");
+      return 0;
+    }
+  CPP
 end

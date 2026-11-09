@@ -4265,6 +4265,29 @@ ImageLoader* load(const char* path, const LoadContext& context, unsigned& cacheI
 
 
 
+// update global state
+static void installSharedCacheGlobalState(bool forcePrivate)
+{
+	if ( sSharedCacheLoadInfo.loadAddress != nullptr ) {
+		gLinkContext.dyldCache 								= sSharedCacheLoadInfo.loadAddress;
+		dyld::gProcessInfo->processDetachedFromSharedRegion = forcePrivate;
+		dyld::gProcessInfo->sharedCacheSlide                = sSharedCacheLoadInfo.slide;
+		dyld::gProcessInfo->sharedCacheBaseAddress          = (unsigned long)sSharedCacheLoadInfo.loadAddress;
+		sSharedCacheLoadInfo.loadAddress->getUUID(dyld::gProcessInfo->sharedCacheUUID);
+		dyld3::kdebug_trace_dyld_image(DBG_DYLD_UUID_SHARED_CACHE_A, sSharedCacheLoadInfo.path, (const uuid_t *)&dyld::gProcessInfo->sharedCacheUUID[0], {0,0}, {{ 0, 0 }}, (const mach_header *)sSharedCacheLoadInfo.loadAddress);
+	}
+}
+
+// If this process wants a different __DATA_CONST state from the shared region, then override that now
+static void matchSharedCacheDataConstState(bool sharedCacheDataConstIsEnabled)
+{
+	if ( (sSharedCacheLoadInfo.loadAddress != nullptr) && (gEnableSharedCacheDataConst != sharedCacheDataConstIsEnabled) ) {
+		uint32_t permissions = gEnableSharedCacheDataConst ? VM_PROT_READ : (VM_PROT_READ | VM_PROT_WRITE);
+		sSharedCacheLoadInfo.loadAddress->changeDataConstPermissions(mach_task_self(), permissions,
+																	 (gLinkContext.verboseMapping ? &dyld::log : nullptr));
+	}
+}
+
 static void mapSharedCache(uintptr_t mainExecutableSlide)
 {
 	dyld3::SharedCacheOptions opts;
@@ -4280,16 +4303,7 @@ static void mapSharedCache(uintptr_t mainExecutableSlide)
     // <rdar://problem/56299169> kern.bootargs is now blocked
 	opts.disableASLR		= (mainExecutableSlide == 0) && dyld3::internalInstall(); // infer ASLR is off if main executable is not slid
 	loadDyldCache(opts, &sSharedCacheLoadInfo);
-
-	// update global state
-	if ( sSharedCacheLoadInfo.loadAddress != nullptr ) {
-		gLinkContext.dyldCache 								= sSharedCacheLoadInfo.loadAddress;
-		dyld::gProcessInfo->processDetachedFromSharedRegion = opts.forcePrivate;
-		dyld::gProcessInfo->sharedCacheSlide                = sSharedCacheLoadInfo.slide;
-		dyld::gProcessInfo->sharedCacheBaseAddress          = (unsigned long)sSharedCacheLoadInfo.loadAddress;
-		sSharedCacheLoadInfo.loadAddress->getUUID(dyld::gProcessInfo->sharedCacheUUID);
-		dyld3::kdebug_trace_dyld_image(DBG_DYLD_UUID_SHARED_CACHE_A, sSharedCacheLoadInfo.path, (const uuid_t *)&dyld::gProcessInfo->sharedCacheUUID[0], {0,0}, {{ 0, 0 }}, (const mach_header *)sSharedCacheLoadInfo.loadAddress);
-	}
+	installSharedCacheGlobalState(opts.forcePrivate);
 
 //#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
 // RAM disk booting does not have shared cache yet
@@ -6889,13 +6903,7 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 #else
 		mapSharedCache(mainExecutableSlide);
 #endif
-
-		// If this process wants a different __DATA_CONST state from the shared region, then override that now
-		if ( (sSharedCacheLoadInfo.loadAddress != nullptr) && (gEnableSharedCacheDataConst != sharedCacheDataConstIsEnabled) ) {
-			uint32_t permissions = gEnableSharedCacheDataConst ? VM_PROT_READ : (VM_PROT_READ | VM_PROT_WRITE);
-			sSharedCacheLoadInfo.loadAddress->changeDataConstPermissions(mach_task_self(), permissions,
-																		 (gLinkContext.verboseMapping ? &dyld::log : nullptr));
-		}
+		matchSharedCacheDataConstState(sharedCacheDataConstIsEnabled);
 	}
 #endif // !DARLING
 
