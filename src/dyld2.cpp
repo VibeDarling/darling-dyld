@@ -248,6 +248,7 @@ struct EnvironmentVariables {
 	bool						DYLD_DISABLE_DOFS;
 	bool						hasOverride;
                             //  DYLD_SHARED_CACHE_DIR           ==> sSharedCacheOverrideDir
+                            //  DYLD_SHARED_CACHE_SPLIT_DIR     ==> sSharedCacheSplitDir (Darling only)
 							//	DYLD_ROOT_PATH					==> gLinkContext.rootPaths
 							//	DYLD_IMAGE_SUFFIX				==> gLinkContext.imageSuffix
 							//	DYLD_PRINT_OPTS					==> gLinkContext.verboseOpts
@@ -315,6 +316,9 @@ static UndefinedHandler				sUndefinedHandler = NULL;
 static ImageLoader*					sBundleBeingLoaded = NULL;	// hack until OFI is reworked
 static dyld3::SharedCacheLoadInfo	sSharedCacheLoadInfo;
 static const char*					sSharedCacheOverrideDir;
+#ifdef DARLING
+static const char*					sSharedCacheSplitDir;	// DYLD_SHARED_CACHE_SPLIT_DIR, null when not set
+#endif
        bool							gSharedCacheOverridden = false;
 ImageLoader::LinkContext			gLinkContext;
 bool								gLogAPIs = false;
@@ -2270,6 +2274,12 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	else if ( (strcmp(key, "DYLD_SHARED_CACHE_DIR") == 0) && gLinkContext.allowEnvVarsSharedCache  ) {
 		sSharedCacheOverrideDir = value;
 	}
+#ifdef DARLING
+	// A restricted process must not choose which cache it maps, so this needs the path permission as well.
+	else if ( (strcmp(key, "DYLD_SHARED_CACHE_SPLIT_DIR") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
+		sSharedCacheSplitDir = value;
+	}
+#endif
 	else if ( strcmp(key, "DYLD_USE_CLOSURES") == 0 ) {
 		// Handled elsewhere
 	}
@@ -4316,6 +4326,20 @@ static void mapSharedCache(uintptr_t mainExecutableSlide)
 //	}
 //#endif
 }
+
+#ifdef DARLING
+// The user asked for this cache with DYLD_SHARED_CACHE_SPLIT_DIR, so a failure to map it must not leave the process running without it.
+static void mapSplitSharedCache(const macho_header* mainExecutableMH)
+{
+	char path[sizeof(sSharedCacheLoadInfo.path)];
+	if ( const char* error = dyld3::splitCacheMainFilePath(sSharedCacheSplitDir, mainExecutableMH->cputype, mainExecutableMH->cpusubtype, path, sizeof(path)) )
+		halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_DIR='%s': %s\n", sSharedCacheSplitDir, error));
+	dyld3::SplitCacheMapStats stats;
+	if ( !dyld3::mapSplitCachePrivate(path, gLinkContext.verboseMapping, &sSharedCacheLoadInfo, &stats) )
+		halt(mkstringf("could not map the split dyld cache '%s': %s\n", path, sSharedCacheLoadInfo.errorMessage ? sSharedCacheLoadInfo.errorMessage : "no reason given"));
+	installSharedCacheGlobalState(true);
+}
+#endif
 
 
 
@@ -6904,6 +6928,14 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 		mapSharedCache(mainExecutableSlide);
 #endif
 		matchSharedCacheDataConstState(sharedCacheDataConstIsEnabled);
+	}
+#else
+	// Off unless DYLD_SHARED_CACHE_SPLIT_DIR names a split macOS cache. Prebuilt closures do not exist for a split cache.
+	if ( sSharedCacheSplitDir != nullptr ) {
+		mapSplitSharedCache(mainExecutableMH);
+		sClosureMode = ClosureMode::Off;
+		// mapSplitCachePrivate maps __DATA_CONST read-only whatever this process wants, so that is the state to match
+		matchSharedCacheDataConstState(true);
 	}
 #endif // !DARLING
 

@@ -39,6 +39,17 @@ COMMON = <<~CPP
   #define CHECK(cond) do { if (!(cond)) { printf("FAIL line %d: %s\\n", __LINE__, #cond); ++failures; } } while (0)
 CPP
 
+CPU_DEFS = <<~CPP
+  #define CPU_TYPE_ARM64 0x0100000C
+  #define CPU_TYPE_ARM64_32 0x0200000C
+  #define CPU_TYPE_X86_64 0x01000007
+  #define CPU_TYPE_ARM 12
+  #define CPU_SUBTYPE_MASK 0xff000000
+  #define CPU_SUBTYPE_ARM64_ALL 0
+  #define CPU_SUBTYPE_ARM64_V8 1
+  #define CPU_SUBTYPE_ARM64E 2
+CPP
+
 names_src = (runtime[/^\/\/ The longest directory accepted.*?^const char\* splitCacheMainFilePath\(.*?^\}/m] or abort 'name helpers missing')
 decls = %w[splitCacheArchName splitCacheDirError splitCacheMainFilePath].map { |n| runtime_h[/^const char\* #{n}\(.*?;/m] }.join("\n")
 abort 'name helper declarations missing' if decls.scan(/splitCache/).size != 3
@@ -47,14 +58,7 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
   run_cpp(dir, 'names', <<~CPP, root)
     #{COMMON}
     #include "dyld_cache_format.h"
-    #define CPU_TYPE_ARM64 0x0100000C
-    #define CPU_TYPE_ARM64_32 0x0200000C
-    #define CPU_TYPE_X86_64 0x01000007
-    #define CPU_TYPE_ARM 12
-    #define CPU_SUBTYPE_MASK 0xff000000
-    #define CPU_SUBTYPE_ARM64_ALL 0
-    #define CPU_SUBTYPE_ARM64_V8 1
-    #define CPU_SUBTYPE_ARM64E 2
+    #{CPU_DEFS}
     #{decls}
     #{names_src}
 
@@ -191,6 +195,24 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
   abort 'gLinkContext fields assigned changed' unless assigned_link == ['dyldCache']
   abort 'header has no cache fields?' if header_fields.size != 4
 
+  # The legacy (non-DARLING) cache block in _main: the original statements with the DATA_CONST block as a call.
+  legacy_main = dyld2[/^#ifndef DARLING\n\t\/\/ While the shared cache code.*?^#else\n(?=\t\/\/ Off unless)/m] or abort 'legacy cache block in _main missing'
+  legacy_main_golden = <<~'GOLDEN'
+    #ifndef DARLING
+    checkSharedRegionDisable((dyld3::MachOLoaded*)mainExecutableMH, mainExecutableSlide);
+    if ( gLinkContext.sharedRegionMode != ImageLoader::kDontUseSharedRegion ) {
+    #if TARGET_OS_SIMULATOR
+    if ( sSharedCacheOverrideDir)
+    mapSharedCache(mainExecutableSlide);
+    #else
+    mapSharedCache(mainExecutableSlide);
+    #endif
+    matchSharedCacheDataConstState(sharedCacheDataConstIsEnabled);
+    }
+    #else
+  GOLDEN
+  abort 'the legacy cache block in _main changed' unless squash.(legacy_main) == legacy_main_golden.gsub(/\s+/, ' ').strip
+
   # Neither mapper assigns that state itself: the legacy function only calls the helper.
   abort 'mapSharedCache sets cache state itself' if legacy_fn =~ /gLinkContext\.dyldCache|gProcessInfo->shared|processDetached/
 
@@ -323,6 +345,181 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
       CHECK(arrayCalls == 0);
       if (failures) { printf("%d failure(s)\\n", failures); return 1; }
       puts("PASS objc tables of a split cache are absent, not read through a missing image array");
+      return 0;
+    }
+  CPP
+
+  # --- DYLD_SHARED_CACHE_SPLIT_DIR: parsed like DYLD_SHARED_CACHE_DIR, ignored by restricted processes ---
+  env_branch = dyld2[/^\telse if \( \(strcmp\(key, "DYLD_SHARED_CACHE_SPLIT_DIR"\) == 0\).*?^\t\}/m] or abort 'environment branch missing'
+  abort 'the DYLD_SHARED_CACHE_SPLIT_DIR branch is not inside #ifdef DARLING' unless dyld2.include?("#ifdef DARLING\n\t// A restricted process must not choose which cache it maps, so this needs the path permission as well.\n\telse if")
+  abort 'processDyldEnvironmentVariable does not hold the branch' unless dyld2[/^void processDyldEnvironmentVariable\(.*?^\}/m].to_s.include?(env_branch)
+  # LC_DYLD_ENVIRONMENT load commands only feed *_PATH variables, so a binary cannot name a cache directory
+  lc_filter = dyld2[/^static void checkLoadCommandEnvironmentVariables\(\).*?^\}/m].to_s
+  abort 'the load command filter changed' unless lc_filter.include?('strncmp(&equals[-5], "_PATH", 5) == 0') && !'DYLD_SHARED_CACHE_SPLIT_DIR'.end_with?('_PATH')
+
+  run_cpp(dir, 'env', <<~CPP, root)
+    #{COMMON}
+    static struct { bool allowEnvVarsSharedCache, allowEnvVarsPath; } gLinkContext;
+    static const char* sSharedCacheSplitDir;
+    static void process(const char* key, const char* value) {
+      if ( false ) {}
+      #{env_branch}
+    }
+    int main() {
+      const char* kDir = "/some/dir";
+      struct Case { bool shared, path; const char* key; bool stored; } cases[] = {
+        { true,  true,  "DYLD_SHARED_CACHE_SPLIT_DIR", true  },
+        { true,  false, "DYLD_SHARED_CACHE_SPLIT_DIR", false },   // restricted: no path variables
+        { false, true,  "DYLD_SHARED_CACHE_SPLIT_DIR", false },   // custom caches not allowed
+        { false, false, "DYLD_SHARED_CACHE_SPLIT_DIR", false },
+        { true,  true,  "DYLD_SHARED_CACHE_DIR",       false },   // another variable
+        { true,  true,  "DYLD_SHARED_CACHE_SPLIT_DIR_X", false },
+        { true,  true,  "dyld_shared_cache_split_dir", false },
+      };
+      for (const Case& c : cases) {
+        sSharedCacheSplitDir = nullptr;
+        gLinkContext.allowEnvVarsSharedCache = c.shared; gLinkContext.allowEnvVarsPath = c.path;
+        process(c.key, kDir);
+        CHECK((sSharedCacheSplitDir == kDir) == c.stored);
+        CHECK(c.stored || sSharedCacheSplitDir == nullptr);
+      }
+      // a set but empty value is kept as set: the mapping step rejects it loudly rather than ignoring the request
+      sSharedCacheSplitDir = nullptr; gLinkContext.allowEnvVarsSharedCache = true; gLinkContext.allowEnvVarsPath = true;
+      process("DYLD_SHARED_CACHE_SPLIT_DIR", "");
+      CHECK(sSharedCacheSplitDir != nullptr && sSharedCacheSplitDir[0] == '\\0');
+      if (failures) { printf("%d failure(s)\\n", failures); return 1; }
+      puts("PASS DYLD_SHARED_CACHE_SPLIT_DIR parsing and restricted processes");
+      return 0;
+    }
+  CPP
+
+  # --- the only entry into the new code is guarded by the variable and by DARLING ---
+  # Every use of the split wiring must sit in a DARLING-only region of the preprocessor.
+  wiring = /sSharedCacheSplitDir|mapSplitSharedCache|mapSplitCachePrivate|splitCacheMainFilePath/
+  stack = []
+  stray = []
+  dyld2.each_line.with_index(1) do |line, number|
+    case line
+    when /^\s*#\s*ifdef\s+DARLING\b/ then stack.push(:darling)
+    when /^\s*#\s*ifndef\s+DARLING\b/ then stack.push(:not_darling)
+    when /^\s*#\s*if/ then stack.push(:other)
+    when /^\s*#\s*elif\b/ then stack[-1] = :other
+    when /^\s*#\s*else\b/ then stack[-1] = { darling: :not_darling, not_darling: :darling }.fetch(stack[-1], stack[-1])
+    when /^\s*#\s*endif\b/ then stack.pop
+    else stray << number if line =~ wiring && line !~ %r{^\s*//} && !stack.include?(:darling)
+    end
+  end
+  abort "split wiring outside a DARLING-only region at dyld2.cpp lines #{stray}" unless stray.empty?
+  abort 'mapSplitSharedCache has an unexpected number of uses' unless dyld2.scan(/\bmapSplitSharedCache\(/).size == 2
+  entry = dyld2[/^#else\n(\t\/\/ Off unless DYLD_SHARED_CACHE_SPLIT_DIR.*?)^#endif \/\/ !DARLING/m, 1] or abort 'DARLING branch of the cache block missing'
+  abort 'the call is not guarded by the variable' unless entry =~ /\A[^\n]*\n\s*if \( sSharedCacheSplitDir != nullptr \) \{\n\s*mapSplitSharedCache\(mainExecutableMH\);/
+  abort 'more than the guarded block' unless entry.scan(/^\t\S/).size == 3  # comment line, the if, its closing brace
+
+  run_cpp(dir, 'entry', <<~CPP, root)
+    #{COMMON}
+    #include <vector>
+    struct macho_header { uint32_t magic; int cputype, cpusubtype; };
+    enum class ClosureMode { Unset, Off, On, PreBuiltOnly };
+    static ClosureMode sClosureMode = ClosureMode::PreBuiltOnly;
+    static const char* sSharedCacheSplitDir;
+    static std::vector<std::string> calls;
+    static void mapSplitSharedCache(const macho_header*) { calls.push_back("map"); }
+    static void matchSharedCacheDataConstState(bool enabled) { calls.push_back(enabled ? "match1" : "match0"); }
+    static void entry(const macho_header* mainExecutableMH, bool sharedCacheDataConstIsEnabled) {
+      #{entry}
+    }
+    int main() {
+      macho_header mh = { 0, 0, 0 };
+      // variable not set: nothing runs and nothing changes
+      sSharedCacheSplitDir = nullptr; entry(&mh, true);
+      CHECK(calls.empty() && sClosureMode == ClosureMode::PreBuiltOnly);
+      // set (even to an empty string): the cache is mapped first, then the closures are turned off, then DATA_CONST is
+      // matched against what the mapper produced (read-only), whatever the process's own snapshot says
+      for (const char* value : { "/d", "" }) {
+        for (bool snapshot : { true, false }) {
+          calls.clear(); sClosureMode = ClosureMode::PreBuiltOnly; sSharedCacheSplitDir = value;
+          entry(&mh, snapshot);
+          CHECK(calls.size() == 2 && calls[0] == "map" && calls[1] == "match1" && sClosureMode == ClosureMode::Off);
+        }
+      }
+      if (failures) { printf("%d failure(s)\\n", failures); return 1; }
+      puts("PASS the split cache block is entered only when the variable is set");
+      return 0;
+    }
+  CPP
+
+  # --- a failure to map the cache the user asked for is fatal and says why ---
+  map_fn = dyld2[/^static void mapSplitSharedCache\(.*?^\}/m] or abort 'mapSplitSharedCache missing'
+  run_cpp(dir, 'map', <<~CPP, root)
+    #{COMMON}
+    #include <vector>
+    #include <stdarg.h>
+    #{CPU_DEFS}
+    struct macho_header { uint32_t magic; int cputype, cpusubtype; };
+    #include "dyld_cache_format.h"
+    namespace dyld3 {
+      struct SharedCacheLoadInfo { const void* loadAddress; long slide; const char* errorMessage; char path[256]; };
+      struct SplitCacheMapStats {};
+      #{decls}
+      #{names_src}
+      static struct { bool ok = true; const char* error = "the cache is gone"; int calls = 0; std::string path; bool verbose = false; } mapper;
+      bool mapSplitCachePrivate(const char* path, bool verbose, SharedCacheLoadInfo* results, SplitCacheMapStats*) {
+        ++mapper.calls; mapper.path = path; mapper.verbose = verbose;
+        results->errorMessage = mapper.ok ? nullptr : mapper.error;
+        return mapper.ok;
+      }
+    }
+    static dyld3::SharedCacheLoadInfo sSharedCacheLoadInfo;
+    static struct { bool verboseMapping = false; } gLinkContext;
+    static const char* sSharedCacheSplitDir;
+    static int installCalls = 0; static bool installArg = false;
+    static void installSharedCacheGlobalState(bool forcePrivate) { ++installCalls; installArg = forcePrivate; }
+    static const char* mkstringf(const char* format, ...) {
+      static char buffers[4][1024]; static int next = 0; char* b = buffers[next++ % 4];
+      va_list ap; va_start(ap, format); vsnprintf(b, 1024, format, ap); va_end(ap); return b;
+    }
+    // halt() never returns: the test throws instead
+    [[noreturn]] static void halt(const char* message) { throw std::string(message); }
+    namespace dyld { using ::mkstringf; }
+    #{map_fn}
+
+    // runs the function; returns the halt message, or "" when it returned
+    static std::string attempt(const char* dir, int cputype, int cpusubtype) {
+      sSharedCacheSplitDir = dir; dyld3::mapper.calls = 0; installCalls = 0; dyld3::mapper.path.clear();
+      macho_header mh = { 0, cputype, cpusubtype };
+      try { mapSplitSharedCache(&mh); } catch (const std::string& m) { return m; }
+      return "";
+    }
+    int main() {
+      std::string m;
+      // success: maps <dir>/dyld_shared_cache_arm64e privately, then installs the global state
+      m = attempt("/cache", CPU_TYPE_ARM64, 0x80000002);
+      CHECK(m.empty() && dyld3::mapper.calls == 1 && dyld3::mapper.path == "/cache/dyld_shared_cache_arm64e" && installCalls == 1 && installArg == true);
+      gLinkContext.verboseMapping = true; attempt("/cache", CPU_TYPE_ARM64, 2); CHECK(dyld3::mapper.verbose); gLinkContext.verboseMapping = false;
+      // the mapper fails: halt, with the variable's file and the mapper's reason; the state is not installed
+      dyld3::mapper.ok = false;
+      m = attempt("/cache", CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E);
+      CHECK(!m.empty() && m.find("/cache/dyld_shared_cache_arm64e") != std::string::npos && m.find("the cache is gone") != std::string::npos);
+      CHECK(installCalls == 0 && dyld3::mapper.calls == 1);
+      dyld3::mapper.error = nullptr;
+      m = attempt("/cache", CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E);
+      CHECK(m.find("no reason given") != std::string::npos && installCalls == 0);
+      dyld3::mapper.ok = true; dyld3::mapper.error = "unused";
+      // the variable is invalid: halt without touching the mapper
+      const char* bad[] = { "", "relative/dir", "/cache\\n" };
+      const char* why[] = { "empty", "absolute", "control" };
+      for (int i = 0; i < 3; ++i) {
+        m = attempt(bad[i], CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E);
+        CHECK(m.find("DYLD_SHARED_CACHE_SPLIT_DIR") != std::string::npos && m.find(why[i]) != std::string::npos);
+        CHECK(dyld3::mapper.calls == 0 && installCalls == 0);
+      }
+      // an architecture the split mapper does not support, or with no cache at all
+      m = attempt("/cache", CPU_TYPE_X86_64, 3);
+      CHECK(m.find("x86_64") != std::string::npos && dyld3::mapper.calls == 0 && installCalls == 0);
+      m = attempt("/cache", CPU_TYPE_ARM64_32, 1);
+      CHECK(m.find("architecture") != std::string::npos && dyld3::mapper.calls == 0 && installCalls == 0);
+      if (failures) { printf("%d failure(s)\\n", failures); return 1; }
+      puts("PASS mapping failures with DYLD_SHARED_CACHE_SPLIT_DIR set abort with the reason");
       return 0;
     }
   CPP

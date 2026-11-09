@@ -72,7 +72,8 @@ struct SplitCacheMapStats {
 };
 
 // Maps a split cache (the main file at mainCachePath plus the sub-cache files its header lists, found by
-// appending each suffix to that path) privately at its preferred address. Not called by dyld yet.
+// appending each suffix to that path) privately at its preferred address. dyld calls it only when
+// DYLD_SHARED_CACHE_SPLIT_DIR is set.
 bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLoadInfo* results, SplitCacheMapStats* stats,
                           SplitCacheAuthMode authMode = kSplitCacheAuthSign);
 

@@ -1469,7 +1469,7 @@ static const char* loadSplitFileMappings(int fd, uint64_t fileLength, const dyld
 // Deferred on purpose, not oversights:
 // - No translateDarlingCacheTSD pass: the TSD rewrite and its veneer reach for a split cache is a separate design.
 // - Protections: each mapping gets its raw initProt, whereas the legacy mapCachePrivate path adds VM_PROT_WRITE to a
-//   DATA_CONST mapping unless gEnableSharedCacheDataConst is set. Revisit when dyld starts binding into the cache.
+//   DATA_CONST mapping unless gEnableSharedCacheDataConst is set. dyld2.cpp makes up the difference after mapping.
 // - Authenticated pointers are signed with the running process's own keys; this never changes, resets or
 //   disables a key, it only executes the PAC instructions.
 // - authMode defaults to signing, the production behaviour; kSplitCacheAuthLeaveAlone (and authLeftAlone) exist for
