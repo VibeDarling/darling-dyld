@@ -7,20 +7,7 @@ require 'tmpdir'
 require 'open3'
 root = File.realpath(ARGV.fetch(0, File.expand_path('..', __dir__)))
 base = ARGV.fetch(1, '0x180000000')
-runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
-cache_src = File.read("#{root}/dyld3/shared-cache/DyldSharedCache.cpp")
-runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
-
-reservation = runtime[/static int mmapProtection\(.*?^\}/m].to_s + "\n" + (runtime[/class DarlingCacheReservation \{.*?^\};/m] or abort 'reservation missing')
-range_helper = runtime[/static bool cacheRangeContains\(.*?(?=^static bool preflightCacheFile)/m] or abort 'range helpers missing'
-split_code = runtime[/^static const uint32_t kSplitMaxFileMappings.*?^bool mapSplitCachePrivate\(.*?^\}/m] or abort 'split mapper missing'
-stats_struct = runtime_h[/struct SplitCacheMapStats \{.*?^\};/m] or abort 'stats struct missing'
-image_funcs = %w[imageTable isSplitCache forEachRegion forEachImage getIndexedImageEntry getIndexedImagePath
-                 findMachHeaderImageIndex hasImagePath mappedSize].map do |name|
-  cache_src[/^[^\n]*\bDyldSharedCache::#{name}\(.*?^\}/m] or abort "#{name} missing"
-end
-image_helper = cache_src[/^static const uint32_t kMaxSplitSubCaches.*?^static bool splitCacheTables\(.*?^\}/m] or abort 'split region walk missing'
-image_helper += "\n" + (cache_src[/^static const dyld_cache_image_info\* cacheImageTable\(.*?^\}/m] or abort 'image table helper missing')
+require_relative 'split-cache-harness'
 
 # variant => nil (maps) or the substring the error message must contain
 host_page = `getconf PAGESIZE`.to_i
@@ -59,62 +46,7 @@ VARIANTS = {
 
 Dir.mktmpdir('split-cache-mapping-') do |dir|
   File.write("#{dir}/test.cpp", <<~CPP)
-    #include <sys/mman.h>
-    #include <sys/stat.h>
-    #include <fcntl.h>
-    #include <unistd.h>
-    #include <stdint.h>
-    #include <stddef.h>
-    #include <stdio.h>
-    #include <stdlib.h>
-    #include <stdarg.h>
-    #include <string.h>
-    #include <assert.h>
-    #include <errno.h>
-    #include <string>
-    #include <vector>
-    #define DARLING 1
-    #define TARGET_OS_SIMULATOR 0
-    #define __offsetof offsetof
-    enum { VM_PROT_READ=1, VM_PROT_WRITE=2, VM_PROT_EXECUTE=4 };
-    #include "dyld_cache_format.h"
-    #if !__GLIBC_PREREQ(2, 38)
-    static size_t strlcpy(char *d, const char *s, size_t n) { size_t l=strlen(s); if (n) { size_t c=l<n-1?l:n-1; memcpy(d,s,c); d[c]=0; } return l; }
-    #endif
-    // The block runtime is not linked: these blocks are never copied or escaped.
-    extern "C" { void *_NSConcreteStackBlock[32]; void *_NSConcreteGlobalBlock[32];
-                 void _Block_object_assign(void*, const void*, const int) {}
-                 void _Block_object_dispose(const void*, const int) {} }
-    struct mach_header { uint32_t magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags; };
-    struct Diagnostics {};
-    namespace dyld3 {
-      struct MachOLoaded { static const uint8_t *trieWalk(Diagnostics&, const uint8_t*, const uint8_t*, const char*) { return nullptr; } };
-      struct MachOFile { static uint64_t read_uleb128(Diagnostics&, const uint8_t*&, const uint8_t*) { return 0; } };
-    }
-    struct DyldSharedCache {
-      dyld_cache_header header;
-      const dyld_cache_image_info *imageTable(uint32_t&) const;
-      bool isSplitCache() const;
-      void forEachRegion(void (^)(const void*, uint64_t, uint64_t, uint32_t, uint32_t, uint64_t)) const;
-      void forEachImage(void (^)(const mach_header*, const char*)) const;
-      const mach_header *getIndexedImageEntry(uint32_t, uint64_t&, uint64_t&) const;
-      const char *getIndexedImagePath(uint32_t) const;
-      bool findMachHeaderImageIndex(const mach_header*, uint32_t&) const;
-      bool hasImagePath(const char*, uint32_t&) const;
-      uint64_t mappedSize() const;
-    };
-    #{image_helper}
-    #{image_funcs.join("\n")}
-    namespace dyld { static void log(const char *format, ...) { va_list a; va_start(a, format); printf("LOG "); vprintf(format, a); va_end(a); } }
-    namespace dyld3 {
-      struct SharedCacheLoadInfo { const DyldSharedCache *loadAddress; long slide; const char *errorMessage; char path[256]; };
-      #{stats_struct}
-      static int open(const char *path, int flags, int mode) { return ::open(path, flags, mode); }
-      #{reservation}
-      #{range_helper}
-      #{split_code}
-    }
-    using namespace dyld3;
+    #{SplitCacheHarness.prefix(root)}
 
     static unsigned long long hex(const char *s) { return strtoull(s, nullptr, 16); }
     static std::string permissions(uint64_t address) {
@@ -251,9 +183,8 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
       return 0;
     }
   CPP
-  out, st = Open3.capture2e('clang++', '-std=c++17', '-fblocks', '-fsanitize=address,undefined', '-Wno-unused-value',
-                            "-I#{root}/dyld3/shared-cache", "#{dir}/test.cpp", '-o', "#{dir}/test")
-  abort out unless st.success?
+  failed_build = SplitCacheHarness.compile(root, dir, ['-fsanitize=address,undefined'])
+  abort failed_build if failed_build
   failures = 0
   VARIANTS.each do |variant, expected_error|
     next puts("skip #{variant} (needs a host page larger than 4 KiB)") if expected_error == :skip
