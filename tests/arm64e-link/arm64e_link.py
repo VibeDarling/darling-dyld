@@ -17,9 +17,11 @@ ld64 comes from --ld64 or the LD64 environment variable. Run with python3 -I.
 import argparse
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 MH_MAGIC_64 = 0xFEEDFACF
 CPU_TYPE_ARM64 = 0x0100000C
@@ -149,16 +151,20 @@ class MachO:
             self.err("unterminated string at 0x%x" % off)
         return raw[:nul].decode("utf-8", "replace")
 
+    def _fixed_name(self, off):
+        # char[16] fields carry no NUL when the name is exactly 16 characters long
+        return self.data[off:off + 16].split(b"\0", 1)[0].decode("utf-8", "replace")
+
     def _command(self, cmd, cmdsize, off):
         if cmd == LC_SEGMENT_64:
-            name = self._cstr(off + 8, off + 24)
+            name = self._fixed_name(off + 8)
             vmaddr, vmsize, fileoff, filesize, _mp, _ip, nsects, _fl = self.u("<QQQQIIII", off + 24)
             if 72 + nsects * 80 > cmdsize:
                 self.err("segment %s: %d sections overrun the command" % (name, nsects))
             sections = []
             for i in range(nsects):
                 so = off + 72 + i * 80
-                sect = self._cstr(so, so + 16)
+                sect = self._fixed_name(so)
                 saddr, ssize = self.u("<QQ", so + 32)
                 sections.append({"name": sect, "addr": saddr, "size": ssize})
             self.segments.append({"name": name, "vmaddr": vmaddr, "vmsize": vmsize,
@@ -300,9 +306,10 @@ class MachO:
                 ordinal, weak, noff = v & 0xFFFF, (v >> 16) & 1, v >> 32
             else:
                 self.err("imports_format %d unsupported" % fmt)
-            if fmt != 3 and ordinal >= 0xF0:
+            # dyld treats only values above 0xF0 (0xFFF0) as special ordinals
+            if fmt != 3 and ordinal > 0xF0:
                 ordinal -= 0x100
-            elif fmt == 3 and ordinal >= 0xFFF0:
+            elif fmt == 3 and ordinal > 0xFFF0:
                 ordinal -= 0x10000
             raw = blob[symbols_off + noff:]
             nul = raw.find(b"\0")
@@ -447,11 +454,14 @@ def run(cmd, verbose, timeout=300):
     return r
 
 
-def link_command(ld64, objects, out, kind, min_os, sdk, install_name, entry,
-                 no_implicit, libs, lib_dirs, extra):
-    for a in extra:
+def reject_forbidden(*arg_lists):
+    for a in (a for args in arg_lists for a in args):
         if any(bad in a for bad in FORBIDDEN_LD_ARGS):
             raise RecipeError("linker argument %r is not allowed in the arm64e recipe" % a)
+
+
+def link_command(ld64, objects, out, kind, min_os, sdk, install_name, entry,
+                 libs, lib_dirs, extra):
     cmd = [ld64, "-arch", "arm64e", "-fixup_chains", "-platform_version", "macos", min_os, sdk]
     if kind == "dylib":
         cmd.append("-dylib")
@@ -459,8 +469,6 @@ def link_command(ld64, objects, out, kind, min_os, sdk, install_name, entry,
         cmd += ["-install_name", install_name]
     if entry:
         cmd += ["-e", entry]
-    if no_implicit:
-        cmd.append("-no_implicit_dylibs")
     for d in lib_dirs:
         cmd.append("-L" + d)
     cmd += extra + objects + libs + ["-o", out]
@@ -468,7 +476,7 @@ def link_command(ld64, objects, out, kind, min_os, sdk, install_name, entry,
 
 
 def build(sources, out, kind="dylib", target=DEFAULT_TARGET, clang=None, cflags=(), ld64=None,
-          min_os="13.0", sdk="13.0", install_name=None, entry=None, no_implicit=False,
+          min_os="13.0", sdk="13.0", install_name=None, entry=None,
           libs=(), lib_dirs=(), ld_args=(), workdir=None, verbose=False):
     ld64 = ld64 or os.environ.get("LD64")
     if not ld64:
@@ -480,20 +488,34 @@ def build(sources, out, kind="dylib", target=DEFAULT_TARGET, clang=None, cflags=
     if not sources:
         raise RecipeError("no source files")
     clang = clang or os.environ.get("CLANG", "clang")
-    workdir = workdir or os.path.dirname(os.path.abspath(out))
-    objects = []
-    for i, src in enumerate(sources):
-        stem = "%d_%s" % (i, os.path.splitext(os.path.basename(src))[0])
-        raw, patched = os.path.join(workdir, stem + ".raw.o"), os.path.join(workdir, stem + ".o")
-        run([clang, "--target=" + target, "-c"] + list(cflags) + [src, "-o", raw], verbose)
-        patch_file(raw, patched)
-        objects.append(patched)
-    cmd = link_command(ld64, objects, out, kind, min_os, sdk, install_name, entry,
-                       no_implicit, list(libs), list(lib_dirs), list(ld_args))
-    run(cmd, verbose)
-    if not os.path.isfile(out) or os.path.getsize(out) == 0:
-        raise RecipeError("ld64 reported success but %s is missing or empty" % out)
-    return verify_output(out, kind)
+    reject_forbidden(ld_args, libs, lib_dirs)
+    own_workdir = workdir is None
+    if own_workdir:
+        workdir = tempfile.mkdtemp(prefix="arm64e-link-")
+    else:
+        os.makedirs(workdir, exist_ok=True)
+    partial = out + ".partial"
+    try:
+        objects = []
+        for i, src in enumerate(sources):
+            stem = "%d_%s" % (i, os.path.splitext(os.path.basename(src))[0])
+            raw, patched = os.path.join(workdir, stem + ".raw.o"), os.path.join(workdir, stem + ".o")
+            run([clang, "--target=" + target, "-c"] + list(cflags) + [src, "-o", raw], verbose)
+            patch_file(raw, patched)
+            objects.append(patched)
+        cmd = link_command(ld64, objects, partial, kind, min_os, sdk, install_name, entry,
+                           list(libs), list(lib_dirs), list(ld_args))
+        run(cmd, verbose)
+        if not os.path.isfile(partial) or os.path.getsize(partial) == 0:
+            raise RecipeError("ld64 reported success but %s is missing or empty" % partial)
+        result = verify_output(partial, kind)
+        os.replace(partial, out)
+        return result
+    finally:
+        if os.path.exists(partial):
+            os.remove(partial)
+        if own_workdir:
+            shutil.rmtree(workdir)
 
 
 def main(argv):
@@ -511,7 +533,6 @@ def main(argv):
     b.add_argument("--sdk", default="13.0")
     b.add_argument("--install-name")
     b.add_argument("--entry")
-    b.add_argument("--no-implicit-dylibs", action="store_true")
     b.add_argument("--lib", action="append", default=[], help="-lNAME or a path to a dylib/stub")
     b.add_argument("--lib-dir", action="append", default=[])
     b.add_argument("--ld-arg", action="append", default=[], dest="ld_args")
@@ -529,7 +550,7 @@ def main(argv):
     try:
         if a.cmd == "build":
             _m, dec = build(a.sources, a.out, a.kind, a.target, a.clang, a.cflags, a.ld64, a.min_os,
-                            a.sdk, a.install_name, a.entry, a.no_implicit_dylibs, a.lib, a.lib_dir,
+                            a.sdk, a.install_name, a.entry, a.lib, a.lib_dir,
                             a.ld_args, a.workdir, a.verbose)
             print("OK %s: %d fixups, %d imports" % (a.out, len(dec["fixups"]), len(dec["imports"])))
         elif a.cmd == "patch":

@@ -41,7 +41,7 @@ end
 
 def build_args(sources, out, kind, extra = [])
   cf = CFLAGS.map { |f| "--cflag=#{f}" }
-  ['build', '-v', '--out', out, '--kind', kind, '--no-implicit-dylibs', *cf, *extra, *sources]
+  ['build', '-v', '--out', out, '--kind', kind, *cf, *extra, *sources]
 end
 
 def dump(path)
@@ -64,6 +64,7 @@ def compare(dump, fix, row)
   bad = []
   want = lambda { |name, expected, actual| bad << "#{name} #{actual.inspect} != #{expected.inspect}" unless expected == actual }
   want.call('kind', row['kind'], fix['kind'])
+  want.call('section', row['section'], fix['section']) if row['section']
   want.call('auth bit', %w[auth_rebase auth_bind].include?(row['kind']), fix['auth'])
   want.call('raw bit63', fix['auth'], fix['raw'].to_i(16)[63] == 1)
   if fix['auth']
@@ -129,6 +130,23 @@ def check_chains(dump, label)
   end
 end
 
+def load_commands(data)
+  off = 32
+  Array.new(data.unpack1('@16V')) do
+    cmd, size = data[off, 8].unpack('VV')
+    [cmd, off, size].tap { off += size }
+  end
+end
+
+# Offset and format of the first import word; the ordinal is its low 8 bits (formats 1, 2) or 16 bits (format 3).
+def first_import_offset(data)
+  _cmd, off, _size = load_commands(data).find { |c, _o, _s| c == 0x80000034 }
+  blob = data[off + 8, 4].unpack1('V')
+  fmt = data[blob + 20, 4].unpack1('V')
+  raise "unexpected imports_format #{fmt}" unless [1, 2, 3].include?(fmt)
+  [blob + data[blob + 8, 4].unpack1('V'), fmt]
+end
+
 def compile_raw(dir, src, name, target = 'arm64e-apple-macos13')
   out = File.join(dir, name)
   o, st = Open3.capture2e(CLANG, "--target=#{target}", '-c', *CFLAGS, src, '-o', out)
@@ -150,7 +168,8 @@ Dir.mktmpdir('arm64e-link-') do |dir|
   exe_out = File.join(dir, 'toy_main')
 
   # --- build with the recipe
-  out, err, st = tool(*build_args([lib_src], lib_out, 'dylib', ['--install-name', expected['lib']['install_name']]),
+  out, err, st = tool(*build_args([lib_src], lib_out, 'dylib',
+                                  ['--install-name', expected['lib']['install_name'], '--workdir', File.join(dir, 'work')]),
                       env: { 'LD64' => LD64 })
   check('toy dylib builds and verifies', st.success?, err)
   link_line = err.lines.find { |l| l.start_with?("+ #{LD64} ") }.to_s
@@ -159,10 +178,10 @@ Dir.mktmpdir('arm64e-link-') do |dir|
   check('link line uses -arch arm64e -fixup_chains', link_line.include?('-arch arm64e') && link_line.include?('-fixup_chains'), link_line)
   check('link line passes the platform version', link_line.include?('-platform_version macos 13.0 13.0'), link_line)
   check('link line never uses dynamic_lookup', !link_line.empty? && !link_line.include?('dynamic_lookup'), link_line)
-  check('link input is the patched object', link_line.include?('0_toy_lib.o') && !link_line.include?('.raw.o'), link_line)
-  raw = File.join(dir, '0_toy_lib.raw.o')
+  check('link input is the patched object', link_line.include?('work/0_toy_lib.o') && !link_line.include?('.raw.o'), link_line)
+  raw = File.join(dir, 'work', '0_toy_lib.raw.o')
   check('raw object keeps the caps byte', File.exist?(raw) && File.binread(raw, 4, 8).unpack1('V') == 0x80000002)
-  patched = File.join(dir, '0_toy_lib.o')
+  patched = File.join(dir, 'work', '0_toy_lib.o')
   check('patched object has the caps byte cleared', File.exist?(patched) && File.binread(patched, 4, 8).unpack1('V') == 2)
 
   out, err, st = tool(*build_args([exe_src], exe_out, 'exe', ['--entry', '_main', '--lib', lib_out]),
@@ -179,7 +198,7 @@ Dir.mktmpdir('arm64e-link-') do |dir|
     check('dylib cpusubtype arm64e without caps', lib['cpusubtype'] == 2)
     check('dylib filetype', lib['filetype'] == 6)
     check('dylib install name', lib['install_name'] == expected['lib']['install_name'], lib['install_name'].inspect)
-    check('dylib loads nothing (-no_implicit_dylibs)', lib['load_dylibs'].empty?, lib['load_dylibs'].inspect)
+    check('dylib loads nothing', lib['load_dylibs'].empty?, lib['load_dylibs'].inspect)
     check('dylib has no imports', lib['chained']['imports'].empty?)
     check('dylib fixup count matches the table', lib['chained']['fixups'].size == expected['lib']['fixups'].size,
           "#{lib['chained']['fixups'].size} vs #{expected['lib']['fixups'].size}")
@@ -228,6 +247,29 @@ Dir.mktmpdir('arm64e-link-') do |dir|
     File.binwrite(info, data)
     _o, e, s = tool('verify', info)
     check('verify rejects LC_DYLD_INFO rebase/bind data next to chained fixups', !s.success? && e.include?('LC_DYLD_INFO'), e)
+    # --- tampered executables: special ordinals, ordinal boundary, platform
+    edata = File.binread(exe_out)
+    imp, imp_fmt = first_import_offset(edata)
+    wide = imp_fmt == 3
+    low = wide ? 0xFFF0 : 0xF0
+    { low + 15 => 'special lib ordinal -1', low + 1 => 'special lib ordinal -15', low => "lib ordinal #{low}" }.each do |ord, msg|
+      t = edata.dup
+      t[imp, wide ? 2 : 1] = [ord].pack(wide ? 'v' : 'C')
+      path = File.join(dir, format('toy_main.ord%02x', ord))
+      File.binwrite(path, t)
+      _o, e, s = tool('verify', path)
+      check(format('verify reports import ordinal 0x%02x as "%s"', ord, msg), !s.success? && e.include?(msg), e)
+      check("ordinal #{low} is not special", !e.include?('special')) if ord == low
+    end
+    t = edata.dup
+    _c, bv, _s = load_commands(t).find { |c, _o, _s| c == 0x32 }
+    t[bv + 8, 4] = [2].pack('V') # PLATFORM_IOS
+    path = File.join(dir, 'toy_main.ios')
+    File.binwrite(path, t)
+    _o, e, s = tool('verify', path)
+    check('verify rejects a non-macOS build platform', !s.success? && e.include?('not macOS'), e)
+    _o, e, s = tool('verify', exe_out, '--kind', 'dylib')
+    check('verify rejects a filetype that does not match --kind', !s.success? && e.include?('filetype'), e)
     trunc = File.join(dir, 'libtoy.trunc')
     File.binwrite(trunc, File.binread(lib_out)[0, 0x8010])
     _o, e, s = tool('verify', trunc)
@@ -283,6 +325,26 @@ Dir.mktmpdir('arm64e-link-') do |dir|
                   env: { 'LD64' => LD64 })
   check('build refuses -undefined dynamic_lookup', !s.success? && e.include?('not allowed'), e)
 
+  %w[--lib --lib-dir --ld-arg].each do |opt|
+    _o, e, s = tool(*build_args([c_arm64], File.join(dir, 'x.dylib'), 'dylib', ["#{opt}=-undefined", "#{opt}=dynamic_lookup"]),
+                    env: { 'LD64' => LD64 })
+    check("build refuses dynamic_lookup passed through #{opt}", !s.success? && e.include?('not allowed'), e)
+  end
+
+  # A link that succeeds but fails verification must leave nothing at --out.
+  bad_out = File.join(dir, 'unverified.dylib')
+  _o, e, s = tool(*build_args([c_arm64], bad_out, 'dylib', ['--install-name', '@rpath/u.dylib', '--ld-arg=-bundle']),
+                  env: { 'LD64' => LD64 })
+  check('failed verification is reported', !s.success? && e.include?('filetype 8, expected 6'), e)
+  check('failed verification leaves no output', !File.exist?(bad_out) && !File.exist?("#{bad_out}.partial"))
+  # Default workdir: nothing but the output remains next to it.
+  clean = File.join(dir, 'clean')
+  Dir.mkdir(clean)
+  _o, e, s = tool(*build_args([c_arm64], File.join(clean, 'ok.dylib'), 'dylib', ['--install-name', '@rpath/ok.dylib']),
+                  env: { 'LD64' => LD64 })
+  check('default workdir build succeeds', s.success?, e)
+  check('default workdir build leaves only the output', Dir.children(clean) == ['ok.dylib'], Dir.children(clean).inspect)
+
   undef_src = File.join(dir, 'undef.c')
   File.write(undef_src, "extern int missing_symbol(void);\nint f(void) { return missing_symbol(); }\n")
   _o, e, s = tool(*build_args([undef_src], File.join(dir, 'undef.dylib'), 'dylib'), env: { 'LD64' => LD64 })
@@ -292,6 +354,10 @@ Dir.mktmpdir('arm64e-link-') do |dir|
   _o, e, s = tool('verify', raw_e)
   check('verify refuses a clang object', !s.success? && e.include?('cpusubtype'), e)
 end
+
+unit, st = Open3.capture2e({ 'ARM64E_LINK_SCRIPT' => SCRIPT }, 'python3', '-I', File.join(HERE, 'parser_unit.py'))
+puts unit
+check('parser unit checks', st.success?, unit)
 
 puts $failures.zero? ? 'PASS arm64e-link-toy' : "FAIL arm64e-link-toy: #{$failures} check(s) failed"
 exit($failures.zero? ? 0 : 1)
