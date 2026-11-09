@@ -21,7 +21,7 @@ Dir.mktmpdir('cache-alias-lookup-') do |dir|
     namespace dyld3 { namespace closure {
       const unsigned kFormatVersion=1;
       struct Image { uintptr_t cacheOffset() const { return 64; } const char *path() const { return "closure-image"; } };
-      struct ImageArray { Image image; const Image *imageForNum(uint32_t n) const { return n==1?&image:nullptr; } };
+      struct ImageArray { Image image; const Image *imageForNum(uint32_t n) const { return (n==1||n==2)?&image:nullptr; } };
     }}
     struct DyldSharedCache {
       struct Header {
@@ -82,6 +82,7 @@ Dir.mktmpdir('cache-alias-lookup-') do |dir|
       assert(result.image==&f.cache.array.image && result.cacheImageIndex==0);
       assert((uintptr_t)result.mhInCache==(uintptr_t)&f.cache+64);
       assert(strcmp(result.pathInCache,"closure-image")==0);
+      f.cache.trieIndex=1; assert(findInSharedCacheImage(load,"alias",&result) && result.cacheImageIndex==1); f.cache.trieIndex=0;
       // A split cache reads its own table even though a closure ImageArray is advertised, and the
       // alias index is bounded by that table, not by the (empty) legacy one.
       f.cache.split=true; f.cache.header.imagesCount=0;
