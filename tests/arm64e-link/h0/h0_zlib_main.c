@@ -83,6 +83,7 @@ static int check_streams(void) {
     zero(&s, sizeof s);
     if (deflateInit_(&s, Z_DEFAULT_COMPRESSION, ZLIB_VERSION_STRING, (int)sizeof s) != Z_OK)
         return FAIL_DEFLATE_INIT;
+    zero(packed, sizeof packed);  // so a short deflate() cannot pass on compress()'s leftovers
     s.next_in = input;
     s.avail_in = SIZE;
     s.next_out = packed;

@@ -27,8 +27,8 @@ BRK_1 = 0xD4200020  # what __builtin_trap() compiles to on arm64
 
 # name: (install name, symbol list, compat, current, output file)
 STUBS = {
-    "libz": ("/usr/lib/libz.1.dylib", "libz_symbols.txt", "1.0.0", "1.2.12", "libz.1.linkonly.dylib"),
-    "libsystem": ("/usr/lib/libSystem.B.dylib", "libsystem_symbols.txt", "1.0.0", "1351.0.0",
+    "libz": ("/usr/lib/libz.1.dylib", "libz_symbols.txt", "1.0.0", "1.2.11", "libz.1.linkonly.dylib"),
+    "libsystem": ("/usr/lib/libSystem.B.dylib", "libsystem_symbols.txt", "1.0.0", "1281.0.0",
                   "libSystem.B.linkonly.dylib"),
 }
 
@@ -125,6 +125,9 @@ def check_exe(path, expected_file=None):
         text = next((s for s in m.segments if s["name"] == "__TEXT"), None)
         if text is None or not 0 < m.entry_offset < text["filesize"]:
             problems.append("LC_MAIN entryoff 0x%x is outside __TEXT" % m.entry_offset)
+    got_bv = [rec.version_str(v) for v in m.build_versions or ()]
+    if got_bv != [exp["build_version"]["minos"], exp["build_version"]["sdk"]]:
+        problems.append("LC_BUILD_VERSION (minos, sdk) %s, expected %s" % (got_bv, exp["build_version"]))
     cmds = [c for c, _p in m.dylibs]
     if any(c != rec.LC_LOAD_DYLIB for c in cmds):
         problems.append("dependencies must all be plain LC_LOAD_DYLIB, got %s" % [hex(c) for c in cmds])
