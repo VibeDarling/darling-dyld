@@ -29,9 +29,9 @@ def bare(dylibs=()):
     return m
 
 
-def imports_of(m, words, fmt):
-    pack = {1: "<I", 3: "<QQ"}[fmt]
-    blob = b"".join(struct.pack(pack, *w) if fmt == 3 else struct.pack(pack, w) for w in words) + b"sym\0"
+def imports_of(m, words, fmt, names=b"sym\0"):
+    pack = {1: "<I", 3: "<Qq"}[fmt]
+    blob = b"".join(struct.pack(pack, *w) if fmt == 3 else struct.pack(pack, w) for w in words) + names
     reader = lambda f, o: struct.unpack_from(f, blob, o)
     size = {1: 4, 3: 16}[fmt]
     return m._imports(blob, reader, 0, size * len(words), len(words), fmt)
@@ -56,6 +56,11 @@ check("format 1 ordinal 0xFF is -1 (main executable)", one(0xFF) == -1)
 three = lambda ordinal: imports_of(m, [(ordinal | (0 << 32), 0)], 3)[0]["ordinal"]
 check("format 3 ordinal 0xFFF0 stays 65520", three(0xFFF0) == 0xFFF0)
 check("format 3 ordinal 0xFFFF is -1", three(0xFFFF) == -1)
+
+# format 3 keeps a 32-bit name offset and a weak flag
+far = imports_of(m, [(1 | (1 << 16) | (0x10005 << 32), -8)], 3, names=b"\0" * 0x10000 + b"junk\0far\0")[0]
+check("format 3 name offset above 0xFFFF", far["name"] == "far")
+check("format 3 weak flag and addend", far["weak"] and far["addend"] == -8 and far["ordinal"] == 1)
 
 # a 16-character name has no NUL inside its char[16] field
 m = bare()

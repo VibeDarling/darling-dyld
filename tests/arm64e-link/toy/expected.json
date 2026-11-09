@@ -1,5 +1,5 @@
 {
-  "_comment": "ld64 puts the negative addend of _exe_plain_bind_negative in a second _lib_array import (imports_format 2). Chained-fixup entry each global in toy_lib.c / toy_main.c must produce. at/target/import are [symbol, byte offset]; symbols keep the Mach-O underscore. Unqualified function pointers are signed IA/0 by the arm64e ABI, plain data pointers are not signed.",
+  "_comment": "ld64 puts the negative addend of _exe_plain_bind_negative in a second _lib_array import (imports_format 3, DYLD_CHAINED_IMPORT_ADDEND64). Chained-fixup entry each global in toy_lib.c / toy_main.c must produce. at/target/import are [symbol, byte offset]; symbols keep the Mach-O underscore. Unqualified function pointers are signed IA/0 by the arm64e ABI, plain data pointers are not signed.",
   "lib": {
     "install_name": "@rpath/libtoy.dylib",
     "fixups": [
