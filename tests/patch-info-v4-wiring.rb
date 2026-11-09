@@ -4,7 +4,7 @@
 # allow-listed one), that nothing runs without a cache, without version 4 patch info, without records or without a cache
 # image in the process, that the symbols are looked up in the loaded image with dyld's own export lookup, that a second
 # pass counts nothing twice, that a reader error halts with the exporter's name, and that exactly one summary line is
-# printed per pass (always when a slot kept the cache's pointer, otherwise only with the verbose mapping option). It also
+# printed per pass (always for an anomaly, otherwise only with the verbose mapping option) and that the verbose option adds one line per patched symbol. It also
 # checks where the hook sits: at the end of link(), which runs under dyld's lock, and in neither initializer pass (those
 # run after dlopen has released the lock). The reader and the signing are tested in tests/patch-info-v4-override.rb.
 # Usage: ruby tests/patch-info-v4-wiring.rb [checkout]
@@ -85,8 +85,9 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     };
     struct ImageLoader {
       struct LinkContext { bool verboseMapping = false; };
-      std::string install; bool inCache = false; std::map<std::string, uintptr_t> exports;
+      std::string install, path; bool inCache = false; std::map<std::string, uintptr_t> exports;
       const char *getInstallPath() const { return install.c_str(); }
+      const char *getPath() const { return path.c_str(); }
       bool inSharedCache() const { return inCache; }
       // the real lookup is ImageLoader::findExportedSymbolAddress (searchReExports, resolvers run for a GOT pointer)
       bool findExportedSymbolAddress(const LinkContext &, const char *name, const ImageLoader *requestor, int ordinal, bool runResolver, const ImageLoader **foundIn, uintptr_t *address) const {
@@ -110,7 +111,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     using namespace dyld;
 
     static ImageLoader *image(const char *install, bool inCache = false) {
-      ImageLoader *i = new ImageLoader; i->install = install; i->inCache = inCache;
+      ImageLoader *i = new ImageLoader; i->install = install; i->path = std::string("/prefix") + install; i->inCache = inCache;
       i->exports = {{"_open", 0x1000}, {"_close", 0x2000}}; return i;   // _nosuchsymbol is not exported
     }
     // a disk image standing in for cache image `index`, as loadPhase5 records it
@@ -142,24 +143,23 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       overrideSplitCacheGotSlots();
       CHECK(cache.calls == std::vector<uint32_t>{1});
       CHECK(cache.lastAddress.size() == 2 && cache.lastAddress["_open"] == 0x1000 && cache.lastAddress["_close"] == 0x2000);   // the loaded image's addresses
-      CHECK(summaries() == 1 && logged.size() == 1 && logged[0].find("patched=4 missing=2 unexplained=0") != std::string::npos);   // a missing symbol is always reported
+      CHECK(logged.empty());                                              // a symbol Darling lacks is normal: no line without the verbose mapping option
 
-      // --- a second pass (the next link) does not count the same exporter twice, a new one is added; the line is cumulative ---
-      logged.clear();
+      // --- a second pass (the next link) does not count the same exporter twice, a new one is added ---
       shadow("/usr/lib/libSystem.B.dylib", 0);
       overrideSplitCacheGotSlots();
       CHECK((cache.calls == std::vector<uint32_t>{1, 1, 0}));
-      CHECK(summaries() == 1 && logged[0].find("patched=8 missing=4 unexplained=0") != std::string::npos);
+      CHECK(logged.empty());
+
+      // --- an anomaly (slots refused for their encoding or kind) is always reported, once, with the cumulative totals ---
+      shadow("/usr/lib/system/libsystem_malloc.dylib", 4);
+      overrideSplitCacheGotSlots();
+      CHECK(summaries() == 1 && logged.size() == 1 && logged[0].find("patched=8 missing=4 unexplained=2") != std::string::npos);
       logged.clear();
       overrideSplitCacheGotSlots();
       CHECK(logged.empty());                                              // nothing new, nothing to say
 
-      // --- slots that are left because they cannot be explained are reported too ---
-      shadow("/usr/lib/system/libsystem_malloc.dylib", 4);
-      overrideSplitCacheGotSlots();
-      CHECK(summaries() == 1 && logged[0].find("unexplained=2") != std::string::npos);
-
-      // --- all good: silent, unless the verbose mapping option asks for the line; the missing symbol is named then ---
+      // --- the verbose mapping option: one line per patched symbol and the summary; none without it ---
       reset(cache);
       sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
       ImageLoader *kernel = image("/usr/lib/system/libsystem_kernel.dylib"); kernel->exports["_nosuchsymbol"] = 0x3000;
@@ -168,12 +168,14 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       CHECK(logged.empty() && cache.calls.size() == 1);
       cache.applied.clear(); gLinkContext.verboseMapping = true;
       overrideSplitCacheGotSlots();
-      CHECK(summaries() == 1);                                            // nothing missing, but the verbose mapping option asks for the line
+      unsigned patchedLines = 0; bool sawOpen = false;
+      for (const std::string &l : logged) { patchedLines += l.rfind("dyld: patched ", 0) == 0; sawOpen |= l == "dyld: patched /usr/lib/system/libsystem_kernel.dylib _open -> /prefix/usr/lib/system/libsystem_kernel.dylib\\n"; }
+      CHECK(patchedLines == 3 && sawOpen && summaries() == 1 && logged.size() == 4);
       logged.clear(); cache.applied.clear(); kernel->exports.erase("_nosuchsymbol");
       overrideSplitCacheGotSlots();
-      bool sawMissing = false;
-      for (const std::string &l : logged) sawMissing |= l.find("_nosuchsymbol") != std::string::npos && l.find("libsystem_kernel") != std::string::npos;
-      CHECK(sawMissing && summaries() == 1);
+      bool sawMissing = false; patchedLines = 0;
+      for (const std::string &l : logged) { sawMissing |= l.find("_nosuchsymbol") != std::string::npos && l.find("does not export") != std::string::npos; patchedLines += l.rfind("dyld: patched ", 0) == 0; }
+      CHECK(sawMissing && patchedLines == 2 && summaries() == 1);
       gLinkContext.verboseMapping = false;
 
       // --- a reader error halts, naming the exporter and the reason ---

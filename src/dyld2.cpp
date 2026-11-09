@@ -1787,7 +1787,7 @@ static void overrideSplitCacheGotSlots()
 	if ( !cacheImageLoaded )
 		return;
 	const bool verbose = gLinkContext.verboseMapping;
-	uint64_t exporters = 0, newMissing = 0, newUnexplained = 0;
+	uint64_t exporters = 0, newUnexplained = 0;
 	for (const DiskOverrideOfCacheImage& record : sDiskOverridesOfCacheImages) {
 		const ImageLoader* image = record.image;
 		const char* installPath = image->getInstallPath();
@@ -1799,6 +1799,8 @@ static void overrideSplitCacheGotSlots()
 			uintptr_t found;
 			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) ) {
 				*address = found;
+				if ( verbose )
+					dyld::log("dyld: patched %s %s -> %s\n", installPath, symbol, foundIn->getPath());
 				return true;
 			}
 			if ( verbose )
@@ -1813,11 +1815,11 @@ static void overrideSplitCacheGotSlots()
 		sSplitCachePatchTotals.patched += stats.patched;
 		sSplitCachePatchTotals.missing += stats.missingSlots;
 		sSplitCachePatchTotals.unexplained += stats.unexplained;
-		newMissing += stats.missingSlots;
 		newUnexplained += stats.unexplained;
 	}
-	// one line per pass: always when a slot kept the cache's pointer, otherwise under the verbose mapping option
-	if ( (newMissing + newUnexplained != 0) || ((exporters != 0) && verbose) )
+	// one line per pass: with the verbose mapping option, and without it only for an anomaly (an encoding or an export kind
+	// that was refused). Missing symbols are normal (Darling lacks some of the exports), so they are only in the verbose line.
+	if ( (newUnexplained != 0) || ((exporters != 0) && verbose) )
 		dyld::log("dyld: split cache GOT override: patched=%llu missing=%llu unexplained=%llu (slots, all exporters so far)\n",
 				  (unsigned long long)sSplitCachePatchTotals.patched, (unsigned long long)sSplitCachePatchTotals.missing,
 				  (unsigned long long)sSplitCachePatchTotals.unexplained);
