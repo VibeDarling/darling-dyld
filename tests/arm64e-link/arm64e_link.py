@@ -25,6 +25,28 @@ CAPS_MASK = 0xFF000000
 CAPS_ARM64E_VERSIONED = 0x80000000
 MH_OBJECT = 1
 
+LC_SEGMENT_64 = 0x19
+LC_SYMTAB = 0x2
+LC_ID_DYLIB = 0xD
+LC_LOAD_DYLIB = 0xC
+LC_LOAD_WEAK_DYLIB = 0x80000018
+LC_REEXPORT_DYLIB = 0x8000001F
+LC_LOAD_UPWARD_DYLIB = 0x80000023
+LC_LAZY_LOAD_DYLIB = 0x20
+LC_DYLD_INFO = 0x22
+LC_DYLD_INFO_ONLY = 0x80000022
+LC_DYLD_CHAINED_FIXUPS = 0x80000034
+LC_BUILD_VERSION = 0x32
+DYLIB_ORDINAL_CMDS = (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB,
+                      LC_LOAD_UPWARD_DYLIB, LC_LAZY_LOAD_DYLIB)
+PLATFORM_MACOS = 1
+
+DYLD_CHAINED_PTR_ARM64E = 1
+CHAIN_STRIDE = 8
+PAGE_START_NONE = 0xFFFF
+PAGE_START_MULTI = 0x8000
+KEYS = ("IA", "IB", "DA", "DB")
+
 DEFAULT_TARGET = "arm64e-apple-macos13"
 # -undefined dynamic_lookup made ld64 emit lib_ordinal -1 (main executable)
 # instead of a flat lookup, so the recipe never passes it.
@@ -69,6 +91,292 @@ def patch_file(src, dst):
         raise RecipeError("%s: %s" % (src, e))
     with open(dst, "wb") as f:
         f.write(patched)
+
+
+# --------------------------------------------------------------- Mach-O parser
+
+class MachO:
+    """Minimal 64-bit Mach-O reader; every bounds problem raises RecipeError."""
+
+    def __init__(self, data, name="<buffer>"):
+        self.data = data
+        self.name = name
+        self.segments = []
+        self.dylibs = []          # (command, path) in ordinal order
+        self.install_name = None
+        self.symtab = None
+        self.chained = None       # (dataoff, datasize)
+        self.dyld_info = None
+        self.build_platform = None
+        self._parse()
+
+    def err(self, msg):
+        raise RecipeError("%s: %s" % (self.name, msg))
+
+    def u(self, fmt, off):
+        try:
+            return struct.unpack_from(fmt, self.data, off)
+        except struct.error:
+            self.err("read of %s at 0x%x past end of file (size 0x%x)" % (fmt, off, len(self.data)))
+
+    def _parse(self):
+        magic, self.cputype, self.cpusubtype, self.filetype, ncmds, sizeofcmds, self.flags, _ = \
+            self.u("<IIIIIIII", 0)
+        if magic != MH_MAGIC_64:
+            self.err("not a 64-bit little-endian Mach-O (magic 0x%08x)" % magic)
+        off = 32
+        end = 32 + sizeofcmds
+        if end > len(self.data):
+            self.err("load commands (0x%x bytes) exceed the file" % sizeofcmds)
+        for _ in range(ncmds):
+            if off + 8 > end:
+                self.err("load command table overruns sizeofcmds")
+            cmd, cmdsize = self.u("<II", off)
+            if cmdsize < 8 or cmdsize % 8 or off + cmdsize > end:
+                self.err("bad load command size 0x%x at 0x%x" % (cmdsize, off))
+            self._command(cmd, cmdsize, off)
+            off += cmdsize
+        if off != end:
+            self.err("load commands end at 0x%x, header says 0x%x" % (off, end))
+
+    def _cstr(self, off, limit):
+        raw = self.data[off:limit]
+        nul = raw.find(b"\0")
+        if nul < 0:
+            self.err("unterminated string at 0x%x" % off)
+        return raw[:nul].decode("utf-8", "replace")
+
+    def _command(self, cmd, cmdsize, off):
+        if cmd == LC_SEGMENT_64:
+            name = self._cstr(off + 8, off + 24)
+            vmaddr, vmsize, fileoff, filesize, _mp, _ip, nsects, _fl = self.u("<QQQQIIII", off + 24)
+            if 72 + nsects * 80 > cmdsize:
+                self.err("segment %s: %d sections overrun the command" % (name, nsects))
+            sections = []
+            for i in range(nsects):
+                so = off + 72 + i * 80
+                sect = self._cstr(so, so + 16)
+                saddr, ssize = self.u("<QQ", so + 32)
+                sections.append({"name": sect, "addr": saddr, "size": ssize})
+            self.segments.append({"name": name, "vmaddr": vmaddr, "vmsize": vmsize,
+                                  "fileoff": fileoff, "filesize": filesize, "sections": sections})
+        elif cmd in DYLIB_ORDINAL_CMDS or cmd == LC_ID_DYLIB:
+            nameoff = self.u("<I", off + 8)[0]
+            if nameoff >= cmdsize:
+                self.err("dylib command name offset 0x%x outside the command" % nameoff)
+            path = self._cstr(off + nameoff, off + cmdsize)
+            if cmd == LC_ID_DYLIB:
+                self.install_name = path
+            else:
+                self.dylibs.append((cmd, path))
+        elif cmd == LC_SYMTAB:
+            self.symtab = self.u("<IIII", off + 8)
+        elif cmd == LC_DYLD_CHAINED_FIXUPS:
+            if self.chained is not None:
+                self.err("more than one LC_DYLD_CHAINED_FIXUPS")
+            self.chained = self.u("<II", off + 8)
+        elif cmd in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY):
+            if cmdsize < 48:
+                self.err("LC_DYLD_INFO command is %d bytes, expected 48" % cmdsize)
+            self.dyld_info = self.u("<10I", off + 8)
+        elif cmd == LC_BUILD_VERSION:
+            self.build_platform = self.u("<I", off + 8)[0]
+
+    # -- addresses
+    def image_base(self):
+        for s in self.segments:
+            if s["fileoff"] == 0 and s["filesize"] > 0:
+                return s["vmaddr"]
+        self.err("no segment maps file offset 0")
+
+    def segment_of(self, vmaddr):
+        for s in self.segments:
+            if s["vmaddr"] <= vmaddr < s["vmaddr"] + s["vmsize"]:
+                return s
+        return None
+
+    def section_of(self, vmaddr):
+        seg = self.segment_of(vmaddr)
+        if seg:
+            for sec in seg["sections"]:
+                if sec["addr"] <= vmaddr < sec["addr"] + sec["size"]:
+                    return "%s,%s" % (seg["name"], sec["name"])
+        return None
+
+    def read_vm(self, vmaddr, size):
+        seg = self.segment_of(vmaddr)
+        if seg is None:
+            self.err("address 0x%x is in no segment" % vmaddr)
+        rel = vmaddr - seg["vmaddr"]
+        if rel + size > seg["filesize"]:
+            self.err("0x%x..0x%x is beyond the file-backed part of %s" %
+                     (vmaddr, vmaddr + size, seg["name"]))
+        start = seg["fileoff"] + rel
+        if start + size > len(self.data):
+            self.err("0x%x maps past the end of the file" % vmaddr)
+        return self.data[start:start + size]
+
+    # -- symbols
+    def symbols(self):
+        """Defined, non-debug symbols as {name: vmaddr} (names keep their underscore)."""
+        if self.symtab is None:
+            return {}
+        symoff, nsyms, stroff, strsize = self.symtab
+        if stroff + strsize > len(self.data) or symoff + nsyms * 16 > len(self.data):
+            self.err("symbol table outside the file")
+        out = {}
+        for i in range(nsyms):
+            n_strx, n_type, n_sect, _desc, n_value = struct.unpack_from("<IBBHQ", self.data, symoff + i * 16)
+            if n_type & 0xE0 or (n_type & 0x0E) != 0x0E or n_strx >= strsize:
+                continue
+            out[self._cstr(stroff + n_strx, stroff + strsize)] = n_value
+        return out
+
+    # -- chained fixups
+    def chained_fixups(self):
+        if self.chained is None:
+            self.err("no LC_DYLD_CHAINED_FIXUPS")
+        dataoff, datasize = self.chained
+        if datasize < 28 or dataoff + datasize > len(self.data):
+            self.err("chained fixups blob 0x%x+0x%x outside the file" % (dataoff, datasize))
+        blob = self.data[dataoff:dataoff + datasize]
+
+        def b(fmt, off):
+            try:
+                return struct.unpack_from(fmt, blob, off)
+            except struct.error:
+                self.err("chained fixups read at 0x%x past the blob" % off)
+
+        version, starts_off, imports_off, symbols_off, nimports, imports_format, symbols_format = \
+            b("<7I", 0)
+        if version != 0:
+            self.err("chained fixups version %d, expected 0" % version)
+        if symbols_format != 0:
+            self.err("symbols_format %d (compressed) unsupported" % symbols_format)
+        imports = self._imports(blob, b, imports_off, symbols_off, nimports, imports_format)
+
+        seg_count = b("<I", starts_off)[0]
+        if seg_count != len(self.segments):
+            self.err("chained starts cover %d segments, the file has %d" % (seg_count, len(self.segments)))
+        base = self.image_base()
+        starts, fixups = [], []
+        for i in range(seg_count):
+            rel = b("<I", starts_off + 4 + 4 * i)[0]
+            if rel == 0:
+                continue
+            so = starts_off + rel
+            size, page_size, ptr_fmt, seg_off, max_ptr, page_count = b("<IHHQIH", so)
+            if ptr_fmt != DYLD_CHAINED_PTR_ARM64E:
+                self.err("segment %s pointer_format %d, expected %d (DYLD_CHAINED_PTR_ARM64E)" %
+                         (self.segments[i]["name"], ptr_fmt, DYLD_CHAINED_PTR_ARM64E))
+            if size < 22 + 2 * page_count:
+                self.err("segment %s starts record (%d bytes) too small for %d pages" %
+                         (self.segments[i]["name"], size, page_count))
+            seg = self.segments[i]
+            if base + seg_off != seg["vmaddr"]:
+                self.err("segment %s segment_offset 0x%x does not match vmaddr 0x%x" %
+                         (seg["name"], seg_off, seg["vmaddr"]))
+            pages = [b("<H", so + 22 + 2 * p)[0] for p in range(page_count)]
+            starts.append({"segment": seg["name"], "page_size": page_size, "pointer_format": ptr_fmt,
+                           "segment_offset": seg_off, "page_count": page_count, "page_starts": pages})
+            self._walk_segment(seg, page_size, pages, imports, fixups)
+        return {"version": version, "imports_format": imports_format, "imports": imports,
+                "starts": starts, "fixups": fixups}
+
+    def _imports(self, blob, b, imports_off, symbols_off, count, fmt):
+        out = []
+        for i in range(count):
+            if fmt == 1:
+                v = b("<I", imports_off + 4 * i)[0]
+                ordinal, weak, noff, addend = v & 0xFF, (v >> 8) & 1, v >> 9, 0
+            elif fmt == 2:
+                v, addend = b("<Ii", imports_off + 8 * i)
+                ordinal, weak, noff = v & 0xFF, (v >> 8) & 1, v >> 9
+            elif fmt == 3:
+                v, addend = b("<Qq", imports_off + 16 * i)
+                ordinal, weak, noff = v & 0xFFFF, (v >> 16) & 1, v >> 32
+            else:
+                self.err("imports_format %d unsupported" % fmt)
+            if fmt != 3 and ordinal >= 0xF0:
+                ordinal -= 0x100
+            elif fmt == 3 and ordinal >= 0xFFF0:
+                ordinal -= 0x10000
+            raw = blob[symbols_off + noff:]
+            nul = raw.find(b"\0")
+            if nul < 0:
+                self.err("import %d name is not terminated" % i)
+            out.append({"ordinal": ordinal, "weak": bool(weak), "addend": addend,
+                        "name": raw[:nul].decode("utf-8", "replace"), "lib": self._ordinal_path(ordinal)})
+        return out
+
+    def _ordinal_path(self, ordinal):
+        if ordinal == 0:
+            return self.install_name
+        if ordinal < 0:
+            return None
+        if ordinal > len(self.dylibs):
+            self.err("import lib ordinal %d but only %d dylibs are loaded" % (ordinal, len(self.dylibs)))
+        return self.dylibs[ordinal - 1][1]
+
+    def _walk_segment(self, seg, page_size, pages, imports, fixups):
+        for p, start in enumerate(pages):
+            if start == PAGE_START_NONE:
+                continue
+            if start & PAGE_START_MULTI:
+                self.err("segment %s page %d uses multi-start chains, unsupported" % (seg["name"], p))
+            if start >= page_size:
+                self.err("segment %s page %d start 0x%x beyond the page" % (seg["name"], p, start))
+            page_base = seg["vmaddr"] + p * page_size
+            addr = page_base + start
+            index = 0
+            seen = set()
+            while True:
+                if addr in seen:
+                    self.err("fixup chain loops at 0x%x" % addr)
+                seen.add(addr)
+                if not page_base <= addr < page_base + page_size:
+                    self.err("fixup chain leaves page %d of %s at 0x%x" % (p, seg["name"], addr))
+                if addr % 8:
+                    self.err("misaligned fixup at 0x%x" % addr)
+                value = struct.unpack("<Q", self.read_vm(addr, 8))[0]
+                fix = self._decode(value, imports)
+                fix.update({"vmaddr": addr, "segment": seg["name"], "section": self.section_of(addr),
+                            "page": p, "chain_index": index})
+                fixups.append(fix)
+                if fix["next"] == 0:
+                    break
+                addr += fix["next"] * CHAIN_STRIDE
+                index += 1
+
+    def _decode(self, v, imports):
+        auth, bind = (v >> 63) & 1, (v >> 62) & 1
+        nxt = (v >> 51) & 0x7FF
+        fix = {"auth": bool(auth), "next": nxt, "raw": "0x%016x" % v}
+        if bind:
+            ordinal = v & 0xFFFF
+            if (v >> 16) & 0xFFFF:
+                self.err("bind with nonzero reserved bits: 0x%016x" % v)
+            if ordinal >= len(imports):
+                self.err("bind ordinal %d beyond %d imports" % (ordinal, len(imports)))
+            imp = imports[ordinal]
+            fix.update({"kind": "auth_bind" if auth else "bind", "import_index": ordinal,
+                        "import": imp["name"], "lib": imp["lib"], "lib_ordinal": imp["ordinal"]})
+            if auth:
+                fix["addend"] = imp["addend"]
+            else:
+                addend = (v >> 32) & 0x7FFFF
+                if addend & 0x40000:
+                    addend -= 0x80000
+                fix["addend"] = addend + imp["addend"]
+        elif auth:
+            fix.update({"kind": "auth_rebase", "target": v & 0xFFFFFFFF})
+        else:
+            fix.update({"kind": "rebase", "target": v & ((1 << 43) - 1), "high8": (v >> 43) & 0xFF})
+        if auth:
+            fix.update({"diversity": (v >> 32) & 0xFFFF, "addr_div": bool((v >> 48) & 1),
+                        "key": KEYS[(v >> 49) & 3]})
+        return fix
+
 
 
 # ----------------------------------------------------------------------- build
