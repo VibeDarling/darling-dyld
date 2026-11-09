@@ -3668,6 +3668,23 @@ static void recordDiskOverrideOfCacheImage(const ImageLoader* image, const dyld3
 }
 
 
+// loadPhase0 puts DYLD_ROOT_PATH in front of a path (Darling's prefix) before it reaches loadPhase5load, but a cache
+// indexes the path without it. Returns path as the cache knows it.
+static const char* pathWithoutRoot(const char* path)
+{
+#if SUPPORT_ROOT_PATH
+	if ( gLinkContext.rootPaths != NULL ) {
+		for (const char* const* rootPath = gLinkContext.rootPaths; *rootPath != NULL; ++rootPath) {
+			const size_t rootLen = strlen(*rootPath);
+			if ( (strncmp(path, *rootPath, rootLen) == 0) && (path[rootLen] == '/') )
+				return &path[rootLen];
+		}
+	}
+#endif
+	return path;
+}
+
+
 // try to open file
 static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const LoadContext& context, unsigned& cacheIndex, std::vector<const char*>* exceptions)
 {
@@ -3703,7 +3720,7 @@ static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const 
 #else
 
 	auto findSharedCacheImage = ^() {
-		return dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, path, &shareCacheResults);
+		return dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, pathWithoutRoot(path), &shareCacheResults);
 	};
 
 #endif

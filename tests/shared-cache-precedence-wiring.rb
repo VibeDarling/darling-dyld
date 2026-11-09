@@ -11,6 +11,7 @@ dyld2 = File.read("#{root}/src/dyld2.cpp")
 dyld2_h = File.read("#{root}/src/dyld2.h")
 runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
 runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
+without_root = dyld2[/^static const char\* pathWithoutRoot\(.*?^\}/m] or abort 'pathWithoutRoot missing'
 load5 = dyld2[/^static ImageLoader\* loadPhase5load\(.*?^\}/m] or abort 'loadPhase5load missing'
 relative = dyld2[/^static bool isFileRelativePath\(.*?^\}/m] or abort 'isFileRelativePath missing'
 records = (dyld2[/^static std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;.*?^\}/m] or abort 'override vector missing') + "\n" +
@@ -45,6 +46,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
     #define SUPPORT_ACCELERATE_TABLES 0
     #define TARGET_OS_SIMULATOR 0
     #define TARGET_OS_IPHONE 0
+    #define SUPPORT_ROOT_PATH 1
     // The block runtime is not linked: these blocks are never copied or escaped.
     extern "C" { void *_NSConcreteStackBlock[32]; void *_NSConcreteGlobalBlock[32];
                  void _Block_object_assign(void*, const void*, const int) {}
@@ -91,7 +93,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
     using namespace dyld3;
     class ImageLoader {
     public:
-      struct LinkContext { bool allowEnvVarsPath = true; };
+      struct LinkContext { bool allowEnvVarsPath = true; const char* const* rootPaths = nullptr; };
       int tag = 0;                       // 1 = cache, 2 = disk
       const void* mh = nullptr;
       uint32_t overrides = 0;
@@ -127,6 +129,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       #{relative}
       #{records}
       #{in_cache}
+      #{without_root}
       #{load5}
     }
     ImageLoader* ImageLoaderMachO::instantiateFromCache(macho_header*, const char* path, long, const struct stat& sb, ImageLoader::LinkContext&) {
@@ -144,6 +147,14 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       dyld::LoadContext ctx; unsigned idx = 0; std::vector<const char*> ex;
       try { ImageLoader* i = dyld::loadPhase5load(path, path, ctx, idx, &ex); if (out) *out = i; return i ? i->tag : 0; }
       catch (const std::string&) { return -1; }   // a throw is a failure of the rule
+    }
+
+    // Like load, for a path that loadPhase0 put DYLD_ROOT_PATH in front of: orgPath is the unprefixed one.
+    static int loadRooted(const char* path, const char* orgPath, ImageLoader** out = nullptr) {
+      dyld::seen = dyld::Seen();
+      dyld::LoadContext ctx; unsigned idx = 0; std::vector<const char*> ex;
+      try { ImageLoader* i = dyld::loadPhase5load(path, orgPath, ctx, idx, &ex); if (out) *out = i; return i ? i->tag : 0; }
+      catch (const std::string&) { return -1; }
     }
 
     int main() {
@@ -207,6 +218,32 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       CHECK(dyld::sDiskOverridesOfCacheImages.size() == 1);
       removeImage(other);
       CHECK(dyld::sDiskOverridesOfCacheImages.empty());
+
+      // --- DYLD_ROOT_PATH: Darling's prefix is in front of the path that reaches loadPhase5load ---
+      static const char* const kRoots[] = { "/prefix", nullptr };
+      dyld::gLinkContext.rootPaths = kRoots;
+      // allow-listed: the cache wins over the prefix's own copy, and that copy's stat stays off the cache image
+      dyld3::gDisk.clear(); dyld3::gDisk["/prefix/usr/lib/libz.1.dylib"] = 555; dyld::sDiskOverridesOfCacheImages.clear();
+      CHECK(loadRooted("/prefix/usr/lib/libz.1.dylib", kLibz) == 1);
+      CHECK(dyld::seen.diskCalls == 0 && dyld::seen.cacheCalls == 1 && dyld::seen.cachePath == kLibz);
+      CHECK(dyld::seen.ino == 0 && dyld::seen.mtime == 0 && dyld::sDiskOverridesOfCacheImages.empty());
+      // not allow-listed: the prefix's copy wins and the override of cache image 1 is recorded
+      dyld3::gDisk.clear(); dyld3::gDisk["/prefix/usr/lib/libobjc.A.dylib"] = 556; dyld::sDiskOverridesOfCacheImages.clear();
+      CHECK(loadRooted("/prefix/usr/lib/libobjc.A.dylib", kObjc, &img) == 2 && dyld::seen.cacheCalls == 0);
+      CHECK(dyld::sDiskOverridesOfCacheImages.size() == 1 && dyld::sDiskOverridesOfCacheImages[0].cacheImageIndex == 1);
+      // not allow-listed and absent from the prefix: the cache
+      dyld3::gDisk.clear(); dyld::sDiskOverridesOfCacheImages.clear();
+      CHECK(loadRooted("/prefix/usr/lib/libobjc.A.dylib", kObjc) == 1 && dyld::seen.cachePath == kObjc);
+      // only a whole leading directory is the root: "/prefixed" is a different tree and has no cache entry
+      dyld3::gDisk.clear(); dyld3::gDisk["/prefixed/usr/lib/libz.1.dylib"] = 557;
+      CHECK(loadRooted("/prefixed/usr/lib/libz.1.dylib", "/prefixed/usr/lib/libz.1.dylib") == 2 && dyld::seen.cacheCalls == 0);
+      // the unprefixed path of the same load still reaches the cache
+      dyld3::gDisk.clear(); dyld3::gDisk[kLibz] = 555;
+      CHECK(loadRooted(kLibz, kLibz) == 1 && dyld::seen.cachePath == kLibz);
+      dyld::gLinkContext.rootPaths = nullptr;
+      // no root path: a prefixed-looking path has no cache entry
+      dyld3::gDisk.clear(); dyld3::gDisk["/prefix/usr/lib/libz.1.dylib"] = 555;
+      CHECK(loadRooted("/prefix/usr/lib/libz.1.dylib", kLibz) == 2 && dyld::seen.cacheCalls == 0);
 
       // --- old caches (no closure Image here either): a file on disk wins, even for the allow-listed path ---
       f.cache.split = false;
