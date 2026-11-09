@@ -1793,9 +1793,11 @@ bool pathIsInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* d
     return loadInfo.loadAddress->hasImagePath(dylibPathToFind, imageIndex);
 }
 
-// libz is a leaf library: the first one to come from the cache while Darling's libSystem family stays on disk.
+// Leaf libraries that come from the cache while Darling's libSystem family stays on disk. libz was first;
+// libexpat follows as a leaf whose data holds hundreds of PAC-signed pointers (Darling ships its own copy).
 static const char* const kSharedCacheServedOverDisk[] = {
     "/usr/lib/libz.1.dylib",
+    "/usr/lib/libexpat.1.dylib",
 };
 static const SharedCacheAllowList kSharedCacheAllowList = { kSharedCacheServedOverDisk,
                                                             sizeof(kSharedCacheServedOverDisk)/sizeof(kSharedCacheServedOverDisk[0]) };

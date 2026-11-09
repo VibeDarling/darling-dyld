@@ -60,8 +60,11 @@ Dir.mktmpdir('shared-cache-precedence-') do |dir|
     int main() {
       const char* kLibzPath = "/usr/lib/libz.1.dylib";
       const char* kOther = "/usr/lib/libobjc.A.dylib";
-      // The shipped list is exactly one entry: libz's canonical install name.
-      CHECK(sharedCacheAllowList().count == 1 && strcmp(sharedCacheAllowList().paths[0], kLibzPath) == 0);
+      // The shipped list is exactly two entries, each a canonical install name: libz and libexpat.
+      CHECK(sharedCacheAllowList().count == 2 && strcmp(sharedCacheAllowList().paths[0], kLibzPath) == 0
+            && strcmp(sharedCacheAllowList().paths[1], "/usr/lib/libexpat.1.dylib") == 0);
+      CHECK(sharedCachePathIsAllowListed("/usr/lib/libexpat.1.dylib", sharedCacheAllowList()));
+      CHECK(!sharedCachePathIsAllowListed("/usr/lib/libexpat.dylib", sharedCacheAllowList()));   // an alias is not the canonical name
 
       // Full matrix. Columns: split, inCache, existsOnDisk, allow-listed.
       struct Row { bool split, inCache, disk, listed; SharedCacheLoadSource want; };
