@@ -75,6 +75,18 @@ struct SplitCacheMapStats {
 // appending each suffix to that path) privately at its preferred address. Not called by dyld yet.
 bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLoadInfo* results, SplitCacheMapStats* stats,
                           SplitCacheAuthMode authMode = kSplitCacheAuthSign);
+
+// The architecture part of the split cache's main file name for a main executable (dyld_shared_cache_<name>), or
+// nullptr when no cache exists for it. Subtype flag bits are ignored. x86_64 has a name but no split mapper.
+const char* splitCacheArchName(uint32_t cputype, uint32_t cpusubtype);
+
+// nullptr when dir is usable as a cache directory (absolute, no control characters, short enough), else why not.
+const char* splitCacheDirError(const char* dir);
+
+// Writes the main cache file's path (dir, a separator unless dir ends in one, the cache name) into path.
+// nullptr on success, else why it cannot be built: a bad dir, an architecture without a cache or
+// without split mapper support, or a path longer than pathSize.
+const char* splitCacheMainFilePath(const char* dir, uint32_t cputype, uint32_t cpusubtype, char* path, size_t pathSize);
 #endif
 
 

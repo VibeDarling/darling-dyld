@@ -1629,6 +1629,58 @@ bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLo
     reservation.keep();
     return true;
 }
+// The longest directory accepted: the main file name and a sub-cache suffix must still fit in SharedCacheLoadInfo::path.
+static const size_t kSplitCacheDirMaxLength = 200;
+
+const char* splitCacheArchName(uint32_t cputype, uint32_t cpusubtype)
+{
+    const uint32_t subtype = cpusubtype & ~CPU_SUBTYPE_MASK;
+    if ( cputype == CPU_TYPE_ARM64 ) {
+        if ( subtype == CPU_SUBTYPE_ARM64E )
+            return "arm64e";
+        if ( (subtype == CPU_SUBTYPE_ARM64_ALL) || (subtype == CPU_SUBTYPE_ARM64_V8) )
+            return "arm64";
+        return nullptr;
+    }
+    if ( cputype == CPU_TYPE_X86_64 )
+        return "x86_64";
+    return nullptr;
+}
+
+const char* splitCacheDirError(const char* dir)
+{
+    if ( dir == nullptr )
+        return "no directory given";
+    const size_t length = strnlen(dir, kSplitCacheDirMaxLength + 1);
+    if ( length == 0 )
+        return "the directory is empty";
+    if ( dir[0] != '/' )
+        return "the directory is not an absolute path";
+    if ( length > kSplitCacheDirMaxLength )
+        return "the directory path is too long";
+    for (size_t i = 0; i != length; ++i) {
+        if ( ((unsigned char)dir[i] < 0x20) || (dir[i] == 0x7f) )
+            return "the directory path contains a control character";
+    }
+    return nullptr;
+}
+
+const char* splitCacheMainFilePath(const char* dir, uint32_t cputype, uint32_t cpusubtype, char* path, size_t pathSize)
+{
+    if ( const char* error = splitCacheDirError(dir) )
+        return error;
+    const char* arch = splitCacheArchName(cputype, cpusubtype);
+    if ( arch == nullptr )
+        return "the main executable's architecture has no dyld shared cache";
+    if ( cputype == CPU_TYPE_X86_64 )
+        return "the split cache mapper does not support x86_64 caches";
+    const size_t dirLength = strlen(dir);
+    const char* separator = (dir[dirLength - 1] == '/') ? "" : "/";
+    if ( (strlcpy(path, dir, pathSize) >= pathSize) || (strlcat(path, separator, pathSize) >= pathSize)
+      || (strlcat(path, DYLD_SHARED_CACHE_BASE_NAME, pathSize) >= pathSize) || (strlcat(path, arch, pathSize) >= pathSize) )
+        return "the cache file path is too long";
+    return nullptr;
+}
 #endif // DARLING && !TARGET_OS_SIMULATOR
 
 
