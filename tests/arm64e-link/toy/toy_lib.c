@@ -28,4 +28,7 @@ struct vtable {
 struct vtable lib_vtable = {fn_a, fn_d, fn_e};
 
 int *plain_ptr = &lib_value;
+
+// 16-character segment and section names fill the char[16] fields with no NUL.
+int *sixteen_ptr __attribute__((section("__TOY_SEGMENT_16,__toy_sixteen_ab"))) = &lib_value;
 fn_t plain_fn = fn_c;
