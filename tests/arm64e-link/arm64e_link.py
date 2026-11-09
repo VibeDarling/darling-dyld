@@ -42,6 +42,7 @@ LC_DYLD_INFO = 0x22
 LC_DYLD_INFO_ONLY = 0x80000022
 LC_DYLD_CHAINED_FIXUPS = 0x80000034
 LC_BUILD_VERSION = 0x32
+LC_MAIN = 0x80000028
 DYLIB_ORDINAL_CMDS = (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB,
                       LC_LOAD_UPWARD_DYLIB, LC_LAZY_LOAD_DYLIB)
 PLATFORM_MACOS = 1
@@ -109,6 +110,10 @@ class MachO:
         self.segments = []
         self.dylibs = []          # (command, path) in ordinal order
         self.install_name = None
+        self.install_versions = None   # (current, compatibility) of LC_ID_DYLIB
+        self.dylib_versions = []       # (current, compatibility), parallel to dylibs
+        self.commands = []             # every load command id, in file order
+        self.entry_offset = None       # LC_MAIN entryoff
         self.symtab = None
         self.chained = None       # (dataoff, datasize)
         self.dyld_info = None
@@ -139,6 +144,7 @@ class MachO:
             cmd, cmdsize = self.u("<II", off)
             if cmdsize < 8 or cmdsize % 8 or off + cmdsize > end:
                 self.err("bad load command size 0x%x at 0x%x" % (cmdsize, off))
+            self.commands.append(cmd)
             self._command(cmd, cmdsize, off)
             off += cmdsize
         if off != end:
@@ -174,10 +180,13 @@ class MachO:
             if nameoff >= cmdsize:
                 self.err("dylib command name offset 0x%x outside the command" % nameoff)
             path = self._cstr(off + nameoff, off + cmdsize)
+            versions = self.u("<II", off + 16)
             if cmd == LC_ID_DYLIB:
                 self.install_name = path
+                self.install_versions = versions
             else:
                 self.dylibs.append((cmd, path))
+                self.dylib_versions.append(versions)
         elif cmd == LC_SYMTAB:
             self.symtab = self.u("<IIII", off + 8)
         elif cmd == LC_DYLD_CHAINED_FIXUPS:
@@ -188,6 +197,8 @@ class MachO:
             if cmdsize < 48:
                 self.err("LC_DYLD_INFO command is %d bytes, expected 48" % cmdsize)
             self.dyld_info = self.u("<10I", off + 8)
+        elif cmd == LC_MAIN:
+            self.entry_offset = self.u("<Q", off + 8)[0]
         elif cmd == LC_BUILD_VERSION:
             self.build_platform = self.u("<I", off + 8)[0]
 
@@ -390,6 +401,11 @@ class MachO:
 
 # ---------------------------------------------------------------------- verify
 
+def version_str(v):
+    """Mach-O packed dylib version (xxxx.yy.zz) as text."""
+    return "%d.%d.%d" % (v >> 16, (v >> 8) & 0xFF, v & 0xFF)
+
+
 def load_macho(path):
     try:
         with open(path, "rb") as f:
@@ -433,7 +449,10 @@ def dump(path):
     return {
         "file": os.path.basename(path), "cputype": m.cputype, "cpusubtype": m.cpusubtype,
         "filetype": m.filetype, "image_base": base, "install_name": m.install_name,
-        "load_dylibs": [p for _c, p in m.dylibs], "segments": m.segments,
+        "load_dylibs": [p for _c, p in m.dylibs],
+        "load_dylib_versions": [[version_str(v) for v in vs] for vs in m.dylib_versions],
+        "install_versions": [version_str(v) for v in m.install_versions] if m.install_versions else None,
+        "entry_offset": m.entry_offset, "segments": m.segments,
         "symbols": m.symbols(), "chained": decoded,
     }
 
