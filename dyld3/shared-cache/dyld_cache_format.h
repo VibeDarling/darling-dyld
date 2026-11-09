@@ -79,7 +79,66 @@ struct dyld_cache_header
     uint64_t    otherTrieSize;          // size of trie of dylibs and bundles with dlopen closures
     uint32_t    mappingWithSlideOffset; // file offset to first dyld_cache_mapping_and_slide_info
     uint32_t    mappingWithSlideCount;  // number of dyld_cache_mapping_and_slide_info entries
+    // Split-cache generation (main file plus sub-cache files). Only the offsets asserted below the
+    // struct were verified against a real cache; the other names follow Apple's published layout.
+    uint64_t    dylibsPBLStateArrayAddrUnused;
+    uint64_t    dylibsPBLSetAddr;
+    uint64_t    programsPBLSetPoolAddr;
+    uint64_t    programsPBLSetPoolSize;
+    uint64_t    programTrieAddr;
+    uint32_t    programTrieSize;
+    uint32_t    osVersion;
+    uint32_t    altPlatform;
+    uint32_t    altOsVersion;
+    uint64_t    swiftOptsOffset;
+    uint64_t    swiftOptsSize;
+    uint32_t    subCacheArrayOffset;    // file offset to first dyld_subcache_entry (main file only)
+    uint32_t    subCacheArrayCount;     // number of dyld_subcache_entry entries
+    uint8_t     symbolFileUUID[16];
+    uint64_t    rosettaReadOnlyAddr;
+    uint64_t    rosettaReadOnlySize;
+    uint64_t    rosettaReadWriteAddr;
+    uint64_t    rosettaReadWriteSize;
+    uint32_t    imagesOffsetSplit;      // split caches: file offset (in the main file) of the dyld_cache_image_info table;
+    uint32_t    imagesCountSplit;       // imagesOffset/imagesCount above are then zero
+    uint32_t    cacheSubType;
+    uint32_t    padding2;
+    uint64_t    objcOptsOffset;
+    uint64_t    objcOptsSize;
+    uint64_t    cacheAtlasOffset;
+    uint64_t    cacheAtlasSize;
+    uint64_t    dynamicDataOffset;
+    uint64_t    dynamicDataMaxSize;
+    uint32_t    tproMappingsOffset;
+    uint32_t    tproMappingsCount;
+    uint64_t    functionVariantInfoAddr;
+    uint64_t    functionVariantInfoSize;
+    uint64_t    prewarmingDataOffset;
+    uint64_t    prewarmingDataSize;
 };
+
+#ifdef __cplusplus
+#include <stddef.h>
+static_assert(offsetof(dyld_cache_header, uuid) == 0x58, "dyld_cache_header::uuid");
+static_assert(offsetof(dyld_cache_header, patchInfoAddr) == 0x98, "dyld_cache_header::patchInfoAddr");
+static_assert(offsetof(dyld_cache_header, sharedRegionStart) == 0xe0, "dyld_cache_header::sharedRegionStart");
+static_assert(offsetof(dyld_cache_header, sharedRegionSize) == 0xe8, "dyld_cache_header::sharedRegionSize");
+static_assert(offsetof(dyld_cache_header, mappingWithSlideOffset) == 0x138, "dyld_cache_header::mappingWithSlideOffset");
+static_assert(offsetof(dyld_cache_header, mappingWithSlideCount) == 0x13c, "dyld_cache_header::mappingWithSlideCount");
+static_assert(offsetof(dyld_cache_header, subCacheArrayOffset) == 0x188, "dyld_cache_header::subCacheArrayOffset");
+static_assert(offsetof(dyld_cache_header, subCacheArrayCount) == 0x18c, "dyld_cache_header::subCacheArrayCount");
+static_assert(offsetof(dyld_cache_header, imagesOffsetSplit) == 0x1c0, "dyld_cache_header::imagesOffsetSplit");
+static_assert(offsetof(dyld_cache_header, imagesCountSplit) == 0x1c4, "dyld_cache_header::imagesCountSplit");
+static_assert(sizeof(dyld_cache_header) == 0x228, "dyld_cache_header size");
+
+// The main file of a split cache: its header has the split fields and lists the images there (a legacy
+// header with a grown mappingOffset has zeros in them). Such a file holds anywhere from one mapping up.
+static inline bool dyld_cache_header_is_split(const dyld_cache_header& header)
+{
+    return header.mappingOffset >= offsetof(dyld_cache_header, imagesCountSplit) + sizeof(header.imagesCountSplit)
+        && header.imagesCountSplit != 0;
+}
+#endif
 
 // Uncomment this and check the build errors for the current mapping offset to check against when adding new fields.
 // template<size_t size> class A { int x[-size]; }; A<sizeof(dyld_cache_header)> a;
@@ -110,6 +169,28 @@ struct dyld_cache_mapping_and_slide_info {
     uint32_t    maxProt;
     uint32_t    initProt;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(dyld_cache_mapping_and_slide_info) == 56, "dyld_cache_mapping_and_slide_info size");
+static_assert(offsetof(dyld_cache_mapping_and_slide_info, slideInfoFileOffset) == 24, "slideInfoFileOffset");
+static_assert(offsetof(dyld_cache_mapping_and_slide_info, flags) == 40, "mapping flags");
+static_assert(offsetof(dyld_cache_mapping_and_slide_info, maxProt) == 48, "mapping maxProt");
+#endif
+
+// One entry per sub-cache file in the array at dyld_cache_header::subCacheArrayOffset.
+// The file name is the main file's name plus fileSuffix.
+struct dyld_subcache_entry
+{
+    uint8_t     uuid[16];               // must equal the uuid in the sub-cache file's own header
+    uint64_t    cacheVMOffset;          // vm address of the sub-cache's first mapping minus sharedRegionStart
+    char        fileSuffix[32];         // e.g. ".01", ".02.dylddata"
+};
+
+#ifdef __cplusplus
+static_assert(sizeof(dyld_subcache_entry) == 56, "dyld_subcache_entry size");
+static_assert(offsetof(dyld_subcache_entry, cacheVMOffset) == 16, "cacheVMOffset");
+static_assert(offsetof(dyld_subcache_entry, fileSuffix) == 24, "fileSuffix");
+#endif
 
 struct dyld_cache_image_info
 {
@@ -447,7 +528,49 @@ struct dyld_cache_slide_info4
 #define DYLD_CACHE_SLIDE4_PAGE_EXTRA_END           0x8000  // last chain entry for page
 
 
+// The version 5 of the slide info is used by split caches (arm64e, macOS 13 and later). Each mapping that
+// needs rebasing has one table. A page's chain starts at page_starts[page] (a byte offset into the page,
+// 8-byte aligned) and each entry's "next" field is the distance to the following entry in 8-byte units
+// (0 ends the chain). The slide is zero for a private mapping at the preferred address, so a plain entry
+// becomes (value_add + runtimeOffset) | (high8 << 56). An authenticated entry has the same target and
+// additionally carries the key, address-diversity bit and 16-bit diversity to sign it with.
+struct dyld_cache_slide_info5
+{
+    uint32_t    version;            // currently 5
+    uint32_t    page_size;          // currently 16384
+    uint32_t    page_starts_count;
+    uint64_t    value_add;
+    uint16_t    page_starts[/* page_starts_count */];
+};
 
+#define DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE    0xFFFF    // page has no rebasing
+
+union dyld_cache_slide_pointer5
+{
+    uint64_t  raw;
+    struct {
+        uint64_t    runtimeOffset : 34,   // offset from the shared region start
+                    high8         :  8,   // top byte of the final pointer
+                    unused        : 10,
+                    next          : 11,   // 8-byte strides to the next entry
+                    auth          :  1;   // = 0
+    }         regular;
+
+    struct {
+        uint64_t    runtimeOffset : 34,
+                    diversity     : 16,
+                    addrDiv       :  1,
+                    keyIsData     :  1,   // 0 = IA, 1 = DA
+                    next          : 11,
+                    auth          :  1;   // = 1
+    }         auth;
+};
+
+#ifdef __cplusplus
+static_assert(offsetof(dyld_cache_slide_info5, value_add) == 16, "slide info 5 value_add");
+static_assert(offsetof(dyld_cache_slide_info5, page_starts) == 24, "slide info 5 page_starts");
+static_assert(sizeof(dyld_cache_slide_pointer5) == 8, "slide pointer 5 size");
+#endif
 
 struct dyld_cache_local_symbols_info
 {
