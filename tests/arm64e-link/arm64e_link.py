@@ -118,6 +118,7 @@ class MachO:
         self.chained = None       # (dataoff, datasize)
         self.dyld_info = None
         self.build_platform = None
+        self.build_versions = None     # (minos, sdk) of LC_BUILD_VERSION
         self._parse()
 
     def err(self, msg):
@@ -201,6 +202,7 @@ class MachO:
             self.entry_offset = self.u("<Q", off + 8)[0]
         elif cmd == LC_BUILD_VERSION:
             self.build_platform = self.u("<I", off + 8)[0]
+            self.build_versions = self.u("<II", off + 12)
 
     # -- addresses
     def image_base(self):
@@ -452,7 +454,8 @@ def dump(path):
         "load_dylibs": [p for _c, p in m.dylibs],
         "load_dylib_versions": [[version_str(v) for v in vs] for vs in m.dylib_versions],
         "install_versions": [version_str(v) for v in m.install_versions] if m.install_versions else None,
-        "entry_offset": m.entry_offset, "segments": m.segments,
+        "entry_offset": m.entry_offset,
+        "build_versions": [version_str(v) for v in m.build_versions] if m.build_versions else None, "segments": m.segments,
         "symbols": m.symbols(), "chained": decoded,
     }
 
