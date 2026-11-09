@@ -1,0 +1,9 @@
+# libexpat symbols the PAC-leaf test executable imports (public expat interface only).
+XML_ExpatVersion
+XML_ParserCreate
+XML_SetUserData
+XML_SetElementHandler
+XML_SetCharacterDataHandler
+XML_Parse
+XML_GetErrorCode
+XML_ParserFree
