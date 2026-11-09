@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build and structurally check the H0 test executable and its link-only stubs.
 
-  build_h0.py build --out DIR [--libsystem stub|sdk] [--libz-symbols FILE]
+  build_h0.py build --out DIR [--leaf libz|libexpat] [--libsystem stub|sdk] [--libz-symbols FILE]
   build_h0.py check EXE [--expected FILE]
 
 LD64 (in-tree ld64) comes from the environment; --libsystem sdk also needs SDKROOT.
@@ -30,6 +30,16 @@ STUBS = {
     "libz": ("/usr/lib/libz.1.dylib", "libz_symbols.txt", "1.0.0", "1.2.11", "libz.1.linkonly.dylib"),
     "libsystem": ("/usr/lib/libSystem.B.dylib", "libsystem_symbols.txt", "1.0.0", "1281.0.0",
                   "libSystem.B.linkonly.dylib"),
+    # versions as in the cache's libexpat (compat 7.0.0, current 8.0.0)
+    "libexpat": ("/usr/lib/libexpat.1.dylib", "libexpat_symbols.txt", "7.0.0", "8.0.0",
+                 "libexpat.1.linkonly.dylib"),
+}
+
+# leaf library under test: its program, the executable's name and its expected structure.
+# libz is the H0 test; libexpat is the PAC-leaf test (260 signed function pointers in its data).
+LEAVES = {
+    "libz": {"source": "h0_zlib_main.c", "exe": "h0_zlib_main", "expected": "expected.json"},
+    "libexpat": {"source": "expat_main.c", "exe": "h0_expat_main", "expected": "expected-expat.json"},
 }
 
 
@@ -46,20 +56,20 @@ def build_stub(which, out_dir, symbols_file=None):
     return out
 
 
-def build_exe(out_dir, libz, libsystem, sdkroot=None):
-    out = os.path.join(out_dir, "h0_zlib_main")
-    # libz before libSystem: the order clang's driver gives (-lz, then the implicit -lSystem)
+def build_exe(out_dir, libz, libsystem, sdkroot=None, leaf="libz"):
+    out = os.path.join(out_dir, LEAVES[leaf]["exe"])
+    # the leaf before libSystem: the order clang's driver gives (-lz, then the implicit -lSystem)
     if libsystem == "sdk":
         libs = [libz, "-lSystem"]
         ld_args = ["-syslibroot", sdkroot]
     else:
         libs, ld_args = [libz, libsystem], []
-    rec.build([os.path.join(HERE, "h0_zlib_main.c")], out, kind="exe", cflags=CFLAGS,
+    rec.build([os.path.join(HERE, LEAVES[leaf]["source"])], out, kind="exe", cflags=CFLAGS,
               entry="_main", libs=libs, ld_args=ld_args)
     return out
 
 
-def build_all(out_dir, mode="stub", libz_symbols=None):
+def build_all(out_dir, mode="stub", libz_symbols=None, leaf="libz"):
     sdkroot = None
     if mode == "sdk":
         sdkroot = os.environ.get("SDKROOT")
@@ -68,9 +78,9 @@ def build_all(out_dir, mode="stub", libz_symbols=None):
     elif mode != "stub":
         raise rec.RecipeError("libsystem mode must be stub or sdk, not %r" % mode)
     os.makedirs(out_dir, exist_ok=True)
-    libz = build_stub("libz", out_dir, libz_symbols)
+    libz = build_stub(leaf, out_dir, libz_symbols)
     libsystem = build_stub("libsystem", out_dir) if mode == "stub" else "sdk"
-    return {"libz": libz, "libsystem": libsystem, "exe": build_exe(out_dir, libz, libsystem, sdkroot)}
+    return {"libz": libz, "libsystem": libsystem, "exe": build_exe(out_dir, libz, libsystem, sdkroot, leaf)}
 
 
 # ---------------------------------------------------------------------- checks
@@ -180,18 +190,19 @@ def main(argv):
     b = sub.add_parser("build")
     b.add_argument("--out", required=True)
     b.add_argument("--libsystem", choices=("stub", "sdk"), default="stub")
-    b.add_argument("--libz-symbols")
+    b.add_argument("--libz-symbols", help="symbol list of the leaf stub (default: the leaf's own list)")
+    b.add_argument("--leaf", choices=sorted(LEAVES), default="libz")
     c = sub.add_parser("check")
     c.add_argument("exe")
     c.add_argument("--expected")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "build":
-            paths = build_all(a.out, a.libsystem, a.libz_symbols)
-            problems = check_stub(paths["libz"], "libz", a.libz_symbols)
+            paths = build_all(a.out, a.libsystem, a.libz_symbols, a.leaf)
+            problems = check_stub(paths["libz"], a.leaf, a.libz_symbols)
             if a.libsystem == "stub":
                 problems += check_stub(paths["libsystem"], "libsystem")
-            problems += check_exe(paths["exe"])
+            problems += check_exe(paths["exe"], os.path.join(HERE, LEAVES[a.leaf]["expected"]))
             if problems:
                 raise rec.RecipeError("structural checks failed:\n  " + "\n  ".join(problems))
             report(paths["exe"])
