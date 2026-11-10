@@ -32,6 +32,9 @@
 #include <unordered_map>
 #include <vector>
 
+extern "C" void *__cxa_allocate_exception(size_t);
+extern "C" void __cxa_free_exception(void *);
+
 #define STR_(x) #x
 #define STR(x) STR_(x)
 #define REQUIRE(c) do { if (!(c)) return fail("line " STR(__LINE__) ": " #c); } while (0)
@@ -415,11 +418,49 @@ int static_local_init_throws() {
     PASS();
 }
 
+// Diagnostics x1..x8 bisect the c3 throw failure with the public C++ runtime API (L4 T5, not part of the plan's 28
+// checks). They are recorded only: the finding is which of them fault, not that they pass.
+int x1_get_terminate() { REQUIRE(std::get_terminate() != nullptr); PASS(); }
+int x2_set_get_terminate() {
+    std::terminate_handler h = std::get_terminate();
+    std::terminate_handler old = std::set_terminate(h);
+    REQUIRE(old == h && std::get_terminate() == h);
+    PASS();
+}
+int x3_allocate_free_exception() {
+    void *p = __cxa_allocate_exception(8);
+    REQUIRE(p != nullptr);
+    __cxa_free_exception(p);
+    PASS();
+}
+typedef void (*init_primary_fn)(void *, std::type_info *, void (*)(void *));
+void x_dtor(void *) {}
+// __cxa_init_primary_exception is not in every libc++abi's export list, so it is found by name
+int x_init_primary(std::type_info *ti, void (*dest)(void *)) {
+    init_primary_fn f = (init_primary_fn)dlsym(RTLD_DEFAULT, "__cxa_init_primary_exception");
+    if (!f) return fail("dlsym(__cxa_init_primary_exception) failed");
+    f(__cxa_allocate_exception(8), ti, dest);
+    PASS();
+}
+int x4_init_primary_null_dtor() { return x_init_primary((std::type_info *)&typeid(int), nullptr); }
+int x5_init_primary_signed_dtor() { return x_init_primary((std::type_info *)&typeid(int), x_dtor); }
+int x6_init_primary_stripped_dtor() { return x_init_primary((std::type_info *)&typeid(int), (void (*)(void *))L4_STRIP(x_dtor)); }
+int x7_init_primary_class_typeinfo() { return x_init_primary((std::type_info *)&typeid(std::runtime_error), x_dtor); }
+int x8_get_unexpected_via_dlsym() {
+    typedef void *(*fn)(void);
+    fn f = (fn)dlsym(RTLD_DEFAULT, "_ZSt14get_unexpectedv");
+    if (!f) return fail("dlsym(get_unexpected) failed");
+    REQUIRE(f() != nullptr);
+    PASS();
+}
+
 #define EXP_STD "c1=ok,c2=any,c3=ok,native=ok"
 // not from the cache is a recorded fact (failed), never a fault
 #define EXP_CACHE "c1=failed,c2=failed,c3=ok,native=failed"
 // the in-tree ld64 loses the vtable address point of an authenticated typeinfo vtable bind
 #define EXP_ADDEND "c1=ok,c2=any,c3=any,native=ok"
+// recorded only, in every configuration
+#define EXP_DIAG "c1=any,c2=any,c3=any,native=any"
 
 }  // namespace
 
@@ -453,6 +494,14 @@ const struct check checks[] = {
     {"q5_exit_flushes_cout", exit_flushes_cout, EXP_STD ";need=L4-FLUSHED-BY-EXIT"},
     {"q6_static_local_contention", static_local_contention, EXP_STD},
     {"q6_static_local_init_throws", static_local_init_throws, EXP_STD},
+    {"x1_get_terminate", x1_get_terminate, EXP_DIAG},
+    {"x2_set_get_terminate", x2_set_get_terminate, EXP_DIAG},
+    {"x3_allocate_free_exception", x3_allocate_free_exception, EXP_DIAG},
+    {"x4_init_primary_null_dtor", x4_init_primary_null_dtor, EXP_DIAG},
+    {"x5_init_primary_signed_dtor", x5_init_primary_signed_dtor, EXP_DIAG},
+    {"x6_init_primary_stripped_dtor", x6_init_primary_stripped_dtor, EXP_DIAG},
+    {"x7_init_primary_class_typeinfo", x7_init_primary_class_typeinfo, EXP_DIAG},
+    {"x8_get_unexpected_via_dlsym", x8_get_unexpected_via_dlsym, EXP_DIAG},
 };
 const int nchecks = sizeof checks / sizeof checks[0];
 }

@@ -47,21 +47,30 @@ src = File.read(File.join(HERE, 'l4_checks.cpp'))
 table = src[/const struct check checks\[\] = \{(.*?)\n\};/m, 1].to_s
 rows = table.scan(/\{"([a-z0-9_]+)", (\w+), ([A-Z_]+)((?: ";need=[^"]*")?)\}/)
 names = rows.map(&:first)
-EXPECTED_COUNT = 28
+# the plan's 28 checks (q1..q6) and the 8 diagnostics x1..x8 that bisect the c3 throw failure, recorded only
+PLAN_COUNT = 28
+DIAG_COUNT = 8
+EXPECTED_COUNT = PLAN_COUNT + DIAG_COUNT
+plan_names = names.select { |n| n.start_with?('q') }
+diag_names = names.select { |n| n.start_with?('x') }
 check "the check table lists #{EXPECTED_COUNT} checks with unique names", rows.size == EXPECTED_COUNT && names.uniq.size == EXPECTED_COUNT, rows.size
-check 'checks are grouped q1..q6 in order and every Q4 group has a check',
-      names.map { |n| n[/\Aq(\d)_/, 1].to_i } == names.map { |n| n[/\Aq(\d)_/, 1].to_i }.sort &&
-      names.map { |n| n[/\Aq(\d)_/, 1] }.uniq == %w[1 2 3 4 5 6]
+check "#{PLAN_COUNT} checks are grouped q1..q6 in order and every Q4 group has a check, followed by the #{DIAG_COUNT} diagnostics x1..x8",
+      plan_names.size == PLAN_COUNT && names.first(PLAN_COUNT) == plan_names && diag_names.size == DIAG_COUNT &&
+      diag_names.map { |n| n[/\Ax(\d)_/, 1] } == %w[1 2 3 4 5 6 7 8] &&
+      plan_names.map { |n| n[/\Aq(\d)_/, 1].to_i } == plan_names.map { |n| n[/\Aq(\d)_/, 1].to_i }.sort &&
+      plan_names.map { |n| n[/\Aq(\d)_/, 1] }.uniq == %w[1 2 3 4 5 6]
 rows.each_with_index do |(name, fn, _exp, _need), i|
   body = src[/^int #{fn}\(\) \{.*?^\}/m].to_s
   # a check may report through a helper: the exit-path check from the atexit handler it registers first (it
   # runs last), the served-from-cache checks from the function that measures
   helper = { 'atexit_and_static_destructor' => 'void exit_first_registered', 'served_libcxx' => 'int served_by_cache',
-             'served_cxa_throw' => 'int served_by_cache' }[fn]
+             'served_cxa_throw' => 'int served_by_cache' }.fetch(fn) { fn.start_with?('x') && body.include?('x_init_primary(') ? 'int x_init_primary' : nil }
   body += src[/^#{helper}\(.*?^\}/m].to_s if helper
   check "check #{i + 1} (#{name}) reports through PASS() or ok_mark(g_check)", body.match?(/PASS\(\)|ok_mark\(g_check\)/), fn
 end
 macros = src.scan(/^#define (EXP_\w+) "([^"]*)"/).to_h
+check 'the diagnostics are recorded only: every configuration says any',
+      rows.select { |r| r[0].start_with?('x') }.all? { |r| macros[r[2]] == 'c1=any,c2=any,c3=any,native=any' }
 check 'every expectation macro names c1, c2, c3 and native', macros.size >= 3 &&
       macros.values.all? { |v| %w[c1 c2 c3 native].all? { |c| v.include?("#{c}=") } }, macros.inspect
 user_class = names.select { |n| n.include?('known_ld64_addend') }
@@ -297,6 +306,9 @@ Dir.mktmpdir('l4-probe-') do |tmp|
     ['exit skips the flush (_Exit)', [["    ok_mark(g_check);\n    std::exit(0);\n}\n\n// ----", "    ok_mark(g_check);\n    std::_Exit(0);\n}\n\n// ----"]], 'q5_exit_flushes_cout', 'failed'],
     ['the function-local static is not static (every thread initialises)', [['static Lazy<I> x; return x.v;', 'Lazy<I> x; return x.v;']], 'q6_static_local_contention', 'failed'],
     ['the first initialisation of the guarded static does not throw', [['g_flaky_attempts++ == 0', 'g_flaky_attempts++ == 99']], 'q6_static_local_init_throws', 'failed'],
+    ['the diagnostic that allocates and frees an exception sees no memory', [['REQUIRE(p != nullptr);', 'REQUIRE(p == nullptr);']], 'x3_allocate_free_exception', 'failed'],
+    ['the diagnostic that sets the terminate handler sees another one come back', [['REQUIRE(old == h && std::get_terminate() == h);', 'REQUIRE(old != h && std::get_terminate() == h);']], 'x2_set_get_terminate', 'failed'],
+    ['the diagnostic that finds get_unexpected by name finds nothing', [['REQUIRE(f() != nullptr);', 'REQUIRE(f() == nullptr);']], 'x8_get_unexpected_via_dlsym', 'failed'],
     ['the cout line is not printed (the required output is missing)', [['std::cout << "L4-COUT-LINE " << 42 << \' \' << 1.25 << std::endl;', 'std::cout << "x" << std::endl;']], 'q3_cout_and_cerr', 'failed'],
     ['the harness expectation for a check says faulted while it passes (EXPECT-MISMATCH)',
      [['#define EXP_STD "c1=ok,c2=any,c3=ok,native=ok"', '#define EXP_STD "c1=ok,c2=any,c3=ok,native=faulted"']], :all_mismatch, nil]
@@ -323,7 +335,7 @@ Dir.mktmpdir('l4-probe-') do |tmp|
     if target == :all_mismatch
       mism = mout.scan(/^RESULT \d+ (\S+) .*EXPECT-MISMATCH/).flatten
       # every check on EXP_STD (not the cache facts, not the known_ld64_addend ones) now expects faulted
-      ok = mism.size == names.size - 2 - user_class.size && mism.none? { |n| n.start_with?('q1_') || n.include?('known_') }
+      ok = mism.size == plan_names.size - 2 - user_class.size && mism.none? { |n| n.start_with?('q1_') || n.include?('known_') }
       check "probe #{i + 1} killed by the expectation table: #{desc}", ok, mism.size
       killed += 1 if ok
       next
