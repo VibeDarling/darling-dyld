@@ -9,9 +9,16 @@ module AdapterSupport
   SHIM_LOADED = <<~H
     #pragma once
     #include <stdint.h>
-    namespace dyld3 { struct MachOLoaded { struct ChainedFixupPointerOnDisk { struct Arm64e {
-      static uint64_t signPointer(uint64_t unsignedAddr, void* loc, bool addrDiv, uint16_t diversity, uint8_t key);
-    }; }; }; }
+    struct linkedit_data_command { uint32_t cmd, cmdsize, dataoff, datasize; };
+    struct Diagnostics;
+    namespace dyld3 { struct MachOLoaded {
+      struct ChainedFixupPointerOnDisk { struct Arm64e {
+        static uint64_t signPointer(uint64_t unsignedAddr, void* loc, bool addrDiv, uint16_t diversity, uint8_t key);
+      }; };
+      struct LayoutInfo { uintptr_t slide, textUnslidVMAddr, linkeditUnslidVMAddr; uint32_t linkeditFileOffset, linkeditFileSize, linkeditSegIndex, lastSegIndex; };
+      struct LinkEditInfo { const linkedit_data_command* functionStarts; LayoutInfo layout; };
+      void getLinkEditPointers(Diagnostics&, LinkEditInfo&) const;
+    }; }
   H
   SHIM_MACHINE = <<~H
     #pragma once
