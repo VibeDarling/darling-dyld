@@ -113,6 +113,20 @@ private:
     uint8_t*    done = nullptr;
 };
 
+// Memory that reads in place and writes through /proc/self/mem, so a page that holds a neighbour's running code is
+// never unprotected. Writing a private file mapping this way copies the page, never the file.
+class ProcSelfMemory {
+public:
+    ProcSelfMemory();
+    ~ProcSelfMemory();
+    ProcSelfMemory(const ProcSelfMemory&) = delete;
+    ProcSelfMemory& operator=(const ProcSelfMemory&) = delete;
+    bool   ok() const { return fd >= 0; }
+    Memory memory();
+private:
+    int fd;
+};
+
 }
 }
 

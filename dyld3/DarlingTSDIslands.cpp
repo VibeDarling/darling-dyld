@@ -1,7 +1,9 @@
 #include "DarlingTSDIslands.h"
 
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 namespace dyld3 {
 namespace darling_tsd {
@@ -291,6 +293,47 @@ const char* Patcher::patchImage(uintptr_t machHeader, const Memory& memory, Patc
     if ( statsOut != nullptr )
         *statsOut = stats;
     return nullptr;
+}
+
+ProcSelfMemory::ProcSelfMemory() : fd(::open("/proc/self/mem", O_RDWR | O_CLOEXEC))
+{
+}
+
+ProcSelfMemory::~ProcSelfMemory()
+{
+    if ( fd >= 0 )
+        ::close(fd);
+}
+
+static bool procRead(void*, uintptr_t address, void* out, size_t length)
+{
+    memcpy(out, (const void*)address, length);
+    return true;
+}
+
+static bool procWrite(void* context, uintptr_t address, const void* data, size_t length)
+{
+    const int fd = *(const int*)context;
+    const uint8_t* bytes = (const uint8_t*)data;
+    while ( length != 0 ) {
+        const ssize_t written = ::pwrite(fd, bytes, length, (off_t)address);
+        if ( written <= 0 )
+            return false;
+        bytes += written;
+        address += (size_t)written;
+        length -= (size_t)written;
+    }
+    return true;
+}
+
+static void procSync(void*, uintptr_t address, size_t length)
+{
+    __builtin___clear_cache((char*)address, (char*)address + length);
+}
+
+Memory ProcSelfMemory::memory()
+{
+    return { &fd, procRead, procWrite, procSync };
 }
 
 }
