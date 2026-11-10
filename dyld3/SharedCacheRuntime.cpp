@@ -1643,6 +1643,11 @@ const char* splitCacheArchName(uint32_t cputype, uint32_t cpusubtype)
     return nullptr;
 }
 
+bool splitCacheArchHasMapper(uint32_t cputype, uint32_t cpusubtype)
+{
+    return (cputype != CPU_TYPE_X86_64) && (splitCacheArchName(cputype, cpusubtype) != nullptr);
+}
+
 const char* splitCacheDirError(const char* dir)
 {
     if ( dir == nullptr )

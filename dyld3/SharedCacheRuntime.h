@@ -84,6 +84,10 @@ bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLo
 // nullptr when no cache exists for it. Subtype flag bits are ignored. x86_64 has a name but no split mapper.
 const char* splitCacheArchName(uint32_t cputype, uint32_t cpusubtype);
 
+// True when the split mapper can map a cache for this architecture. False for x86_64, which has a cache name but
+// no mapper, and for architectures with no cache at all; a process of such an architecture runs without a cache.
+bool splitCacheArchHasMapper(uint32_t cputype, uint32_t cpusubtype);
+
 // nullptr when dir is usable as a cache directory (absolute, no control characters, short enough), else why not.
 const char* splitCacheDirError(const char* dir);
 

@@ -4445,16 +4445,16 @@ static const char* basename(const char* path)
 
 #ifdef DARLING
 // The user asked for this cache with DYLD_SHARED_CACHE_SPLIT_DIR, so a failure to map it must not leave the process running without it.
-// The one exception is a directory that has no cache for this process's architecture (macOS ships an arm64e cache only, and the
-// variable reaches every process): that process runs without a cache, and false is returned. No message names the host's
-// directory, only the files in it.
+// The exceptions are a process whose architecture has no split mapper (x86_64, i386: the variable reaches every child) and a
+// directory that has no cache file for this process's architecture (macOS ships an arm64e cache only): that process runs
+// without a cache, and false is returned. Neither has any use for the policy, so only a process that maps a cache reads it.
+// No message names the host's directory, only the files in it.
 static bool mapSplitSharedCache(const macho_header* mainExecutableMH)
 {
-	// a bad policy is fatal even for a process that then maps nothing: the setup is wrong whatever the architecture
-	if ( sSharedCacheSplitPolicy != nullptr ) {
-		size_t errorLine;
-		if ( const char* error = dyld3::loadSplitCachePolicy(sSharedCacheSplitPolicy, &errorLine) )
-			halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_POLICY '%s': %s (line %lu)\n", basename(sSharedCacheSplitPolicy), error, (unsigned long)errorLine));
+	if ( !dyld3::splitCacheArchHasMapper(mainExecutableMH->cputype, mainExecutableMH->cpusubtype) ) {
+		if ( gLinkContext.verboseMapping )
+			dyld::log("dyld: no split dyld cache mapper for this architecture, running without a split dyld cache\n");
+		return false;
 	}
 	char path[sizeof(sSharedCacheLoadInfo.path)];
 	if ( const char* error = dyld3::splitCacheMainFilePath(sSharedCacheSplitDir, mainExecutableMH->cputype, mainExecutableMH->cpusubtype, path, sizeof(path)) )
@@ -4463,6 +4463,11 @@ static bool mapSplitSharedCache(const macho_header* mainExecutableMH)
 		if ( gLinkContext.verboseMapping )
 			dyld::log("dyld: DYLD_SHARED_CACHE_SPLIT_DIR has no %s, running without a split dyld cache\n", basename(path));
 		return false;
+	}
+	if ( sSharedCacheSplitPolicy != nullptr ) {
+		size_t errorLine;
+		if ( const char* error = dyld3::loadSplitCachePolicy(sSharedCacheSplitPolicy, &errorLine) )
+			halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_POLICY '%s': %s (line %lu)\n", basename(sSharedCacheSplitPolicy), error, (unsigned long)errorLine));
 	}
 	dyld3::SplitCacheMapStats stats;
 	if ( !dyld3::mapSplitCachePrivate(path, gLinkContext.verboseMapping, &sSharedCacheLoadInfo, &stats) )
