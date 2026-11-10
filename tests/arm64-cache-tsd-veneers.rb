@@ -17,6 +17,9 @@ Dir.mktmpdir('arm64-tsd-veneers-') do |dir|
  #include <ucontext.h>
  #include <stdio.h>
  #include <unistd.h>
+ #include <string.h>
+ #include "DarlingTSDIslands.h"
+ namespace darling_tsd = dyld3::darling_tsd;
  static void sys_icache_invalidate(void* p,size_t n) { __builtin___clear_cache((char*)p,(char*)p+n); }
  #{helper}
  static thread_local void* slot;
@@ -94,7 +97,7 @@ Dir.mktmpdir('arm64-tsd-veneers-') do |dir|
    puts("PASS production veneers: 400000 native-slot reads, per-thread null fallback, invalid metadata, branch range and occupied mapping");
  }
  CPP
- out,status=Open3.capture2e('c++','-std=c++11','-O2','-pthread',"#{dir}/test.cpp",'-o',"#{dir}/test")
+ out,status=Open3.capture2e('c++','-std=c++11','-O2','-pthread','-I',"#{root}/dyld3","#{dir}/test.cpp","#{root}/dyld3/DarlingTSDIslands.cpp",'-o',"#{dir}/test")
  abort out unless status.success?
  out,status=Open3.capture2e("#{dir}/test"); puts out; abort 'veneer test failed' unless status.success?
 end

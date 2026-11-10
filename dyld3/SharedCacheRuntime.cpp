@@ -998,16 +998,9 @@ class DarlingTSDReadVeneers {
     unsigned long slot = 0;
     bool committed = false;
     static const size_t capacity = 1024 * 1024;
-    static bool branch(uintptr_t from, uintptr_t to, uint32_t& encoded) {
-        int64_t delta = (int64_t)to - (int64_t)from;
-        if ((delta & 3) || delta < -(1LL << 27) || delta >= (1LL << 27))
-            return false;
-        encoded = 0x14000000U | ((uint32_t)(delta >> 2) & 0x03FFFFFFU);
-        return true;
-    }
 public:
     DarlingTSDReadVeneers(uintptr_t cacheStart, unsigned long offset) : slot(offset) {
-        if (offset < 16 || offset > 32760 || (offset & 7) || cacheStart <= capacity)
+        if (!darling_tsd::isValidSlotOffset(offset) || cacheStart <= capacity)
             return;
         void* desired = (void*)(cacheStart - capacity);
         void* mapped = ::mmap(desired, capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -1022,18 +1015,17 @@ public:
     }
     uint32_t translate(uint32_t reg, uintptr_t original) {
         if (reg == 31) return 0xD503201FU; // MRS XZR has no observable result
-        uint32_t entryBranch, returnBranch;
-        if (!memory || used + 20 > capacity
-            || !branch(original, (uintptr_t)memory + used, entryBranch)
-            || !branch((uintptr_t)memory + used + 16, original + 4, returnBranch))
+        if (!memory || used + darling_tsd::kVeneerBytes > capacity)
             return 0x0000DA00U | reg;
-        uint32_t* code = (uint32_t*)((uintptr_t)memory + used);
-        code[0] = 0xD53BD040U | reg; // mrs Xd, TPIDR_EL0
-        code[1] = 0xF9400000U | ((uint32_t)(slot / 8) << 10) | (reg << 5) | reg;
-        code[2] = 0xB5000040U | reg; // cbnz Xd, +8 (preserves NZCV)
-        code[3] = 0x0000DA00U | reg; // uninitialized slot: existing TSD trap
-        code[4] = returnBranch;
-        used += 20;
+        const uintptr_t veneer = (uintptr_t)memory + used;
+        bool ok = true;
+        uint32_t code[5];
+        const uint32_t entryBranch = darling_tsd::encodeBranch(original, veneer, &ok);
+        darling_tsd::encodeVeneer(reg, slot, veneer, original, code, &ok);
+        if (!ok)
+            return 0x0000DA00U | reg;
+        memcpy((void*)veneer, code, sizeof(code));
+        used += darling_tsd::kVeneerBytes;
         return entryBranch;
     }
     size_t count() const { return used / 20; }
