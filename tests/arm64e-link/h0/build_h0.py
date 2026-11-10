@@ -33,6 +33,8 @@ STUBS = {
     # versions as in the cache's libexpat (compat 7.0.0, current 8.0.0)
     "libexpat": ("/usr/lib/libexpat.1.dylib", "libexpat_symbols.txt", "7.0.0", "8.0.0",
                  "libexpat.1.linkonly.dylib"),
+    # symbols file given by the caller (abi/libcxxabi_symbols.txt, the ABI probe's stub)
+    "libc++abi": ("/usr/lib/libc++abi.dylib", None, "1.0.0", "1.0.0", "libc++abi.linkonly.dylib"),
 }
 
 # leaf library under test: its program, the executable's name and its expected structure.
@@ -43,16 +45,19 @@ LEAVES = {
 }
 
 
-def build_stub(which, out_dir, symbols_file=None):
+def build_stub(which, out_dir, symbols_file=None, builder=None):
+    """Build a link-only stub; `builder` replaces the arm64e recipe's build (the ABI probe's plain
+    arm64 control passes its own, with the same keyword arguments)."""
     install, symbols, compat, current, fname = STUBS[which]
     names = gen_stub.read_symbols(symbols_file or os.path.join(HERE, symbols))
     out = os.path.join(out_dir, fname)
     with tempfile.TemporaryDirectory(prefix="h0-stub-") as tmp:
         inc = os.path.join(tmp, "symbols.inc")
         gen_stub.write_inc(names, inc)
-        rec.build([os.path.join(HERE, "libz_stub.c")], out, kind="dylib",
-                  cflags=CFLAGS + ['-DSTUB_SYMBOLS="%s"' % inc], install_name=install,
-                  ld_args=["-compatibility_version", compat, "-current_version", current])
+        (builder or rec.build)(
+            [os.path.join(HERE, "libz_stub.c")], out, kind="dylib",
+            cflags=CFLAGS + ['-DSTUB_SYMBOLS="%s"' % inc], install_name=install,
+            ld_args=["-compatibility_version", compat, "-current_version", current])
     return out
 
 
