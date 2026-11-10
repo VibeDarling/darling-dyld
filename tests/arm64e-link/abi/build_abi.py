@@ -19,24 +19,28 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 sys.path[:0] = [HERE, os.path.dirname(HERE), os.path.join(os.path.dirname(HERE), "h0")]
 import arm64e_link as rec  # noqa: E402  (the 3.3a recipe, reused as is)
-import gen_stub  # noqa: E402  (h0's symbol list reader)
+import build_h0  # noqa: E402  (h0's link-only stub builder)
 
 CFLAGS = ["-ffreestanding", "-fno-builtin", "-fno-stack-protector", "-O1", "-fblocks", "-fexceptions",
           "-nostdinc++", "-Wno-unused-command-line-argument"]
 SOURCES = ["abi_harness.c", "abi_checks.c", "abi_cxx.cpp"]
-STUB_TEMPLATE = os.path.join(os.path.dirname(HERE), "h0", "libz_stub.c")
 CXXABI = "/usr/lib/libc++abi.dylib"
 ARCHS = ("arm64e", "arm64")
 # arm64e variants that remove kinds of signing from the whole executable (mutation probes for the
-# C++ checks, where no source-level strip exists): name -> (extra compile flags, also rewrite every
-# authenticated bind outside __auth_got as a plain bind). noret: return addresses unsigned.
-# noret_unsigned: that plus the personality GOT slot and the typeinfo vtable pointers unsigned.
-# nosign: that plus no function-pointer or vtable-pointer signing in the code the compiler emits.
+# C++ checks, where no source-level strip exists): name -> (extra compile flags, rewrite every
+# authenticated bind outside __auth_got as a plain bind, put the vtable address point offset back on
+# the typeinfo vtable binds). noret: return addresses unsigned. noret_unsigned: that plus the
+# personality GOT slot and the typeinfo vtable pointers unsigned. noret_unsigned_addend: that plus
+# the +16 the in-tree ld64 drops from authenticated binds (README, check 13). nosign: no signed
+# return addresses, function or vtable pointers from the compiler.
 VARIANTS = {
-    "noret": (["-fno-ptrauth-returns"], False),
-    "noret_unsigned": (["-fno-ptrauth-returns"], True),
-    "nosign": (["-fno-ptrauth-returns", "-fno-ptrauth-calls"], True),
+    "noret": (["-fno-ptrauth-returns"], False, False),
+    "noret_unsigned": (["-fno-ptrauth-returns"], True, False),
+    "noret_unsigned_addend": (["-fno-ptrauth-returns"], True, True),
+    "nosign": (["-fno-ptrauth-returns", "-fno-ptrauth-calls"], True, False),
 }
+VTABLE_PREFIX = "__ZTV"
+VTABLE_ADDRESS_POINT = 16     # Itanium C++ ABI: two pointers (offset-to-top, typeinfo) precede it
 AUTH_GOT = "__DATA_CONST,__auth_got"
 # calls into the plain libs the probe is about; every one must be imported
 REQUIRED_IMPORTS = {
@@ -44,11 +48,14 @@ REQUIRED_IMPORTS = {
                   "_qsort", "_dlsym", "_dispatch_async", "_dispatch_once", "__dyld_register_func_for_add_image",
                   "__Unwind_Resume", "__NSConcreteStackBlock", "__NSConcreteGlobalBlock", "_sigaction"],
     "libc++abi": ["___cxa_throw", "___gxx_personality_v0", "__ZTIi",
-                  "__ZTVN10__cxxabiv120__si_class_type_infoE"],
+                  "__ZTVN10__cxxabiv120__si_class_type_infoE", "___cxa_allocate_exception"],
 }
 # arm64e return-address and function-pointer instructions; a plain build has none
 PAC_WORDS = {0xD503233F: "paciasp", 0xD503237F: "pacibsp", 0xD50323BF: "autiasp", 0xD50323FF: "autibsp",
              0xD65F0BFF: "retaa", 0xD65F0FFF: "retab"}
+# (mask, value, name): pointer signing and authenticated calls with a register operand
+PAC_PATTERNS = [(0xFFFFFFE0, 0xDAC123E0, "paciza"), (0xFFFFFC1F, 0xD63F081F, "blraaz"),
+                (0xFFFFFC00, 0xD73F0800, "blraa")]
 
 
 # clang would take SDKROOT as its own sysroot (and warn that it is the wrong platform); only the
@@ -87,24 +94,18 @@ def build_plain(sources, out, kind="exe", cflags=(), install_name=None, entry=No
 
 
 def build_cxxabi_stub(arch, out_dir):
-    out = os.path.join(out_dir, "libc++abi.%s.linkonly.dylib" % arch)
-    names = gen_stub.read_symbols(os.path.join(HERE, "libcxxabi_symbols.txt"))
-    with tempfile.TemporaryDirectory(prefix="abi-stub-") as tmp:
-        inc = os.path.join(tmp, "symbols.inc")
-        gen_stub.write_inc(names, inc)
-        flags = ["-ffreestanding", "-fno-builtin", "-fno-stack-protector", "-O1", '-DSTUB_SYMBOLS="%s"' % inc]
-        versions = ["-compatibility_version", "1.0.0", "-current_version", "1.0.0"]
-        if arch == "arm64e":
-            rec.build([STUB_TEMPLATE], out, kind="dylib", cflags=flags, install_name=CXXABI, ld_args=versions)
-        else:
-            build_plain([STUB_TEMPLATE], out, kind="dylib", cflags=flags, install_name=CXXABI, ld_args=versions)
-    return out
+    """The link-only libc++abi stub for `arch`, through h0's stub builder (same template)."""
+    sub = os.path.join(out_dir, "libcxxabi-" + arch)
+    os.makedirs(sub, exist_ok=True)
+    builder = None if arch == "arm64e" else build_plain
+    return build_h0.build_stub("libc++abi", sub, os.path.join(HERE, "libcxxabi_symbols.txt"), builder)
 
 
-def unsign_data_binds(path):
+def unsign_data_binds(path, restore_vtable_addend=False):
     """Rewrite, in place, each authenticated bind outside __auth_got as a plain bind to the same
-    import (ordinal and addend kept, chain link kept). Returns the import names of the rewritten
-    slots. The __auth_got entries stay signed because the arm64e call stubs authenticate them."""
+    import (ordinal and chain link kept; the in-tree ld64 keeps no addend on an authenticated bind,
+    so the inline addend is 0, or the vtable address point for a vtable import when
+    `restore_vtable_addend`). Returns the import names of the rewritten slots. The __auth_got entries stay signed because the arm64e call stubs authenticate them."""
     m, dec = rec.verify_output(path, "exe")
     data = bytearray(m.data)
     names = []
@@ -117,6 +118,8 @@ def unsign_data_binds(path):
         if not (word >> 63) & 1 or not (word >> 62) & 1:
             raise rec.RecipeError("fixup at 0x%x is not an authenticated bind" % f["vmaddr"])
         word &= ~((1 << 63) | (0x7FFFF << 32))      # clear auth and diversity/address-diversity/key
+        if restore_vtable_addend and f["import"].startswith(VTABLE_PREFIX):
+            word |= VTABLE_ADDRESS_POINT << 32        # the plain bind's 19-bit inline addend
         struct.pack_into("<Q", data, off, word)
         names.append(f["import"])
     with open(path, "wb") as fh:
@@ -128,7 +131,8 @@ def build_probe(arch, out_dir, variant=None):
     sdk = sdk_libs()
     stub = build_cxxabi_stub(arch, out_dir)
     out = os.path.join(out_dir, "abi_probe_" + arch + ("_" + variant if variant else ""))
-    cflags = CFLAGS + (VARIANTS[variant][0] if variant else [])
+    cflags = CFLAGS + (VARIANTS[variant][0] if variant else []) + [
+        '-DABI_VARIANT="%s"' % (variant or arch)]
     srcs = [os.path.join(HERE, s) for s in SOURCES]
     libs, ld_args = ["-lSystem", stub], ["-syslibroot", sdk]
     if arch == "arm64e":
@@ -136,7 +140,7 @@ def build_probe(arch, out_dir, variant=None):
     else:
         build_plain(srcs, out, kind="exe", cflags=cflags, entry="_main", libs=libs, ld_args=ld_args)
     if variant and VARIANTS[variant][1]:
-        unsign_data_binds(out)
+        unsign_data_binds(out, VARIANTS[variant][2])
     return out, stub
 
 
@@ -151,6 +155,9 @@ def text_words(path):
         w = struct.unpack_from("<I", data, off)[0]
         if w in PAC_WORDS:
             counts[PAC_WORDS[w]] = counts.get(PAC_WORDS[w], 0) + 1
+        for mask, value, name in PAC_PATTERNS:
+            if w & mask == value:
+                counts[name] = counts.get(name, 0) + 1
     return counts
 
 
@@ -194,6 +201,21 @@ def check_exe(path, arch, variant=None):
         problems.append("variant %s still signs return addresses %s" % (variant, pac))
     if arch == "arm64" and pac:
         problems.append("plain arm64 control contains PAC instructions %s" % pac)
+    # nosign keeps the harness's explicit sign intrinsics (a few paciza) but no authenticated call
+    auth_calls = pac.get("blraaz", 0) + pac.get("blraa", 0)
+    if variant == "nosign" and auth_calls:
+        problems.append("nosign still authenticates calls through function pointers %s" % pac)
+    if arch == "arm64e" and variant != "nosign" and not auth_calls:
+        problems.append("arm64e probe has no authenticated call (function pointers unsigned?)")
+    if dec is not None and variant in ("nosign", "noret_unsigned_addend"):
+        vt = [f for f in dec["fixups"] if f.get("import", "").startswith(VTABLE_PREFIX) and
+              f["section"] != AUTH_GOT]
+        if not vt:
+            problems.append("no typeinfo vtable bind found in %s" % variant)
+        for f in vt:
+            if f["kind"] != "bind" or f["addend"] != VTABLE_ADDRESS_POINT:
+                problems.append("%s: %s is %s with addend %s, expected a plain bind with addend %d" %
+                                (variant, f["import"], f["kind"], f["addend"], VTABLE_ADDRESS_POINT))
     if dec is not None and variant and VARIANTS[variant][1]:
         left = [f["import"] for f in dec["fixups"] if f["kind"] == "auth_bind" and f["section"] != AUTH_GOT]
         if left:
