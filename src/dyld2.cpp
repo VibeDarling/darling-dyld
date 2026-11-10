@@ -2346,7 +2346,7 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	}
 	else if ( strcmp(key, "DYLD_DARLING_ARM64E_ADAPTERS") == 0 ) {
 		// "off" binds the raw targets to arm64e importers again, to show what the adapters change
-		dyld3::darling::setAdaptersEnabled(strcmp(value, "off") != 0);
+		dyld3::darling::setAdapterMode(strcmp(value, "off") == 0 ? dyld3::darling::AdapterMode::Off : (strcmp(value, "report") == 0 ? dyld3::darling::AdapterMode::Report : dyld3::darling::AdapterMode::On));
 	}
 #endif
 	else if ( strcmp(key, "DYLD_USE_CLOSURES") == 0 ) {

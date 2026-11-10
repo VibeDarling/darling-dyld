@@ -64,11 +64,11 @@ static inline bool isSpecialHandler(uint64_t value)
 	return (value == 0) || (value == 1) || (value == ~0ULL);
 }
 
-static bool sEnabled = true;
+static AdapterMode sMode = AdapterMode::On;
 
-void setAdaptersEnabled(bool enabled)
+void setAdapterMode(AdapterMode mode)
 {
-	sEnabled = enabled;
+	sMode = mode;
 }
 
 const AdapterRow* adapterRows(size_t* count)
@@ -194,7 +194,9 @@ static const size_t kThunkPageSize = 16384;		// the largest page size of the hos
 struct ThunkEntry { const AdapterRow* row; uint64_t real; uint64_t thunk; };
 static ThunkEntry sThunks[128];
 static size_t sThunkCount;
-// dyld's lock is held by every caller; this one also keeps a bind from another thread out of the cache and the page
+// Thunks are made by a bind or by dlsym, neither of which is async-signal-safe, so no signal handler can arrive on a thread
+// that holds this lock and make one; it keeps concurrent binds and dlsym calls on other threads out of the cache. The
+// calls that run through a thunk never touch it.
 static volatile int sThunkLock;
 
 static void flushInstructionCache(void* start, size_t length)
@@ -453,13 +455,36 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 
 // ------------------------------------------------------------------------------------------ bind time
 
+// report mode: a symbol is named once, by a 64-bit FNV-1a hash (a name pointer may not outlive its image; a collision only
+// loses a line of a diagnostic)
+static uint64_t sReported[2048];
+static unsigned sReportedCount;
+
+static void reportMissingRow(const char* symbol)
+{
+	uint64_t hash = 1469598103934665603ULL;
+	for (const char* c = symbol; *c != '\0'; ++c)
+		hash = (hash ^ (uint8_t)*c) * 1099511628211ULL;
+	for (unsigned i = 0; i != sReportedCount; ++i) {
+		if ( sReported[i] == hash )
+			return;
+	}
+	if ( sReportedCount == sizeof(sReported) / sizeof(sReported[0]) )
+		return;
+	sReported[sReportedCount++] = hash;
+	dyld::warn("arm64e adapters: %s is bound by an arm64e image to a plain function and has no row\n", symbol);
+}
+
 uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e)
 {
-	if ( !sEnabled || targetIsArm64e )
+	if ( (sMode == AdapterMode::Off) || targetIsArm64e )
 		return target;
 	const AdapterRow* row = findAdapterRow(symbol);
-	if ( row == nullptr )
+	if ( row == nullptr ) {
+		if ( sMode == AdapterMode::Report )
+			reportMissingRow(symbol);
 		return target;
+	}
 	if ( row->status == AdapterStatus::HandledElsewhere )
 		return target;
 	if ( row->status == AdapterStatus::Unsupported ) {
@@ -478,7 +503,7 @@ uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e)
 #else // not arm64: arm64e importers do not exist, so nothing is ever adapted
 
 static const AdapterRow kRows[] = { { "_unused", 0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, "not arm64" } };
-void setAdaptersEnabled(bool) { }
+void setAdapterMode(AdapterMode) { }
 const AdapterRow* adapterRows(size_t* count) { *count = 0; return kRows; }
 const AdapterRow* findAdapterRow(const char*) { return nullptr; }
 const char* validateAdapterRows(const AdapterRow*, size_t) { return nullptr; }

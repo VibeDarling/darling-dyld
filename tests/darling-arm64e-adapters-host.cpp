@@ -730,10 +730,31 @@ static void checkBind()
 	CHECK(adaptedTarget("_atexit_b", 0x1234, false) == 0x1234, "an unsupported row changed the binding");
 	CHECK(gWarnings.find("_atexit_b") != std::string::npos && gWarnings.find("no adapter") != std::string::npos, "an unsupported row did not warn loudly: '%s'", gWarnings.c_str());
 
-	setAdaptersEnabled(false);
+	setAdapterMode(AdapterMode::Off);
 	CHECK(adaptedTarget("_atexit", 0x7000, false) == 0x7000, "the kill switch did not turn the adapters off");
-	setAdaptersEnabled(true);
+	setAdapterMode(AdapterMode::On);
 	CHECK(adaptedTarget("_atexit", 0x7000, false) != 0x7000, "the adapters did not come back");
+
+	// report mode names a plain function with no row once, and never one that has a row (supported, unsupported or elsewhere)
+	gWarnings.clear();
+	setAdapterMode(AdapterMode::On);
+	adaptedTarget("_report_me", 0x1234, false);
+	CHECK(gWarnings.empty(), "a symbol with no row warned outside report mode: '%s'", gWarnings.c_str());
+	setAdapterMode(AdapterMode::Report);
+	CHECK(adaptedTarget("_report_me", 0x1234, false) == 0x1234 && gWarnings.find("_report_me") != std::string::npos && gWarnings.find("no row") != std::string::npos, "report mode did not name a symbol with no row: '%s'", gWarnings.c_str());
+	gWarnings.clear();
+	adaptedTarget("_report_me", 0x1234, false);
+	adaptedTarget("_atexit", 0x4000, false);
+	adaptedTarget("__Unwind_Resume", 0x1234, false);
+	adaptedTarget("_unrelated", 0x1234, true);
+	CHECK(gWarnings.empty(), "report mode named a symbol twice, one with a row or an arm64e target: '%s'", gWarnings.c_str());
+	adaptedTarget("_report_me_too", 0x1234, false);
+	CHECK(gWarnings.find("_report_me_too") != std::string::npos, "report mode did not name a second symbol");
+	setAdapterMode(AdapterMode::Off);
+	gWarnings.clear();
+	adaptedTarget("_report_me_three", 0x1234, false);
+	CHECK(gWarnings.empty(), "off mode warned");
+	setAdapterMode(AdapterMode::On);
 }
 
 int main(int argc, char** argv)

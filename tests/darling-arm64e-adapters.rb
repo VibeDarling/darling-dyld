@@ -47,6 +47,25 @@ HAND = {
   '_signal' => [0x2, 0, 0, 1, 2, 0],                       # sig_t signal(int, sig_t)
   '__Block_copy' => [0x0, 0, 0, 2, 1, 0],                  # void* _Block_copy(const void*)
   '__tlv_atexit' => [0x1, 0, 0, 0, 2, 1],                  # (void (*termFunc)(void*), void* objAddr); not in the T0 lists
+  # callback-taking exports that the T0 lists lack, prototypes from the SDK headers
+  '_heapsort' => [0x8, 0, 0, 0, 4, 1],                     # stdlib.h (base, nel, width, compar)
+  '_psort' => [0x8, 0, 0, 0, 4, 1],
+  '_tsearch' => [0x4, 0, 0, 0, 3, 1],                      # search.h (key, rootp, compar)
+  '_tfind' => [0x4, 0, 0, 0, 3, 1],
+  '_tdelete' => [0x4, 0, 0, 0, 3, 1],
+  '_twalk' => [0x2, 0, 0, 0, 2, 1],                        # (root, action)
+  '_lfind' => [0x10, 0, 0, 0, 5, 1],                       # (key, base, nelp, width, compar)
+  '_lsearch' => [0x10, 0, 0, 0, 5, 1],
+  '_ftw' => [0x2, 0, 0, 0, 3, 1],                          # ftw.h (path, fn, nfds)
+  '_nftw' => [0x2, 0, 0, 0, 4, 1],                         # (path, fn, nfds, flags)
+  '_dispatch_barrier_async_f' => [0x4, 0, 0, 0, 3, 1],     # dispatch/queue.h (queue, context, work)
+  '_dispatch_barrier_sync_f' => [0x4, 0, 0, 0, 3, 1],
+  '_dispatch_async_and_wait_f' => [0x4, 0, 0, 0, 3, 1],
+  '_dispatch_group_notify_f' => [0x8, 0, 0, 0, 4, 1],      # dispatch/group.h (group, queue, context, work)
+  '_heapsort_b' => [0, 0, 0, 0, 0, 3],                     # block comparators
+  '_psort_b' => [0, 0, 0, 0, 0, 3],
+  '_sigset' => [0, 0, 0, 0, 0, 3],                         # returns a disposition, takes SIG_HOLD
+  '_objc_retainBlock' => [0, 0, 0, 0, 0, 3],               # returns a stored block
 }.freeze
 # The callback-taking imports of the C++ runtime, ObjC and Foundation closures from the T0 facts scan: class, public prototype note.
 FIXTURE = File.readlines(File.join(root, 'tests/darling-arm64e-callback-imports.tsv'), chomp: true).drop(1).map { |l| l.split("\t") }
@@ -228,8 +247,10 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     'a thunk is made again for the same row and target' => ['(sThunks[i].real == real) )', '(sThunks[i].real == real) && false )'],
     'an unsupported row is bound as if supported' => [/if \( row->status == AdapterStatus::Unsupported \) \{(\s+dyld::warn)/, 'if ( false ) {\1'],
     'a handled-elsewhere row warns or is thunked' => [/if \( row->status == AdapterStatus::HandledElsewhere \)\s+return target;\n/, ''],
-    'an arm64e target is thunked' => ['if ( !sEnabled || targetIsArm64e )', 'if ( !sEnabled )'],
-    'the kill switch does nothing' => ['if ( !sEnabled || targetIsArm64e )', 'if ( targetIsArm64e )'],
+    'an arm64e target is thunked' => ['if ( (sMode == AdapterMode::Off) || targetIsArm64e )', 'if ( sMode == AdapterMode::Off )'],
+    'the kill switch does nothing' => ['if ( (sMode == AdapterMode::Off) || targetIsArm64e )', 'if ( targetIsArm64e )'],
+    'report mode names a symbol every time' => [/if \( sReported\[i\] == hash \)\s+return;/, ''],
+    'report mode is always on' => [/if \( sMode == AdapterMode::Report \)\s+reportMissingRow\(symbol\);/, 'reportMissingRow(symbol);'],
     'the validator accepts a nine-argument row' => ['(r.argCount > 8)', '(r.argCount > 9)'],
     'the validator accepts a duplicate symbol' => ['return "a symbol has two rows";', ''],
     'the row of _atexit authenticates the wrong argument' => ['{ "_atexit", 0x1,', '{ "_atexit", 0x2,', :rows],

@@ -64,8 +64,11 @@ const char* validateAdapterRows(const AdapterRow* rows, size_t count);
 // The caller has checked that the importer is arm64e. Callers hold dyld's lock.
 uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e);
 
-// DYLD_DARLING_ARM64E_ADAPTERS=off: bind the raw targets, as before the adapters existed.
-void setAdaptersEnabled(bool enabled);
+// DYLD_DARLING_ARM64E_ADAPTERS: off binds the raw targets, as before the adapters existed. report also warns, once per
+// symbol, for every plain function an arm64e image binds that has no row at all (the way to find a callback-taking import
+// that the table does not know; a symbol with a row never warns here).
+enum class AdapterMode : uint8_t { Off, On, Report };
+void setAdapterMode(AdapterMode mode);
 
 // Flushes the instruction cache over the page and makes it read-execute. False when the protection change failed.
 // Thunk pages are only ever writable before this and never after it.

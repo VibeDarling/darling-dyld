@@ -4,7 +4,8 @@
 // public prototype listed by the T0 facts scan of the callback-taking imports of the C++ runtime, ObjC and Foundation
 // closures (tests/darling-arm64e-callback-imports.tsv): a code pointer argument in a register is ShapeOnly, anything the
 // probe did not run (blocks beyond dispatch_async and dispatch_once, structs that hold code pointers, callbacks passed on the
-// stack) is Unsupported and warns when an arm64e image imports it.
+// stack) is Unsupported and warns when an arm64e image imports it. The last group of hand rows (heapsort to
+// objc_retainBlock) are callback-taking exports that the T0 lists do not contain, checked against the SDK headers.
 #define BLK "a block argument: only dispatch_async and dispatch_once are shown (L2 checks 07-09)"
 #define STACKARG "the callback is not passed in a register, which the thunks do not handle"
 #define STRUCT "a struct that holds a code pointer: only the sigaction handler is shown (L2 check 18)"
@@ -21,6 +22,24 @@
 	{ "_signal", 0x2, 0, 0, ReturnFix::SignInstalledHandler, 2, AdapterStatus::Probed, "L2 check 19" },
 	{ "__Block_copy", 0x0, 0, 0, ReturnFix::ResignCopiedBlock, 1, AdapterStatus::Probed, "L2 check 17; a block with helpers aborts with a message (needs the arm64e shim)" },
 	{ "__tlv_atexit", 0x1, 0, 0, ReturnFix::None, 2, AdapterStatus::ShapeOnly, "the shape of L2 checks 01 and 03; imported by test programs, not in the T0 lists" },
+	{ "_heapsort", 0x8, 0, 0, ReturnFix::None, 4, AdapterStatus::ShapeOnly, "stdlib.h: compar is argument 3; the shape of L2 check 06" },
+	{ "_psort", 0x8, 0, 0, ReturnFix::None, 4, AdapterStatus::ShapeOnly, "stdlib.h: compar is argument 3; the shape of L2 check 06" },
+	{ "_tsearch", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "search.h: compar is argument 2; called during the call only" },
+	{ "_tfind", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "search.h: compar is argument 2; called during the call only" },
+	{ "_tdelete", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "search.h: compar is argument 2; called during the call only" },
+	{ "_twalk", 0x2, 0, 0, ReturnFix::None, 2, AdapterStatus::ShapeOnly, "search.h: the action is argument 1; called during the call only" },
+	{ "_lfind", 0x10, 0, 0, ReturnFix::None, 5, AdapterStatus::ShapeOnly, "search.h: compar is argument 4; called during the call only" },
+	{ "_lsearch", 0x10, 0, 0, ReturnFix::None, 5, AdapterStatus::ShapeOnly, "search.h: compar is argument 4; called during the call only" },
+	{ "_ftw", 0x2, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "ftw.h: fn is argument 1; called during the call only" },
+	{ "_nftw", 0x2, 0, 0, ReturnFix::None, 4, AdapterStatus::ShapeOnly, "ftw.h: fn is argument 1; called during the call only" },
+	{ "_dispatch_barrier_async_f", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "dispatch/queue.h: work is argument 2; the shape of _dispatch_async_f" },
+	{ "_dispatch_barrier_sync_f", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "dispatch/queue.h: work is argument 2; the shape of _dispatch_sync_f" },
+	{ "_dispatch_async_and_wait_f", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "dispatch/queue.h: work is argument 2; the shape of _dispatch_async_f" },
+	{ "_dispatch_group_notify_f", 0x8, 0, 0, ReturnFix::None, 4, AdapterStatus::ShapeOnly, "dispatch/group.h: work is argument 3; the shape of _dispatch_group_async_f" },
+	{ "_heapsort_b", 0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, BLK" (stdlib.h)" },
+	{ "_psort_b", 0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, BLK" (stdlib.h)" },
+	{ "_sigset", 0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, "returns the previous disposition and takes SIG_HOLD: not shown (L2 check 19 shows signal only)" },
+	{ "_objc_retainBlock", 0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, "returns a stored block to arm64e code: not shown (L2 README, Not verified)" },
 	{ "_DNSServiceBrowse", 0x20, 0, 0, ReturnFix::None, 6, AdapterStatus::ShapeOnly, "T0 header rule, dns_sd.h: code pointer in argument 5; the shape of L2 checks 01-06" },
 	{ "_DNSServiceEnumerateDomains", 0x8, 0, 0, ReturnFix::None, 4, AdapterStatus::ShapeOnly, "T0 header rule, dns_sd.h: code pointer in argument 3; the shape of L2 checks 01-06" },
 	{ "_DNSServiceQueryRecord", 0x40, 0, 0, ReturnFix::None, 7, AdapterStatus::ShapeOnly, "T0 header rule, dns_sd.h: code pointer in argument 6; the shape of L2 checks 01-06" },
