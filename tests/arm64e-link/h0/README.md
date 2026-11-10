@@ -187,5 +187,6 @@ libSystem.B as its only dependency, and checks that the first read was rewritten
 `build_h0.py build --out DIR --leaf exclaves`. A guest run needs a dyld with that framework path on the allow-list
 (not committed: the list is fixed on purpose), `DYLD_SHARED_CACHE_SPLIT_DIR` set inside the guest, and the sidecar
 `dyld_shared_cache_arm64e.tsdsites` (from `tests/darling-tsd/emit_tsd_sites.py`) next to the cache files. Exit 0 means
-translated; 3 means the read is still an mrs (run with a table that omits the image to see it); the dyld halts when the
-table is missing. The program does not show that the translated read executes.
+translated; 3 means the first read is still an mrs, which a table gives when it lists the image with no sites (edit the
+table to try it). The dyld halts, and the program never starts, when the table is missing, was made from another cache
+(UUID), or does not list the image at all. The program does not show that the translated read executes.
