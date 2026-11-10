@@ -28,13 +28,13 @@ end
 
 # the call-thunk template of both directions, as an assembler reads it, and what its literals must be
 TEMPLATE = ['stp x29, x30, [sp, #-80]!', 'mov x29, sp', 'stp x0, x1, [sp, #16]', 'stp x2, x3, [sp, #32]', 'stp x4, x5, [sp, #48]', 'stp x6, x7, [sp, #64]',
-            'add x0, sp, #16', 'ldr x1, #28', 'ldr x2, #32', 'ldr x16, #36', 'blr x16', 'ldp x29, x30, [sp], #80', 'ret', 'nop'].freeze
+            'add x0, sp, #16', 'ldr x1, #28', 'ldr x2, #32', 'ldr x3, #36', 'ldr x16, #40', 'blr x16', 'ldp x29, x30, [sp], #80', 'ret'].freeze
 
-# returns [row address, forward helper, words] of the reverse thunk of `sym`
+# returns [row address, forward helper, predicate, words] of the reverse thunk of `sym`
 def reverse_thunk(exe, sym)
   lines = AdapterSupport.run(exe, 'reverse-thunk', sym)[0].lines
   head = lines.shift.split
-  [head[1].to_i(16), head[3].to_i(16), lines.map { |w| w.to_i(16) }]
+  [head[1].to_i(16), head[3].to_i(16), head[5].to_i(16), lines.map { |w| w.to_i(16) }]
 end
 
 driver = File.join(root, 'tests/darling-arm64e-reverse-adapters-host.cpp')
@@ -69,15 +69,15 @@ Dir.mktmpdir('rev-adapters') do |dir|
     end
   end
 
-  # the thunk bytes: the call template, then the literals row, real target, helper
+  # the thunk bytes: the call template, then the literals row, real target, predicate, helper
   if HAVE_MC
     want = mc_words(TEMPLATE.join("\n"))
     lit = ->(v) { [v & 0xffffffff, v >> 32] }
     %w[__ZSt13set_terminatePFvvE __ZSt13get_terminatev ___cxa_throw].each do |sym|
-      row, forward_helper, got = reverse_thunk(exe, sym)
-      helper = got[18] | (got[19] << 32)
-      check("reverse thunk of #{sym} is the template and its literals (the helper is not the forward one)",
-            want && got.size == 20 && got[0, 14] == want && got[14, 2] == lit[row] && got[16, 2] == lit[0x1122334455667788] && helper != 0 && helper != forward_helper,
+      row, forward_helper, predicate, got = reverse_thunk(exe, sym)
+      helper = got[20] | (got[21] << 32)
+      check("reverse thunk of #{sym} is the template and its literals (its own predicate; the helper is not the forward one)",
+            want && got.size == 22 && got[0, 14] == want && got[14, 2] == lit[row] && got[16, 2] == lit[0x1122334455667788] && got[18, 2] == lit[predicate] && helper != 0 && helper != forward_helper,
             got.map { |w| format('%08x', w) }.join(' ')[0, 200])
     end
   else
@@ -108,7 +108,9 @@ Dir.mktmpdir('rev-adapters') do |dir|
     'special values are authenticated' => ['if ( row->authReturn && !isSpecialHandler(result) )', 'if ( row->authReturn )'],
     'every result is authenticated' => ['if ( row->authReturn && !isSpecialHandler(result) )', 'if ( !isSpecialHandler(result) )'],
     'the mask bit is read from the wrong argument' => ["if ( ((row->signMask >> i) & 1) == 0 )\n\t\t\tcontinue;\n\t\tif ( a[i] == 0 )", "if ( ((row->signMask >> (i + 1)) & 1) == 0 )\n\t\t\tcontinue;\n\t\tif ( a[i] == 0 )"],
-    'the thunk calls the forward helper' => ['return emitCallThunkWith(words, row, real, (uint64_t)&callReverseRow);', 'return emitCallThunkWith(words, row, real, callThunkHelperAddress());'],
+    'the thunk calls the forward helper' => ['return emitCallThunkWith(words, row, real, (uint64_t)isEntry, (uint64_t)&callReverseRow);', 'return emitCallThunkWith(words, row, real, (uint64_t)isEntry, callThunkHelperAddress());'],
+    'the thunk does not carry its predicate' => ['putLiteral(&words[18], aux);', 'putLiteral(&words[18], 0);'],
+    'the thunk cache ignores the predicate' => ['(sThunks[i].row == row) && (sThunks[i].real == real) && (sThunks[i].aux == aux)', '(sThunks[i].row == row) && (sThunks[i].real == real)'],
     'a plain exporter is adapted' => ["if ( (sMode == AdapterMode::Off) || !targetIsArm64e )\n\t\treturn target;\n\tconst ReverseRow* row", "if ( (sMode == AdapterMode::Off) )\n\t\treturn target;\n\tconst ReverseRow* row"],
     'the kill switch does nothing in this direction' => ["if ( (sMode == AdapterMode::Off) || !targetIsArm64e )\n\t\treturn target;\n\tconst ReverseRow* row", "if ( !targetIsArm64e )\n\t\treturn target;\n\tconst ReverseRow* row"],
     'an unsupported row is bound as if supported' => ["if ( row->status == AdapterStatus::Unsupported ) {\n\t\tdyld::warn(\"arm64e adapters: %s is bound by a plain image", "if ( false ) {\n\t\tdyld::warn(\"arm64e adapters: %s is bound by a plain image"],
@@ -137,9 +139,9 @@ Dir.mktmpdir('rev-adapters') do |dir|
       dead = !mst.success? || mout =~ /^FAIL/
       # a thunk-shape mutant that the native run does not see is still caught by the assembler comparison
       if !dead && HAVE_MC
-        row, forward_helper, got = reverse_thunk(mexe, '__ZSt13set_terminatePFvvE')
-        helper = got[18] | (got[19] << 32)
-        dead = !(got.size == 20 && got[0, 14] == mc_words(TEMPLATE.join("\n")) && got[14, 2] == [row & 0xffffffff, row >> 32] && helper != 0 && helper != forward_helper)
+        row, forward_helper, predicate, got = reverse_thunk(mexe, '__ZSt13set_terminatePFvvE')
+        helper = got[20] | (got[21] << 32)
+        dead = !(got.size == 22 && got[0, 14] == mc_words(TEMPLATE.join("\n")) && got[14, 2] == [row & 0xffffffff, row >> 32] && got[18, 2] == [predicate & 0xffffffff, predicate >> 32] && helper != 0 && helper != forward_helper)
       end
     end
     killed += 1 if dead

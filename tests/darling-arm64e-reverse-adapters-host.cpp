@@ -60,6 +60,9 @@ static bool isEntry(uint64_t a)
 	return (a >= kCodeLow) && (a < kCodeHigh) && (((a - kCodeLow) % 0x40) == 0);
 }
 static uint64_t codeAddress(int n) { return kCodeLow + 0x40 * n; }
+// a second predicate with a disjoint answer, for the check that a thunk carries its own
+static const uint64_t kOtherEntry = kArm64eLow + 0x4000;
+static bool isEntryOther(uint64_t a) { return a == kOtherEntry; }
 // an entry whose signature differs from the address, and from its signature under another modifier
 static uint64_t goodCode(int n)
 {
@@ -232,6 +235,26 @@ static void checkRoundTrip()
 	CHECK(gSeen[0] == other, "an arm64e address that was never handed out was signed");
 }
 
+// The predicate is carried in the thunk: two predicates with the same row and target get their own thunks, and each one
+// asks its own predicate, whatever the other call did most recently.
+static void checkPredicateIsolation()
+{
+	Fn8 a = (Fn8)reverseAdaptedTarget("__ZSt13set_terminatePFvvE", (uint64_t)&fakeCallee, true, &isEntry);
+	Fn8 b = (Fn8)reverseAdaptedTarget("__ZSt13set_terminatePFvvE", (uint64_t)&fakeCallee, true, &isEntryOther);
+	CHECK((uint64_t)a != (uint64_t)b, "two predicates shared one thunk");
+	const uint64_t entry = goodCode(11);
+	uint64_t args[8]; memcpy(args, kS, sizeof(args));
+	gResult = 0;
+	args[0] = entry;
+	callWith(b, args);
+	CHECK(gSeen[0] == entry, "a thunk used a predicate it was not made with");
+	args[0] = kOtherEntry;
+	callWith(a, args);
+	CHECK(gSeen[0] == kOtherEntry, "a thunk used a predicate it was not made with (the other way)");
+	callWith(b, args);
+	CHECK(gSeen[0] == oracleSign(kOtherEntry, 0), "a thunk did not consult its own predicate");
+}
+
 static void checkFunctionStarts()
 {
 	// deltas 0x10, 0x20, 0x08 give the starts 0x10, 0x30, 0x38; a zero delta ends the table
@@ -375,9 +398,9 @@ int main(int argc, char** argv)
 		const ReverseRow* row = findReverseRow(argv[2]);
 		if ( row == nullptr )
 			return 2;
-		uint32_t w[20];
-		const size_t n = emitReverseThunk(w, row, 0x1122334455667788ULL);
-		printf("ROWADDR %016llx FORWARD_HELPER %016llx\n", (unsigned long long)(uint64_t)row, (unsigned long long)callThunkHelperAddress());
+		uint32_t w[24];
+		const size_t n = emitReverseThunk(w, row, 0x1122334455667788ULL, &isEntry);
+		printf("ROWADDR %016llx FORWARD_HELPER %016llx PREDICATE %016llx\n", (unsigned long long)(uint64_t)row, (unsigned long long)callThunkHelperAddress(), (unsigned long long)(uint64_t)&isEntry);
 		for (size_t i = 0; i != n; ++i)
 			printf("%08x\n", w[i]);
 		return 0;
@@ -387,6 +410,7 @@ int main(int argc, char** argv)
 	checkGetters();
 	checkReturnAuthentication();
 	checkRoundTrip();
+	checkPredicateIsolation();
 	checkFunctionStarts();
 	checkArgPositions();
 	checkEveryRow();

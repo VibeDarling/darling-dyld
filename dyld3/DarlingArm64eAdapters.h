@@ -133,8 +133,8 @@ const char* validateReverseRows(const ReverseRow* rows, size_t count);
 bool functionStartsContain(const uint8_t* blob, size_t size, uint64_t offset);
 
 // What a plain importer should bind for `symbol` when the resolved target is at `target` and the exporter is arm64e or not: a
-// thunk when there is a supported row, otherwise `target` (an Unsupported row warns). isEntry is the predicate that the thunks
-// consult; the loader passes the same one on every call.
+// thunk when there is a supported row, otherwise `target` (an Unsupported row warns). isEntry is the predicate the thunk
+// consults; it is carried in the thunk's own literals and is part of its key, so two predicates never share a thunk.
 uint64_t reverseAdaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e, FunctionEntryPredicate isEntry);
 
 // DYLD_DARLING_ARM64E_ADAPTERS: off binds the raw targets, as before the adapters existed. report also warns, once per
@@ -150,7 +150,7 @@ bool sealExecutablePage(void* page, size_t length);
 // The thunk bytes, exposed so a test can compare them with an assembler. All return the number of words written.
 size_t emitAuthThunk(uint32_t* words, uint8_t authMask, uint64_t real);
 size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real);
-size_t emitReverseThunk(uint32_t* words, const ReverseRow* row, uint64_t real);
+size_t emitReverseThunk(uint32_t* words, const ReverseRow* row, uint64_t real, FunctionEntryPredicate isEntry);
 uint64_t callThunkHelperAddress();
 
 } // namespace darling

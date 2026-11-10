@@ -1051,7 +1051,7 @@ int main(int argc, char** argv)
 		const AdapterRow* row = findAdapterRow(argv[2]);
 		if ( row == nullptr )
 			return 2;
-		uint32_t w[20];
+		uint32_t w[24];
 		const size_t n = emitCallThunk(w, row, 0x1122334455667788ULL);
 		printf("ROWADDR %016llx HELPER %016llx\n", (unsigned long long)(uint64_t)row, (unsigned long long)callThunkHelperAddress());
 		for (size_t i = 0; i != n; ++i)
