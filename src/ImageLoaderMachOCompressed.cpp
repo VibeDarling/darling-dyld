@@ -44,6 +44,9 @@
 #include "ImageLoaderMachOCompressed.h"
 #include "Closure.h"
 #include "Array.h"
+#ifdef DARLING
+#include "DarlingArm64eAdapters.h"
+#endif
 
 #ifndef BIND_SUBOPCODE_THREADED_SET_JOP
    #define BIND_SUBOPCODE_THREADED_SET_JOP								0x0F
@@ -1040,10 +1043,15 @@ void ImageLoaderMachOCompressed::doApplyFixups(const LinkContext& context, const
 	__block Diagnostics diag;
 	const dyld3::MachOAnalyzer* ma = (dyld3::MachOAnalyzer*)ml;
 	ma->forEachChainedFixupTarget(diag, ^(int libOrdinal, const char* symbolName, uint64_t addend, bool weakImport, bool& stop) {
-		const ImageLoader*	targetImage;
+		const ImageLoader*	targetImage = NULL;
 		uint8_t symbolFlags = weakImport ? BIND_SYMBOL_FLAGS_WEAK_IMPORT : 0;
 		try {
 			uintptr_t symbolAddress = this->resolve(context, symbolName, symbolFlags, libOrdinal, &targetImage, patcher, NULL, true);
+#ifdef DARLING
+			// arm64e code binding a plain image's callback-taking export gets a thunk that strips the signatures
+			if ( (symbolAddress != 0) && (addend == 0) && (targetImage != NULL) && dyld3::darling::cpusubtypeIsArm64e(this->machHeader()->cpusubtype) )
+				symbolAddress = dyld3::darling::adaptedTarget(symbolName, symbolAddress, dyld3::darling::cpusubtypeIsArm64e(targetImage->machHeader()->cpusubtype));
+#endif
 			targetAddrs.push_back((void*)(symbolAddress + addend));
 		}
 		catch (const char* msg) {
