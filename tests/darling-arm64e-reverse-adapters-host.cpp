@@ -72,6 +72,16 @@ static uint64_t goodCode(int n)
 	return p;
 }
 
+// A value whose IA/0 signature differs from the value itself. A check that a direction leaves a value unchanged is blind
+// when the value is a fixed point of the PAC insertion (about once in 140 processes here), so every such constant is
+// picked per process, and the choice is asserted where it is used.
+static uint64_t signedDifferently(uint64_t address)
+{
+	while ( oracleSign(address, 0) == address )
+		address += 0x1000;
+	return address;
+}
+
 static Fn8 thunkFor(const char* symbol)
 {
 	const uint64_t t = reverseAdaptedTarget(symbol, (uint64_t)&fakeCallee, true, &isEntry);
@@ -223,8 +233,10 @@ static void checkRoundTrip()
 	// again, but an arm64e address that was never handed out is not signed (no entry, never handed back)
 	Fn8 get = thunkFor("__ZSt13get_terminatev");
 	Fn8 set = thunkFor("__ZSt13set_terminatePFvvE");
-	const uint64_t arm64eHandler = kArm64eLow + 0x1000, other = kArm64eLow + 0x2000;
+	const uint64_t arm64eHandler = signedDifferently(kArm64eLow + 0x1000), other = signedDifferently(kArm64eLow + 0x2001);
 	CHECK(!isEntry(arm64eHandler), "the fake predicate is wrong");
+	CHECK((oracleSign(arm64eHandler, 0) != arm64eHandler) && (oracleSign(other, 0) != other),
+	      "the round-trip constants are fixed points of their own signature: a ring that signs nothing would go unseen");
 	gResult = oracleSign(arm64eHandler, 0);
 	CHECK(callWith(get, kS) == arm64eHandler, "get_terminate did not hand out the raw handler");
 	uint64_t args[8]; memcpy(args, kS, sizeof(args));
@@ -261,7 +273,9 @@ static void checkRingIsolation()
 {
 	Fn8 sig = (Fn8)adaptedTarget("_signal", (uint64_t)&fakeCallee, false);
 	Fn8 set = thunkFor("__ZSt13set_terminatePFvvE");
-	const uint64_t invented = 0x0000000400005000ULL;
+	const uint64_t invented = signedDifferently(0x0000000400005000ULL);
+	CHECK(oracleSign(invented, 0) != invented,
+	      "the invented value is a fixed point of its own signature: a reverse ring that took it would go unseen");
 	uint64_t args[8]; memcpy(args, kS, sizeof(args));
 	// the forward signal() hands out a result that plain code invented (it fails authentication)
 	args[0] = 26; args[1] = invented;
