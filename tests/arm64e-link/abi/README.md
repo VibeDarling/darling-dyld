@@ -132,8 +132,9 @@ The reverse and stored shapes (16-19):
   the old address (`orig_signed=yes`) and arm64e code calling it faults. Re-signing the copy for its
   new address makes it pass.
 - 18: a function pointer inside `struct sigaction`, signed by arm64e code, is called later by
-  Darling's signal path: the process dies (exit 137). Stripped, it works. This is the only check where
-  libsystem_kernel is involved (`sigaction`/signal delivery); the other nineteen do not touch it.
+  Darling's signal path (inferred: the fault site was not identified): the process dies (exit 137).
+  Stripped, it works. Check 18 hands a signed pointer to `sigaction`; check 19's `signal` also goes
+  through `sigaction`, and the harness calls `sigaction` in every child, but with stripped pointers.
 - 19: `signal` hands back the raw pointer it stored (unsigned: `HAND signal.return ... orig_signed=no`);
   arm64e code calling it faults on its own authentication. Signed, it passes.
 
@@ -167,7 +168,7 @@ one variant:
    `__cxa_decrement_exception_refcount`. Check 20 is 13 spelled out with `__cxa_throw` called by hand:
    in `noret_unsigned_addend mutate` the destructor pointer is stripped and 20 passes 6 of 6, with the
    thrown object's vtable pointer still signed at run time by the arm64e constructor. So that vtable
-   pointer is not an obstacle.
+   pointer is not an obstacle on this throw/catch path; a catch through a virtual base would make plain libc++abi read it.
 
 Is the addend loss a defect of the 3.3a link recipe? It comes from the in-tree ld64 that the recipe
 drives, and it affects any image the recipe links that contains an authenticated pointer to
@@ -194,10 +195,14 @@ Not supported:
   signature; an adapter must re-sign on copy), `signal` return values (19: the lib returns the raw
   pointer; an adapter must sign it on return). By the same shape, IMPs, vtables and
   `dispatch_block_create` results are untested.
-- Pointers inside structs (18 shows `sigaction.sa_handler` dying in Darling's signal path;
+- Pointers inside structs (18 shows `sigaction.sa_handler` dying (exit 137, probably in Darling's signal path);
   `pthread_attr`, dispatch sources and similar were not tried).
-- Data-key pointers (isa, C++ object vtables handed to plain libs): none of the checks hands one over.
-- libsystem_kernel: only check 18 reaches it (signal delivery); no other check hands it a signed pointer.
+- Data-key pointers: the stack block's `isa` (DA, address-diversified) reaches libdispatch and
+  libclosure in checks 07, 09 and 17, and `mutate` never strips it, and check 20 hands libc++abi an
+  object with a signed vtable pointer; those paths tolerate it. Other data-key uses (ObjC `isa` use,
+  vtable reads by plain code such as a catch through a virtual base) are untested.
+- libsystem_kernel: only check 18 hands it a signed pointer (`sigaction`); check 19 and the harness
+  call `sigaction` with stripped or unsigned pointers.
 - Any claim that nothing needs an arm64e rebuild of libsystem_*. The evidence is "ten callback shapes
   are adapter-fixable"; the sizes measured earlier (2 to 60 callback-taking exports per cache closure)
   are a lower bound on what must be adapted, in both directions, not a count of one-line strips.
@@ -218,7 +223,8 @@ shapes measured per API. Decision input only.
 - Pointers plain code stores and arm64e code authenticates later, beyond blocks (17) and `signal` (19):
   IMPs, `dispatch_block_create`, `sigaction` through `signal`'s old-action out parameter.
 - Pointers inside other structs (`pthread_attr`, dispatch sources, `qsort_b`, `atexit_b`).
-- Data-key (DA/DB) pointers handed to plain libs, including C++ objects with vtables.
+- Data-key (DA/DB) pointers beyond the block `isa` (checks 07, 09, 17) and the thrown object's vtable
+  pointer (20), which plain libs tolerated on those paths.
 - The cache's arm64e libc++abi with Darling's libunwind (L4): this probe used Darling's plain libc++abi.
 - Whether the in-tree ld64 can emit an addend on an authenticated bind (not tried).
 - Check 03's fault location: the handler does not run at thread exit; the signal and the `HAND` line
