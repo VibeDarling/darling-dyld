@@ -230,63 +230,95 @@ static int c_signal_return(void) {
     return 0;
 }
 
-// ---- T1 extras (libunwind PAC work): 21-23 pass a function pointer to libunwind and expect it to run;
-// 24-27 corrupt the signature (flip a PAC bit) and expect libunwind to fault or abort, never to run it.
-// The "neg" checks are only meaningful in the arm64e column (the plain control has no signature, so the
-// flipped bit is just a bad address); they pass in an unauthenticating libunwind and fault in an authenticating one.
+// ---- T1 extras (libunwind PAC work): 21-23 hand libunwind a function pointer the compiler signed
+// and expect it to run; 24-28 corrupt the signature and expect the unwinder to fault or abort, never to
+// run the callback. 29-32 are the same for a DWARF-mode frame (abi_cxx.cpp, dwarf_frame_call).
+// A negative check reports ok only when the corrupted value carried no signature (an unsigned build or
+// a zero PAC field): there is nothing to authenticate. If it carried one and the subject used the
+// corrupted value, the check fails (CHECKFAIL): the unwinder stripped the signature.
 struct uex { unsigned long long exception_class; void (*exception_cleanup)(int, struct uex *);
              unsigned long long private_1, private_2; } __attribute__((aligned(16)));
 extern void _Unwind_DeleteException(struct uex *);
 extern int _Unwind_Backtrace(int (*)(void *, void *), void *);
 extern int _Unwind_ForcedUnwind(struct uex *, int (*)(int, int, unsigned long long, struct uex *, void *, void *), void *);
-#define PACBIT (1ULL << 50)
 static volatile int g_ran;
 static void x_cleanup(int reason, struct uex *e) { (void)e; g_ran = reason; }
 static int x_trace(void *ctx, void *ref) { (void)ctx; return ++*(int *)ref >= 2 ? 4 : 0; }
 static int x_stop(int v, int a, unsigned long long c, struct uex *e, void *ctx, void *p) {
     (void)v; (void)a; (void)c; (void)e; (void)ctx; g_ran = 1; *(int *)p = 1; return 2; }
-static void *corrupt(void *p) { return (void *)((uintptr_t)p ^ PACBIT); }
+
+/* Flip the lowest set bit of p's signature. STRIP clears exactly the signature bits, so the flip
+   lies in the PAC field; a pointer with no signature is returned unchanged. */
+static void *corrupt(void *p) {
+    uintptr_t v = (uintptr_t)p, sig = v ^ (uintptr_t)STRIP(p);
+    return (void *)(v ^ (sig & (0 - sig)));
+}
+static int signed_pointer(void *p) { return (uintptr_t)p != (uintptr_t)STRIP(p); }
+
+/* A negative check that reaches the end of its body has seen the subject use the corrupted value
+   (or the corrupted return address resume). With a signature that use is the defect the check exists
+   to catch; without one the check does not apply and reports ok. */
+static int neg_finished(int number, int applied, const char *why) {
+    if (!applied) { ok_mark(number); return 0; }
+    return fail(why);
+}
+
 static int c_x_cleanup(void) {
-    struct uex e = {0}; e.exception_cleanup = x_cleanup; g_ran = 0;
+    struct uex e = {0}; g_ran = 0;
+    e.exception_cleanup = (void (*)(int, struct uex *))hand("x_cleanup.cleanup", (void *)x_cleanup);
     _Unwind_DeleteException(&e);
     if (g_ran != 1) return fail("cleanup did not run with reason 1");
     ok_mark(21); return 0;
 }
 static int c_x_trace(void) {
-    int n = 0; int r = _Unwind_Backtrace(x_trace, &n);
+    int n = 0;
+    int r = _Unwind_Backtrace((int (*)(void *, void *))hand("x_trace.trace", (void *)x_trace), &n);
     if (n != 2 || r != 4) return fail("trace function not called twice or its result not returned");
     ok_mark(22); return 0;
 }
 static int c_x_stop(void) {
     struct uex e = {0}; int hit = 0;
-    int r = _Unwind_ForcedUnwind(&e, x_stop, &hit);
+    int r = _Unwind_ForcedUnwind(&e, (int (*)(int, int, unsigned long long, struct uex *, void *, void *))
+                                     hand("x_stop.stop", (void *)x_stop), &hit);
     if (!hit) return fail("stop function not called");
     ok_mark(23); (void)r; return 0;
 }
 extern int cxx_neg_return_address(void);
-static int c_n_ra(void) { int r = cxx_neg_return_address(); if (!r) ok_mark(24); return r; }
+static int c_n_ra(void) {
+    int r = cxx_neg_return_address();
+    return neg_finished(24, r != 0,
+                        r == 2 ? "no catch and no fault" : "the corrupted return address resumed at the catch");
+}
 static int c_n_cleanup(void) {
-    struct uex e = {0}; e.exception_cleanup = x_cleanup; g_ran = 0;
-    e.exception_cleanup = (void (*)(int, struct uex *))corrupt((void *)e.exception_cleanup);
+    struct uex e = {0}; g_ran = 0;
+    void (*cleanup)(int, struct uex *) = (void (*)(int, struct uex *))hand("neg_cleanup.cleanup", (void *)x_cleanup);
+    int applied = signed_pointer((void *)cleanup);
+    e.exception_cleanup = (void (*)(int, struct uex *))corrupt((void *)cleanup);
     _Unwind_DeleteException(&e);
-    if (g_ran) ok_mark(25);
-    return g_ran ? 0 : fail("corrupted cleanup was not called");
+    if (!g_ran) return fail("the corrupted cleanup was not called");
+    return neg_finished(25, applied, "the unwinder called a corrupted cleanup pointer");
 }
 static int c_n_trace(void) {
     int n = 0;
-    _Unwind_Backtrace((int (*)(void *, void *))corrupt((void *)x_trace), &n);
-    if (n) ok_mark(26);
-    return n ? 0 : fail("corrupted trace function was not called");
+    int (*trace)(void *, void *) = (int (*)(void *, void *))hand("neg_trace.trace", (void *)x_trace);
+    int applied = signed_pointer((void *)trace);
+    _Unwind_Backtrace((int (*)(void *, void *))corrupt((void *)trace), &n);
+    if (!n) return fail("the corrupted trace function was not called");
+    return neg_finished(26, applied, "the unwinder called a corrupted trace function");
 }
 static int c_n_stop(void) {
     struct uex e = {0}; int hit = 0;
-    _Unwind_ForcedUnwind(&e, (int (*)(int, int, unsigned long long, struct uex *, void *, void *))corrupt((void *)x_stop), &hit);
-    if (hit) ok_mark(27);
-    return hit ? 0 : fail("corrupted stop function was not called");
+    int (*stopfn)(int, int, unsigned long long, struct uex *, void *, void *) =
+        (int (*)(int, int, unsigned long long, struct uex *, void *, void *))hand("neg_stop.stop", (void *)x_stop);
+    int applied = signed_pointer((void *)stopfn);
+    _Unwind_ForcedUnwind(&e, (int (*)(int, int, unsigned long long, struct uex *, void *, void *))
+                             corrupt((void *)stopfn), &hit);
+    if (!hit) return fail("the corrupted stop function was not called");
+    return neg_finished(27, applied, "the unwinder called a corrupted stop function");
 }
 
-// 28: the personality's GOT slot is corrupted (PAC bit flipped) before a throw: an authenticating
-// unwinder calls a poisoned pointer (fault); one that strips calls the real personality.
+// 28: the personality's GOT slot is corrupted (one signature bit flipped) before a throw: an
+// authenticating unwinder calls a poisoned pointer (fault); one that strips calls the real personality.
 extern int mprotect(void *, size_t, int);
 extern int cxx_same_frame(void);
 static int c_n_personality(void) {
@@ -306,19 +338,23 @@ static int c_n_personality(void) {
     uint32_t poff = *(const uint32_t *)(ui + 12), pcount = *(const uint32_t *)(ui + 16);
     put("personality slots="); putdec(pcount); nl();
     if (!pcount) return fail("no personality slots");
+    int applied = 0;
     for (uint32_t i = 0; i < pcount; i++) {
         uintptr_t *slot = (uintptr_t *)(mh + *(const uint32_t *)(ui + poff + 4 * i));
         if (mprotect((void *)((uintptr_t)slot & ~16383UL), 16384, 3)) return fail("mprotect failed");
-        *slot ^= PACBIT;
+        uintptr_t word = *slot;
+        applied |= signed_pointer((void *)word);
+        *slot = (uintptr_t)corrupt((void *)word);
     }
     int r = cxx_same_frame();
-    if (!r) ok_mark(28);
-    return r;
+    if (r) return fail("the throw through the corrupted personality slot failed for another reason");
+    return neg_finished(28, applied, "the unwinder called a corrupted personality pointer");
 }
 
 // 29-32 a DWARF-mode frame (abi_cxx.cpp, dwarf_frame_call) in the middle of the stack.
 extern int dwarf_frame_call(int (*)(void), int);
 extern int cxx_dwarf_frame(int mode);
+extern unsigned long g_dwf_saved_lr;
 static int dwf_walk(void) {
     char ctx[1024] __attribute__((aligned(16))), cur[2048] __attribute__((aligned(16)));
     int frames = 0, bad = 0, found = 0, after = 0;
@@ -340,11 +376,31 @@ static int dwf_walk(void) {
     if (!found) return fail("dwarf_frame_call frame not seen");
     return (bad || after < 2) ? fail("walk through the DWARF frame failed") : 0;
 }
-static int c_dwf_walk(void) { int r = dwarf_frame_call(dwf_walk, 0); if (!r) ok_mark(29); return r; }
-static int c_dwf_throw(void) { int r = cxx_dwarf_frame(0); if (!r) ok_mark(30); return r; }
-static int c_dwf_flip(void) { int r = cxx_dwarf_frame(1); if (!r) ok_mark(31); return r; }
-static int c_dwf_unsigned(void) { int r = cxx_dwarf_frame(2); if (!r) ok_mark(32); return r; }
+static int c_dwf_walk(void) {
+    int r = dwarf_frame_call(dwf_walk, 0);
+#if __has_feature(ptrauth_returns)
+    hand("dwarf_frame.saved_lr", (void *)g_dwf_saved_lr);
+#endif
+    if (!r) ok_mark(29);
+    return r;
+}
+static int c_dwf_throw(void) {
+    int r = cxx_dwarf_frame(0);
+    if (r) return fail("throw and catch through the DWARF frame failed");
+    ok_mark(30); return 0;
+}
+static int c_dwf_flip(void) {
+    int r = cxx_dwarf_frame(1);
+    return neg_finished(31, r != 0, "the corrupted DWARF return address was accepted");
+}
+static int c_dwf_unsigned(void) {
+    int r = cxx_dwarf_frame(2);
+    return neg_finished(32, r != 0, "the corrupted DWARF return address was accepted");
+}
 
+// expect is the verdict the check must get in the reference run (arm64e, unmutated); the driver
+// compares it there only. Checks 01-20 are the measurement and carry none. A negative check expects
+// faulted; a stripping unwinder makes it fail instead.
 const struct check checks[] = {
     {"atexit", c_atexit, 0},
     {"cxa_atexit", c_cxa_atexit, 0},
@@ -366,17 +422,17 @@ const struct check checks[] = {
     {"sigaction_handler_in_struct", c_sigaction_handler, 0},
     {"signal_return_value_called_by_arm64e", c_signal_return, 0},
     {"cxx_class_throw_manual_dtor_pointer", c_cxx_class_dtor, 0},
-    {"x_unwind_delete_exception_cleanup", c_x_cleanup, 0},
-    {"x_unwind_backtrace_callback", c_x_trace, 0},
-    {"x_unwind_forced_stop_callback", c_x_stop, 0},
-    {"neg_corrupt_return_address", c_n_ra, 0},
-    {"neg_corrupt_exception_cleanup", c_n_cleanup, 0},
-    {"neg_corrupt_backtrace_callback", c_n_trace, 0},
-    {"neg_corrupt_forced_stop_callback", c_n_stop, 0},
-    {"neg_corrupt_personality_slot", c_n_personality, 0},
-    {"dwarf_frame_walk", c_dwf_walk, 0},
-    {"dwarf_frame_throw_catch", c_dwf_throw, 0},
-    {"neg_dwarf_frame_flip_pac_bit", c_dwf_flip, 0},
-    {"neg_dwarf_frame_unsigned_lr", c_dwf_unsigned, 0},
+    {"x_unwind_delete_exception_cleanup", c_x_cleanup, "ok"},
+    {"x_unwind_backtrace_callback", c_x_trace, "ok"},
+    {"x_unwind_forced_stop_callback", c_x_stop, "ok"},
+    {"neg_corrupt_return_address", c_n_ra, "faulted"},
+    {"neg_corrupt_exception_cleanup", c_n_cleanup, "faulted"},
+    {"neg_corrupt_backtrace_callback", c_n_trace, "faulted"},
+    {"neg_corrupt_forced_stop_callback", c_n_stop, "faulted"},
+    {"neg_corrupt_personality_slot", c_n_personality, "faulted"},
+    {"dwarf_frame_walk", c_dwf_walk, "ok"},
+    {"dwarf_frame_throw_catch", c_dwf_throw, "ok"},
+    {"neg_dwarf_frame_flip_pac_bit", c_dwf_flip, "faulted"},
+    {"neg_dwarf_frame_unsigned_lr", c_dwf_unsigned, "faulted"},
 };
 const int nchecks = (int)(sizeof checks / sizeof checks[0]);

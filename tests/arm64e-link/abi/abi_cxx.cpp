@@ -1,9 +1,17 @@
-// C++ exception checks for the ABI probe (checks 11-14). No headers: the compiler's own
+// C++ exception checks for the ABI probe (checks 11-14). No SDK headers: the compiler's own
 // declarations of __cxa_throw / __gxx_personality_v0 / _Unwind_Resume resolve against Darling's
 // plain-arm64 libc++abi and libunwind. In an arm64e build every function below has a signed
 // return address (paciasp/pacibsp), the exception's typeinfo and destructor pointers are signed,
 // and the personality reaches the unwinder through a signed GOT slot.
 extern "C" {
+// The two harness services this file uses. abi_harness.h would also pull in the block types,
+// which the C++ checks do not use and a compile without -fblocks refuses.
+void *hand(const char *what, void *p);
+#if __has_feature(ptrauth_intrinsics)
+#define STRIP(p) ((void *)__builtin_ptrauth_strip((void *)(p), 0))
+#else
+#define STRIP(p) ((void *)(p))
+#endif
 
 static volatile int g_dtor_runs;
 
@@ -70,32 +78,57 @@ int cxx_class_manual_throw(int strip_dtor) {
 }
 
 
-// 24: a signed return address is corrupted (a PAC bit flipped) in the frame that throws. An authenticating
-// unwinder ends the walk at that frame (no handler, terminate); one that strips resumes at the catch.
+// 24: a signed return address is corrupted (one signature bit flipped) in the frame that throws. An
+// authenticating unwinder ends the walk at that frame (no handler, terminate); one that strips resumes
+// at the catch. The flipped bit is taken from the signature itself (saved ^ xpaci(saved)), so it lies
+// in the PAC field; a zero signature leaves the value unchanged and the check is not applicable. The
+// saved lr is recorded so the harness can flag a zero PAC field.
+static int g_ra_was_signed;
 __attribute__((noinline)) static void corrupt_and_throw(void) {
     unsigned long *saved_lr = (unsigned long *)__builtin_frame_address(0) + 1;
-    *saved_lr ^= 1UL << 50;
+    unsigned long signed_lr = *saved_lr;
+    unsigned long signature = signed_lr ^ (unsigned long)STRIP((void *)signed_lr);
+    g_ra_was_signed = signature != 0;
+#if __has_feature(ptrauth_returns)
+    hand("neg_return_address.saved_lr", (void *)signed_lr);
+#endif
+    *saved_lr = signed_lr ^ (signature & (0UL - signature));
     throw_int(1);
 }
+// 0: no signed return address to corrupt (the loop did not walk it); 1: the corrupted value resumed
+// at the catch, so the unwinder accepted it.
 int cxx_neg_return_address(void) {
-    try { corrupt_and_throw(); } catch (int) { return 0; }
+    g_ra_was_signed = 0;
+    try { corrupt_and_throw(); } catch (int) { return g_ra_was_signed ? 1 : 0; }
     return 2;
 }
 
 
-// 29-32: a frame that unwinds in DWARF mode (not compact). Apple's clang emits no negate_ra_state CFI for
-// Mach-O, so such a frame in an arm64e image saves a signed return address (pacibsp, IB key, entry SP =
-// CFA) with plain CFI offsets. The .cfi_escape (DW_CFA_GNU_args_size) is not expressible as a compact
-// encoding and forces DWARF mode, as a function with a cleanup attribute does under clang. mode 1 flips a
-// PAC bit in the saved lr before the callee runs, mode 2 overwrites it with the raw unsigned address.
+// 29-32: a frame that unwinds in DWARF mode (not compact). Inline asm has no compact-unwind entry, so the
+// linker emits the DWARF-mode encoding for it. The frame's CFI states what the frame does, in the convention
+// the open-source libunwind implements: the CIE's B augmentation marks the return address as signed with the
+// B key (DwarfParser.hpp: 'B' -> addressesSignedWithBKey), and DW_CFA_AARCH64_negate_ra_state sets the RA
+// sign state (DwarfInstructions.hpp: autib1716 with x16 = CFA when it is set). pacibsp signs with SP and
+// CFA is the entry SP here, so the modifier agrees. mode 1 flips the lowest bit of the saved signature,
+// mode 2 stores the unsigned address; both read the signature as saved ^ xpaci(saved), so a change is always
+// inside the PAC field. A zero signature leaves either mode a no-op, and the caller records the saved lr so
+// the harness flags it.
 #if __has_feature(ptrauth_returns)
-#define DWF_SIGN "pacibsp\n"
+#define DWF_SIGN ".cfi_b_key_frame\n.cfi_negate_ra_state\npacibsp\n"
 #define DWF_RET "retab\n"
 #define DWF_CORRUPT                                                                   \
     "ldr x9, [sp, #8]\n"                                                              \
+    "adrp x10, _g_dwf_saved_lr@PAGE\n"                                                \
+    "add x10, x10, _g_dwf_saved_lr@PAGEOFF\n"                                         \
+    "str x9, [x10]\n"                                                                 \
+    "mov x13, x9\n"                                                                   \
+    "xpaci x13\n"                                                                     \
+    "eor x11, x9, x13\n"                                                              \
+    "neg x12, x11\n"                                                                  \
+    "and x11, x11, x12\n"                                                             \
     "cmp w1, #1\n b.eq Ldwf_flip\n cmp w1, #2\n b.ne Ldwf_call\n"                     \
-    "xpaci x9\n b Ldwf_store\n"                                                       \
-    "Ldwf_flip: eor x9, x9, #0x4000000000000\n"                                       \
+    "mov x9, x13\n b Ldwf_store\n"                                                    \
+    "Ldwf_flip: eor x9, x9, x11\n"                                                    \
     "Ldwf_store: str x9, [sp, #8]\n"
 #else
 #define DWF_SIGN ""
@@ -107,13 +140,13 @@ int cxx_neg_return_address(void) {
 #else
 #define DWF_CALL "blr x0\n"
 #endif
+unsigned long g_dwf_saved_lr;      /* the lr the frame saved, before corruption: the signature test */
 __asm__(
     ".text\n.globl _dwarf_frame_call\n.p2align 2\n_dwarf_frame_call:\n"
     ".cfi_startproc\n"
     DWF_SIGN
     "stp x29, x30, [sp, #-16]!\n"
     ".cfi_def_cfa_offset 16\n.cfi_offset w29, -16\n.cfi_offset w30, -8\n"
-    ".cfi_escape 0x2e, 0x00\n"
     "mov x29, sp\n.cfi_def_cfa w29, 16\n"
     DWF_CORRUPT
     "Ldwf_call: " DWF_CALL
@@ -123,8 +156,14 @@ __asm__(
 extern "C" int dwarf_frame_call(int (*)(void), int);
 __attribute__((noinline)) static int thrower_cb(void) { throw_int(5); return 0; }
 int cxx_dwarf_frame(int mode) {
-    try { dwarf_frame_call(thrower_cb, mode); } catch (int v) { return v == 5 ? 0 : 1; }
-    return 2;
+    int rc = 2;
+    try { dwarf_frame_call(thrower_cb, mode); } catch (int v) { rc = v == 5 ? 0 : 1; }
+#if __has_feature(ptrauth_returns)
+    hand("dwarf_frame.saved_lr", (void *)g_dwf_saved_lr);
+    if (rc == 0 && mode != 0 && g_dwf_saved_lr != (unsigned long)STRIP((void *)g_dwf_saved_lr))
+        rc = 1;   /* there was a signature and the catch resumed: the unwinder did not authenticate it */
+#endif
+    return rc;
 }
 
 }

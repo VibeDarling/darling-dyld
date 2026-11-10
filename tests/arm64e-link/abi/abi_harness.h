@@ -25,7 +25,9 @@
 #define HAS_PAC_CALLS 0
 #endif
 
-// expect: the verdict a self-test must get (NULL for the real checks, whose verdicts are the data)
+// expect: the verdict the check must get. The selftest rows always carry one; of the real checks only
+// 21-32 do, and the driver compares those in the reference arm64e build (unmutated) only, where a
+// negative check must fault. Checks 01-20 carry NULL: their verdicts are the measurement.
 struct check { const char *name; int (*fn)(void); const char *expect; };
 extern const struct check checks[];     // the numbered checks, defined in abi_checks.c
 extern const int nchecks;

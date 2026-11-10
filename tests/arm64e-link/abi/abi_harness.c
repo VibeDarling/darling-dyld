@@ -308,13 +308,19 @@ static int driver(const char *self, const struct set *set, int mutate) {
         if (hung) put(" (no exit within the watchdog, killed)");
         else if (sig && sig != 0x7f) { put(" killed_by_signal="); putdec(sig); }
         else { put(" exit="); putdec(code); }
-        // A signed pointer whose PAC field is all zero (about 1 in 128 with 7 PAC bits) is a valid
-        // plain pointer, so a plain callee can use it: report it, it is not a pass of the ABI.
-        if (!hung && code == 0 && !sig && !mutate && contains(out, mark) &&
-            contains(out, "expect_signed=yes orig_signed=no"))
-            put(" pac_field_was_zero=yes");
+        // A signed pointer whose PAC field is all zero is a valid plain pointer, so a plain callee can
+        // use it: report it, it is not a pass of the ABI and carries no signature to authenticate.
+        int collision = !hung && code == 0 && !sig && !mutate && contains(out, mark) &&
+                        contains(out, "expect_signed=yes orig_signed=no");
+        if (collision) put(" pac_field_was_zero=yes");
         if (truncated) put(" output_truncated=yes");
-        if (set->t[n - 1].expect && !streq(set->t[n - 1].expect, verdict)) {
+        // Expectations are compared for the selftest and for the real checks in the reference arm64e
+        // build. The control and the signing variants have no signature to corrupt, so their
+        // negative checks report ok and a faulted expectation would not apply there. A collision
+        // leaves a reference check with nothing to authenticate: flag it, do not count it either way.
+        int reference = streq(set->name, "checks") && streq(ABI_VARIANT, "arm64e") && !mutate;
+        if (set->t[n - 1].expect && (streq(set->name, "selftest") || reference) &&
+            !(reference && collision) && !streq(set->t[n - 1].expect, verdict)) {
             put(" EXPECT-MISMATCH expected="); put(set->t[n - 1].expect); mismatches++;
         }
         nl();
@@ -324,6 +330,7 @@ static int driver(const char *self, const struct set *set, int mutate) {
     put(" hung="); putdec(counts[2]); put(" failed="); putdec(counts[3]);
     put(" expect_mismatches="); putdec(mismatches); nl();
     if (streq(set->name, "selftest")) return mismatches ? 1 : 0;
+    if (streq(ABI_VARIANT, "arm64e") && !mutate) return mismatches ? 1 : 0;
     return counts[0] == set->n ? 0 : 1;
 }
 
