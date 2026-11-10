@@ -89,6 +89,32 @@ static Fn8 thunkFor(const char* symbol)
 	return (Fn8)t;
 }
 
+struct Block { void* isa; int32_t flags; int32_t reserved; void* invoke; void* descriptor; };
+static const int32_t kHeap = 1 << 24, kGlobal = 1 << 28;
+// A global block's literal lives in read-only memory and carries the signature that the arm64e image's own fixups gave it:
+// built in a page that is made read-only, so that a write into it by the module crashes the test.
+static const Block* gGlobalBlock;
+static void makeGlobalBlock()
+{
+	Block* page = (Block*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	*page = { nullptr, kGlobal, 0, (void*)oracleSign(0x0000000100004000ULL, (uint64_t)&page->invoke), nullptr };
+	mprotect(page, 4096, PROT_READ);
+	gGlobalBlock = page;
+}
+
+// a heap block in read-only memory: Block_copy of it is a retain, and a write into it by the module crashes the test
+static const Block* gReadOnlyHeapBlock;
+static void makeReadOnlyHeapBlock()
+{
+	Block* page = (Block*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	*page = { nullptr, kHeap, 0, (void*)oracleSign(0x0000000100005000ULL, (uint64_t)&page->invoke), nullptr };
+	mprotect(page, 4096, PROT_READ);
+	gReadOnlyHeapBlock = page;
+}
+
+static uint64_t gBlockInvokeSeen;
+static void snapshotBlock(const uint64_t* a) { const Block* b = (const Block*)a[1]; if (b) { gBlockInvokeSeen = (uint64_t)b->invoke; } }
+
 static void checkPacWorks()
 {
 	const uint64_t p = codeAddress(1), s = oracleSign(p, 0);
@@ -299,6 +325,206 @@ static void checkAuthRows()
 	CHECK(!childSurvives(callCorruptedPointer), "a pointer with a corrupted signature ran");
 }
 
+static void checkSignal()
+{
+	Fn8 t = thunkFor("_signal");
+	const uint64_t handlerA = oracleSign(codeWithSignature(0), 0), handlerB = oracleSign(codeWithSignature(0) + 0x400, 0);
+	const uint64_t plainA = oracleStrip(handlerA), plainB = oracleStrip(handlerB), other = codeAddress(20);
+
+	// arm64e code installs A over SIG_DFL: the result 0 stays, A is remembered
+	gFakeResult = 0;
+	CHECK(t(30, handlerA, 0, 0, 0, 0, 0, 0) == 0, "signal: SIG_DFL came back changed");
+	CHECK(gSeen[0] == 30 && gSeen[1] == plainA, "signal: arguments 30, 0x%llx", (unsigned long long)gSeen[1]);
+
+	// installing B returns A, which arm64e code installed: it comes back signed IA, discriminator 0
+	gFakeResult = plainA;
+	uint64_t result = t(30, handlerB, 0, 0, 0, 0, 0, 0);
+	CHECK(result != plainA && oracleAuth(result, 0) == plainA, "signal: the handler that arm64e code installed did not come back signed");
+
+	// a value that arm64e code did not install is not signed, whatever it points at
+	gFakeResult = other;
+	CHECK(t(30, handlerA, 0, 0, 0, 0, 0, 0) == other, "signal: a handler nobody installed here was signed");
+	gFakeResult = plainB;	// B was installed before the line above replaced it
+	CHECK(t(30, handlerA, 0, 0, 0, 0, 0, 0) == plainB, "signal: a stale handler was signed");
+
+	// the special values come back as they are
+	for (uint64_t special : { 0ULL, 1ULL, ~0ULL }) {
+		gFakeResult = special;
+		CHECK(t(30, handlerA, 0, 0, 0, 0, 0, 0) == special, "signal: special value 0x%llx", (unsigned long long)special);
+	}
+	// SIG_ERR means nothing was installed: the next call must not sign the handler of the failed one
+	gFakeResult = ~0ULL;
+	t(31, handlerB, 0, 0, 0, 0, 0, 0);
+	gFakeResult = plainB;
+	CHECK(t(31, handlerA, 0, 0, 0, 0, 0, 0) == plainB, "signal: a handler whose installation failed was signed");
+	// an out of range signal number is never remembered
+	gFakeResult = 0;
+	t(100, handlerB, 0, 0, 0, 0, 0, 0);
+	gFakeResult = plainB;
+	CHECK(t(100, handlerA, 0, 0, 0, 0, 0, 0) == plainB, "signal: out of range number");
+	// a handler that does not authenticate is not remembered either
+	if ( !gFpac ) {
+		gFakeResult = 0;
+		t(29, corrupted(handlerA), 0, 0, 0, 0, 0, 0);
+		const uint64_t poisoned = gSeen[1];
+		CHECK(poisoned != plainA && poisoned != oracleStrip(poisoned), "signal: a corrupted handler reached the callee usable");
+		gFakeResult = poisoned;
+		CHECK(t(29, handlerB, 0, 0, 0, 0, 0, 0) == poisoned, "signal: a handler that failed authentication was signed on its way back");
+	}
+	// SIG_IGN as the argument survives
+	t(30, 1, 0, 0, 0, 0, 0, 0);
+	CHECK(gSeen[1] == 1, "signal: SIG_IGN changed");
+}
+
+static Block gHeapResult;
+static void checkBlockCopy()
+{
+	Fn8 t = thunkFor("__Block_copy");
+	const uint64_t target = codeWithSignature(0);
+	Block original = { nullptr, 0, 0, nullptr, nullptr };
+	original.invoke = (void*)oracleSign(codeWithSignature((uint64_t)&original.invoke), (uint64_t)&original.invoke);
+	const uint64_t plainTarget = oracleStrip((uint64_t)original.invoke);
+	(void)target;
+
+	// the plain Block_copy moves the literal and leaves the stale signature in the copy
+	gHeapResult = original;
+	gHeapResult.flags = kHeap;
+	gFakeResult = (uint64_t)&gHeapResult;
+	CHECK(t((uint64_t)&original, 0, 0, 0, 0, 0, 0, 0) == (uint64_t)&gHeapResult, "Block_copy: the block pointer changed");
+	CHECK(oracleAuth((uint64_t)gHeapResult.invoke, (uint64_t)&gHeapResult.invoke) == plainTarget, "Block_copy: the copy's invoke is not signed for its own address (IA, address-diversified, discriminator 0)");
+	CHECK(gHeapResult.flags == kHeap, "Block_copy: flags changed");
+	CHECK((uint64_t)original.invoke != (uint64_t)gHeapResult.invoke || (uint64_t)&original == (uint64_t)&gHeapResult, "Block_copy: the copy kept the stale signature");
+
+	// the original's signature is checked first: a corrupted one is not turned into a valid signature for the copy
+	Block bad = original;
+	bad.invoke = (void*)corrupted((uint64_t)original.invoke);
+	gHeapResult = bad;
+	gHeapResult.flags = kHeap;
+	t((uint64_t)&bad, 0, 0, 0, 0, 0, 0, 0);
+	CHECK(gHeapResult.invoke == bad.invoke, "Block_copy: a corrupted original was re-signed for the copy (0x%llx)", (unsigned long long)(uint64_t)gHeapResult.invoke);
+
+	// so is an invoke that was never signed (a block that plain code made)
+	Block unsignedBlock = { nullptr, 0, 0, nullptr, nullptr };
+	unsignedBlock.invoke = (void*)codeWithSignature((uint64_t)&unsignedBlock.invoke);
+	gHeapResult = unsignedBlock;
+	gHeapResult.flags = kHeap;
+	t((uint64_t)&unsignedBlock, 0, 0, 0, 0, 0, 0, 0);
+	CHECK(gHeapResult.invoke == unsignedBlock.invoke, "Block_copy: an unsigned original was signed for the copy");
+
+	// the same heap block returned (a retain, no copy): nothing is written, which the read-only page enforces
+	gFakeResult = (uint64_t)gReadOnlyHeapBlock;
+	CHECK(t((uint64_t)gReadOnlyHeapBlock, 0, 0, 0, 0, 0, 0, 0) == (uint64_t)gReadOnlyHeapBlock, "Block_copy: a retained block");
+
+	// a global block comes back as it is (its literal is read-only), and NULL stays NULL
+	CHECK(gGlobalBlock->invoke != (void*)oracleStrip((uint64_t)gGlobalBlock->invoke), "the global block of this test is not signed");
+	const void* signedInvoke = gGlobalBlock->invoke;
+	gFakeResult = (uint64_t)gGlobalBlock;
+	CHECK(t((uint64_t)gGlobalBlock, 0, 0, 0, 0, 0, 0, 0) == (uint64_t)gGlobalBlock && gGlobalBlock->invoke == signedInvoke, "Block_copy: a global block was touched");
+	gFakeResult = 0;
+	CHECK(t(0, 0, 0, 0, 0, 0, 0, 0) == 0, "Block_copy: NULL");
+}
+
+static void checkDispatch()
+{
+	for (const char* name : { "_dispatch_async", "_dispatch_once" }) {
+		Fn8 t = thunkFor(name);
+		gFakeResult = 0;
+		gHook = snapshotBlock;
+
+		// a stack block: authenticated during the call, its own signature back afterwards
+		Block stack = { nullptr, 0, 0, nullptr, nullptr };
+		const uint64_t target = codeWithSignature((uint64_t)&stack.invoke);
+		stack.invoke = (void*)oracleSign(target, (uint64_t)&stack.invoke);
+		void* original = stack.invoke;
+		t(0x1010, (uint64_t)&stack, 0, 0, 0, 0, 0, 0);
+		CHECK(gSeen[0] == 0x1010 && gSeen[1] == (uint64_t)&stack, "%s: the arguments changed", name);
+		CHECK(gBlockInvokeSeen == target, "%s: the callee saw invoke 0x%llx", name, (unsigned long long)gBlockInvokeSeen);
+		CHECK(stack.invoke == original, "%s: the caller's stack block did not get its signature back", name);
+
+		// a stack block with a corrupted signature reaches the callee unusable and is left as it was
+		Block badStack = stack;
+		badStack.invoke = (void*)corrupted((uint64_t)original);
+		void* badOriginal = badStack.invoke;
+		if ( !gFpac ) {
+			t(0x1010, (uint64_t)&badStack, 0, 0, 0, 0, 0, 0);
+			CHECK(gBlockInvokeSeen != target && gBlockInvokeSeen != oracleStrip(gBlockInvokeSeen), "%s: a corrupted invoke reached the callee usable (0x%llx)", name, (unsigned long long)gBlockInvokeSeen);
+			CHECK(badStack.invoke == badOriginal, "%s: a corrupted stack block was changed", name);
+		}
+
+		// a heap block: authenticated for good (the callee keeps it)
+		Block heap = { nullptr, kHeap, 0, nullptr, nullptr };
+		heap.invoke = (void*)oracleSign(target, (uint64_t)&heap.invoke);
+		t(0x1010, (uint64_t)&heap, 0, 0, 0, 0, 0, 0);
+		CHECK(gBlockInvokeSeen == target && heap.invoke == (void*)target, "%s: heap block", name);
+
+		// a global block lives in read-only memory: the callee gets a mirror with the invoke authenticated, the literal is untouched
+		const void* globalBefore = gGlobalBlock->invoke;
+		t(0x1010, (uint64_t)gGlobalBlock, 0, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] != (uint64_t)gGlobalBlock, "%s: a global block was passed on in place", name);
+		const Block* mirror = (const Block*)gSeen[1];
+		CHECK(mirror->flags == kGlobal && (uint64_t)mirror->invoke == oracleStrip((uint64_t)gGlobalBlock->invoke), "%s: mirror", name);
+		CHECK(gGlobalBlock->invoke == globalBefore, "%s: the global literal was written", name);
+		const uint64_t firstMirror = gSeen[1];
+		t(0x1010, (uint64_t)gGlobalBlock, 0, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] == firstMirror, "%s: a second call made a second mirror", name);
+
+		// NULL block
+		t(0x1010, 0, 0, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] == 0, "%s: NULL block", name);
+		gHook = nullptr;
+	}
+}
+
+static void checkSigaction()
+{
+	Fn8 t = thunkFor("_sigaction");
+	Fn8 sig = thunkFor("_signal");
+	const uint64_t handler = oracleSign(codeWithSignature(0), 0);
+	const uint64_t plainHandler = oracleStrip(handler);
+	struct Act { uint64_t handler; uint32_t mask; int32_t flags; };
+	Act act = { handler, 0xa5a5, 0x42 };
+	uint64_t oact[2] = { 7, 7 };
+	static Act seen;
+	gHook = [](const uint64_t* a) { if (a[1]) memcpy(&seen, (const void*)a[1], sizeof(seen)); };
+	// sigaction returns an int: the upper half of x0 is not its business
+	gFakeResult = 0xdead00000000ULL;
+	t(28, (uint64_t)&act, (uint64_t)oact, 0, 0, 0, 0, 0);
+	CHECK(gSeen[0] == 28 && gSeen[2] == (uint64_t)oact, "sigaction: the other arguments changed");
+	CHECK(gSeen[1] != (uint64_t)&act, "sigaction: the caller's struct was passed on in place");
+	CHECK(seen.handler == plainHandler && seen.mask == 0xa5a5 && seen.flags == 0x42, "sigaction: handler 0x%llx mask 0x%x flags 0x%x", (unsigned long long)seen.handler, seen.mask, seen.flags);
+	CHECK(act.handler == handler, "sigaction: the caller's struct changed");
+	// what sigaction installed is what signal may sign when it hands it back
+	gHook = nullptr;
+	gFakeResult = plainHandler;
+	const uint64_t back = sig(28, handler, 0, 0, 0, 0, 0, 0);
+	CHECK(back != plainHandler && oracleAuth(back, 0) == plainHandler, "sigaction: the installed handler did not come back from signal() signed");
+	// a handler with a corrupted signature reaches the callee unusable
+	if ( !gFpac ) {
+		Act badAct = { corrupted(handler), 0, 0 };
+		gHook = [](const uint64_t* a) { if (a[1]) memcpy(&seen, (const void*)a[1], sizeof(seen)); };
+		gFakeResult = 0;
+		t(25, (uint64_t)&badAct, 0, 0, 0, 0, 0, 0);
+		CHECK(seen.handler != plainHandler && seen.handler != oracleStrip(seen.handler), "sigaction: a corrupted handler reached the callee usable (0x%llx)", (unsigned long long)seen.handler);
+		gHook = nullptr;
+	}
+	// a failed sigaction installs nothing
+	gHook = [](const uint64_t* a) { if (a[1]) memcpy(&seen, (const void*)a[1], sizeof(seen)); };
+	Act other = { oracleSign(codeWithSignature(0) + 0x800, 0), 0, 0 };
+	gFakeResult = 0xffffffffULL;
+	t(27, (uint64_t)&other, 0, 0, 0, 0, 0, 0);
+	gHook = nullptr;
+	gFakeResult = oracleStrip(other.handler);
+	CHECK(sig(27, handler, 0, 0, 0, 0, 0, 0) == oracleStrip(other.handler), "sigaction: a handler whose installation failed was signed");
+	// the caller's struct may be read-only, so the handler cannot be changed in place; SIG_DFL and SIG_IGN pass
+	static const Act readOnlyAct = { 1, 1, 2 };
+	gHook = [](const uint64_t* a) { if (a[1]) memcpy(&seen, (const void*)a[1], sizeof(seen)); };
+	t(26, (uint64_t)&readOnlyAct, 0, 0, 0, 0, 0, 0);
+	CHECK(seen.handler == 1, "sigaction: SIG_IGN in a read-only struct");
+	t(26, 0, 0, 0, 0, 0, 0, 0);
+	CHECK(gSeen[1] == 0 && gSeen[2] == 0, "sigaction: NULL act and oact");
+	gHook = nullptr;
+}
+
 static void checkBind()
 {
 	gWarnings.clear();
@@ -349,8 +575,14 @@ int main(int argc, char** argv)
 	}
 	checkPacWorks();
 	detectFpac();
+	makeGlobalBlock();
+	makeReadOnlyHeapBlock();
 	checkTable();
 	checkAuthRows();
+	checkSignal();
+	checkBlockCopy();
+	checkDispatch();
+	checkSigaction();
 	checkBind();
 	checkSeal();
 	checkThunkPages();
