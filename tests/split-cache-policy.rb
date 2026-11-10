@@ -80,8 +80,12 @@ Dir.mktmpdir('split-cache-policy-') do |dir|
   end
   File.write("#{dir}/emptydir_marker", '')
   Dir.mkdir("#{dir}/adir")
+  File.write("#{dir}/unreadable", HEADER)
+  File.chmod(0, "#{dir}/unreadable")
   File.symlink("#{dir}/f#{REFUSED.size}", "#{dir}/link") rescue nil
 
+  unreadable_check = Process.uid == 0 ? '' :   # permissions do not apply to root
+    "error = loadSplitCachePolicy(\"#{dir}/unreadable\", &line);  CHECK(error && strstr(error, \"permission denied\") && line == 0 && current() == builtin);"
   def cpp_string(s) = '"' + s.bytes.map { |b| format('\\x%02x', b) }.join + '"'
   refused = REFUSED.map { |name, (_, line)| "{ #{cpp_string(name)}, #{cpp_string(files[name])}, #{line} }" }.join(",\n        ")
   accepted = ACCEPTED.map do |name, (_, list)|
@@ -151,7 +155,8 @@ Dir.mktmpdir('split-cache-policy-') do |dir|
       // the file itself: missing, a directory, a path that is not absolute, empty
       size_t line = 99;
       const char* error;
-      error = loadSplitCachePolicy("#{dir}/does-not-exist", &line);  CHECK(error && strstr(error, "opened") && line == 0 && current() == builtin);
+      error = loadSplitCachePolicy("#{dir}/does-not-exist", &line);  CHECK(error && strstr(error, "does not exist") && line == 0 && current() == builtin);
+      #{unreadable_check}
       error = loadSplitCachePolicy("#{dir}/adir", &line);            CHECK(error && current() == builtin);
       error = loadSplitCachePolicy("policy", &line);                 CHECK(error && strstr(error, "absolute") && current() == builtin);
       error = loadSplitCachePolicy("./#{dir}/f0", &line);            CHECK(error && strstr(error, "absolute") && current() == builtin);

@@ -677,6 +677,10 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
       // a bad policy halts a process that does map the cache, and the cache is not mapped
       m = attempt(store.c_str(), CPU_TYPE_ARM64, 0x80000002, "/Volumes/SystemRoot/x/dyld-cache.policy");
       CHECK(!m.empty() && m.find("SystemRoot") == std::string::npos && dyld3::policy.calls == 1 && dyld3::mapper.calls == 0);
+      // a refusal that is not about one line says no line
+      dyld3::policy.error = "the policy file does not exist"; dyld3::policy.line = 0;
+      m = attempt("/cache", CPU_TYPE_ARM64, 0x80000002, "/.darling-launcher/dyld-cache.policy");
+      CHECK(m.find("does not exist") != std::string::npos && m.find("line") == std::string::npos && m.find("dyld-cache.policy") != std::string::npos);
       dyld3::policy.error = nullptr;
       // a good policy and a process with no cache: no halt, nothing read, nothing mapped
       m = attempt(store.c_str(), CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, "/p");

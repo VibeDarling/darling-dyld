@@ -4466,8 +4466,11 @@ static bool mapSplitSharedCache(const macho_header* mainExecutableMH)
 	}
 	if ( sSharedCacheSplitPolicy != nullptr ) {
 		size_t errorLine;
-		if ( const char* error = dyld3::loadSplitCachePolicy(sSharedCacheSplitPolicy, &errorLine) )
+		if ( const char* error = dyld3::loadSplitCachePolicy(sSharedCacheSplitPolicy, &errorLine) ) {
+			if ( errorLine == 0 )
+				halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_POLICY '%s': %s\n", basename(sSharedCacheSplitPolicy), error));
 			halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_POLICY '%s': %s (line %lu)\n", basename(sSharedCacheSplitPolicy), error, (unsigned long)errorLine));
+		}
 	}
 	dyld3::SplitCacheMapStats stats;
 	if ( !dyld3::mapSplitCachePrivate(path, gLinkContext.verboseMapping, &sSharedCacheLoadInfo, &stats) )

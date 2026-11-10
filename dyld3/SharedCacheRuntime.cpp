@@ -1995,8 +1995,14 @@ const char* loadSplitCachePolicy(const char* path, size_t* errorLine)
     if ( path[0] != '/' )
         return "the policy path is not an absolute path";
     const int fd = dyld3::open(path, O_RDONLY, 0);
-    if ( fd == -1 )
+    if ( fd == -1 ) {
+        // static texts, so that a missing file and a refused one read differently
+        if ( errno == ENOENT )
+            return "the policy file does not exist";
+        if ( (errno == EACCES) || (errno == EPERM) )
+            return "the policy file is not readable (permission denied)";
         return "the policy file cannot be opened";
+    }
     const char* error = nullptr;
     char* text = nullptr;
     const char** entries = nullptr;
