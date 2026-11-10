@@ -255,10 +255,10 @@ def matrix_assignments_ok(script, root)
   # every guest run through the launcher's environment)
   code = script.lines.reject { |l| l.lstrip.start_with?('#') }.join
   code.scan('DYLD_SHARED_CACHE_SPLIT_DIR=').size == 1 &&
-    code.scan(/(?:\A|[; "\n])E=/).size == 1 && code.scan(/(?:\A|[; "\n])C=/).size == 1 &&
+    code.scan(/(?:\A|[;[:space:]"])E=/).size == 1 && code.scan(/(?:\A|[;[:space:]"])C=/).size == 1 &&
     log.include?("E=#{probe}/l4_probe_arm64e; C=#{probe}/l4_probe_arm64") &&
     log.scan('DYLD_SHARED_CACHE_SPLIT_DIR=').size == 1 &&
-    log.scan(/(?:\A|[; ])E=/).size == 1 && log.scan(/(?:\A|[; ])C=/).size == 1 &&
+    log.scan(/(?:\A|[;[:space:]])E=/).size == 1 && log.scan(/(?:\A|[;[:space:]])C=/).size == 1 &&
     log[/PROBE_CONFIG=c1[^;]*/].to_s == 'PROBE_CONFIG=c1 $C' &&
     log[/PROBE_CONFIG=c2[^;]*/].to_s == 'PROBE_CONFIG=c2 $E' &&
     log[/PROBE_CONFIG=c3[^;]*/].to_s == "PROBE_CONFIG=c3 DYLD_SHARED_CACHE_SPLIT_DIR=#{cache} $E" &&
@@ -297,6 +297,8 @@ Dir.mktmpdir('l4-matrix-') do |dir|
      'cmd="export DYLD_SHARED_CACHE_SPLIT_DIR=/x; E=$g/l4_probe_arm64e; C=$g/l4_probe_arm64"'],
     ['the control variable is reassigned before c1', 'PROBE_CONFIG=c1 \\$C',
      'C=$g/l4_probe_arm64e; PROBE_CONFIG=c1 \\$C'],
+    ['the control variable is reassigned with a tab before c1', 'cmd="$cmd; PROBE_CONFIG=c1 \\$C"',
+     'cmd="$cmd;' + "\t" + 'C=$g/l4_probe_arm64e; PROBE_CONFIG=c1 \\$C"'],
     ['the cache directory is exported on the host side', "set -u\n",
      "set -u\nexport DYLD_SHARED_CACHE_SPLIT_DIR=/x\n"]
   ]
@@ -345,10 +347,11 @@ Dir.mktmpdir('l4-probe-') do |tmp|
   check 'native: the self-test reports the 137 exit as faulted', st_out.match?(/^RESULT \d+ selftest_exit_137_is_faulted faulted( |$)/),
         st_out.lines.grep(/selftest_exit_137/).join
   ns_out, ns_rc = run_native(native, 'none', 'needstop')
-  check 'native: a death before the text a faulted expectation needs falls to failed, a hang stays hung, and both mismatch',
+  check 'native: a death before the text a faulted expectation needs falls to failed, a death after it stays faulted, a hang stays hung, and both designed mismatches remain',
         ns_rc == 1 && ns_out.match?(/^RESULT \d+ selftest_fault_before_its_required_text_is_failed failed( |$)/) &&
+        ns_out.match?(/^RESULT \d+ selftest_need_printed_then_fault faulted( |$)/) &&
         ns_out.match?(/^RESULT \d+ selftest_hang_is_not_failed_by_a_faulted_need hung( |$)/) &&
-        ns_out.include?('expect_mismatches=2'), ns_out[-300..]
+        ns_out.include?('expect_mismatches=2'), ns_out[-400..]
   check 'native: the driver drops and counts a child line shaped like dyld\'s adapter warning',
         st_out.include?('ADAPTER-WARNINGS-DROPPED 1') && !st_out.include?('dyld: warning, arm64e adapters:'),
         st_out.lines.grep(/ADAPTER-WARNINGS|arm64e adapters/).join
@@ -385,7 +388,11 @@ Dir.mktmpdir('l4-probe-') do |tmp|
       killed: ->(out, _rc) { out.scan(/EXPECT-MISMATCH/).size != EXPECTED_COUNT } },
     { desc: 'a hang is demoted by the need rule', config: 'none', args: ['needstop'],
       old: 'names_faulted(alts, alen) && v == 1 && need[0]', new: 'names_faulted(alts, alen) && need[0]',
-      killed: ->(out, _rc) { out.match?(/^RESULT \d+ selftest_hang_is_not_failed_by_a_faulted_need failed( |$)/) } }
+      killed: ->(out, _rc) { out.match?(/^RESULT \d+ selftest_hang_is_not_failed_by_a_faulted_need failed( |$)/) } },
+    { desc: 'a death after the text a faulted expectation needs is demoted too', config: 'none', args: ['needstop'],
+      old: 'names_faulted(alts, alen) && v == 1 && need[0] && !contains(out, need)',
+      new: 'names_faulted(alts, alen) && v == 1 && need[0] && 1',
+      killed: ->(out, _rc) { out.match?(/^RESULT \d+ selftest_need_printed_then_fault failed( |$)/) } }
   ]
   harness_killed = 0
   harness_probes.each_with_index do |p, i|
@@ -577,11 +584,10 @@ Dir.mktmpdir('l4-probe-') do |tmp|
     check 'every libc++abi stub name is exported by Darling libc++abi.dylib', (abi - exp.call('libc++abi.dylib')).empty?
     listed = File.readlines(File.join(HERE, 'libcxxabi_exports.txt')).reject { |l| l.start_with?('#') }.map { |l| "_#{l.strip}" }.sort
     built = exp.call('libc++abi.dylib').sort
-    # the file is a snapshot of the build that made the stub names, not of every later libc++abi: it
-    # must cover every name the stubs route to libc++abi, and may differ elsewhere (recorded)
-    drift = (listed - built) | (built - listed)
-    check "libcxxabi_exports.txt (a build snapshot) supplies every name the stubs route to libc++abi; #{drift.size} names differ from this build and none is used",
-          (abi - listed).empty? && (abi - built).empty? && (drift & abi).empty?, drift.first(10).inspect
+    # the file is the exact export list of the libc++abi build that made the stub names: an added or
+    # dropped name is drift to explain, not something the stubs may paper over
+    check 'libcxxabi_exports.txt matches Darling libc++abi.dylib exactly and lists every stub name it routes',
+          !listed.empty? && listed == built && (abi - listed).empty?, ((listed - built) | (built - listed)).first(10).inspect
   else
     puts 'SKIP the checks against Darling\'s built libc++ and libc++abi: set DARLING_USR_LIB'
   end

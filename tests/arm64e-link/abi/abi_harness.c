@@ -249,12 +249,17 @@ static const struct check selftests[] = {
     {"selftest_hand_returns_the_right_pointer", st_hand, "ok"},
     {"selftest_strip_and_sign_round_trip", st_strip, "ok"},
 };
-// The rule a "faulted" expectation with ";need=" adds: the first child dies before printing the text, so
-// its verdict must fall to failed, and the second hangs, which must stay a hang rather than becoming
-// failed. Run as `needstop`, which is therefore expected to exit 1 with two mismatches; the other sets
-// expect none.
+// The rule a "faulted" expectation with ";need=" adds: a death before the text falls to failed, a death
+// after it stays faulted, and a hang stays a hang rather than becoming failed. Run as `needstop`, which
+// is therefore expected to exit 1 with two mismatches (the first and the hang); the other sets expect none.
+static int st_need_then_fault(void) {
+    put("SELFTEST-REACHED-NEEDSTOP\n");
+    *(volatile int *)8 = 1;
+    return 0;
+}
 static const struct check needstops[] = {
     {"selftest_fault_before_its_required_text_is_failed", st_fault_main, "faulted;need=SELFTEST-REACHED-GET"},
+    {"selftest_need_printed_then_fault", st_need_then_fault, "faulted;need=SELFTEST-REACHED-NEEDSTOP"},
     {"selftest_hang_is_not_failed_by_a_faulted_need", st_hang, "faulted;need=NEVER-PRINTED"},
 };
 struct set { const char *name; const struct check *t; int n; };

@@ -29,10 +29,9 @@ python3 -I tests/arm64e-link/abi/tally.py <build>/logs/run-PREFIX*.out  # per (a
   `../abi/tally.py` gained a config column.
 - `build_l4.py`: build, stub generation, structural checks. `../h0/gen_stub.py` (extended:
   `undefined_names`, `exported_names`, `write_symbols`) and `../h0/build_h0.py` (a `libc++` stub entry,
-  `check_stub` for plain arm64) are reused. `libcxxabi_exports.txt`: a snapshot of the 369 names of
-  Darling's libc++abi (the LLVM 15.0.7 build that made the stub list); a later build of the same sources
-  exports a slightly different set, so the host test requires the file to cover every name the stubs use
-  and records names the local build dropped or added.
+  `check_stub` for plain arm64) are reused. `libcxxabi_exports.txt`: the exact export list of the 369
+  names of Darling's libc++abi (the LLVM 15.0.7 build that made the stub list); the host test requires it
+  to match the local build's export list exactly and to cover every name the stubs use.
 - `run_matrix.sh`: guest boots (calls `../abi/run_guest.sh`: shared lock, memory cap, `darling shutdown`);
   `L4_POLICY=<host file>` sets `DYLD_SHARED_CACHE_SPLIT_POLICY` on the c3 command.
 - `arm64e-l4-probe.rb`: the host test.
@@ -95,9 +94,7 @@ recorded fact, never a fault. In c3 it also requires the image to be `/usr/lib/l
 | 20-24 | q4_thread_capturing_lambda, mutex_counter, condition_variable_handoff, call_once_across_threads, thread_local_destructor | threads, locks, `call_once` (also after a throwing first call), a `thread_local` destructor per thread (`_tlv_atexit`) |
 | 25-26 | q5_atexit_and_static_destructor, q5_exit_flushes_cout | a static initialiser ran before `main`; atexit handlers in reverse order, then the static object's destructor, whose unflushed cout text must appear in the output; `exit` flushes cout |
 | 27-28 | q6_static_local_contention, q6_static_local_init_throws | 16 guarded statics, 8 threads released together, each initialised once and never seen half-built; `__cxa_guard_abort` after a throwing initialiser |
-
 | x1-x8 | x1_get_terminate, x2_set_get_terminate, x3_allocate_free_exception, x4-x7_init_primary_*, x8_get_unexpected_via_dlsym | diagnostics, not in the plan: public runtime API calls that bisect a throw failure; `__cxa_init_primary_exception` is found by `dlsym` with a null, a signed and a stripped destructor and a class typeinfo. Recorded only (`any` everywhere), so they never turn a run into a mismatch |
-
 | y1-y2 | y1_handler_slots, y2_set_signed_terminate_then_init | diagnostics on the cache's `__cxa_terminate_handler` slot, the value that made every c3 throw trap (Darling's libobjc calls `std::set_terminate(&_objc_terminate)` with a plain pointer): y1 prints which key and discriminator the slot authenticates under and the image its target lies in; y2 hands the runtime a compiler-signed handler, then runs `__cxa_init_primary_exception` and a throw. Recorded only |
 | z1-z8 | z1_plain_entry_is_signed ... z8_throw_after_plain_set | plain code (`l4_plain.dylib`) calls the cache's `set_terminate`/`get_terminate` through the dyld reverse adapters. z1: a plain function entry is signed IA/0 and the old handler comes back raw. z2-z4: entry + 4, an arm64e address and a data address are stored as they are. z5: a handler that arm64e code installed comes back raw and is signed again when handed back; an arm64e address never handed out is not signed. z6: a corrupted slot stops the process (expected `faulted`, credited only if the child printed its marker before the corrupting call, so an earlier crash is `failed`) instead of handing plain code a stripped pointer. z7: a null handler becomes the default. z8: a throw works after plain code installed its handler. `ok` in c3 (z6 `faulted`), recorded only elsewhere |
 

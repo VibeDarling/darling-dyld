@@ -45,9 +45,9 @@ exit 137 (must be `faulted`), a line shaped like dyld's adapter warning (must be
 `hand()` returns the right pointer and the strip/sign round trip. It runs plain and under `mutate`.
 A check whose expectation names `faulted` and carries `;need=TEXT` is credited only when the child
 printed TEXT: a death before that point is `failed`, so a fault in the wrong place cannot satisfy the
-expectation (L4's z6 relies on this). The `needstop` set checks that rule from both sides (a death
-before the text is `failed`, a hang stays `hung`) and is expected to exit 1 with two mismatches; the
-`selftest` and a configured `checks` run expect none.
+expectation (L4's z6 relies on this). The `needstop` set checks that rule (a death before the text is
+`failed`, a death after it stays `faulted`, a hang stays `hung`) and is expected to exit 1 with two
+mismatches; the `selftest` and a configured `checks` run expect none.
 One limit: a fault in a TSD destructor at thread exit is a SIGSEGV kill with no handler output
 (check 03 is judged by its `HAND` line and the signal). Exit status above 128 (Darling's
 signal-trampoline death, check 18: 137) counts as `faulted`. A child that writes more than the
