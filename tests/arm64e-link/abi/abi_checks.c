@@ -230,6 +230,121 @@ static int c_signal_return(void) {
     return 0;
 }
 
+// ---- T1 extras (libunwind PAC work): 21-23 pass a function pointer to libunwind and expect it to run;
+// 24-27 corrupt the signature (flip a PAC bit) and expect libunwind to fault or abort, never to run it.
+// The "neg" checks are only meaningful in the arm64e column (the plain control has no signature, so the
+// flipped bit is just a bad address); they pass in an unauthenticating libunwind and fault in an authenticating one.
+struct uex { unsigned long long exception_class; void (*exception_cleanup)(int, struct uex *);
+             unsigned long long private_1, private_2; } __attribute__((aligned(16)));
+extern void _Unwind_DeleteException(struct uex *);
+extern int _Unwind_Backtrace(int (*)(void *, void *), void *);
+extern int _Unwind_ForcedUnwind(struct uex *, int (*)(int, int, unsigned long long, struct uex *, void *, void *), void *);
+#define PACBIT (1ULL << 50)
+static volatile int g_ran;
+static void x_cleanup(int reason, struct uex *e) { (void)e; g_ran = reason; }
+static int x_trace(void *ctx, void *ref) { (void)ctx; return ++*(int *)ref >= 2 ? 4 : 0; }
+static int x_stop(int v, int a, unsigned long long c, struct uex *e, void *ctx, void *p) {
+    (void)v; (void)a; (void)c; (void)e; (void)ctx; g_ran = 1; *(int *)p = 1; return 2; }
+static void *corrupt(void *p) { return (void *)((uintptr_t)p ^ PACBIT); }
+static int c_x_cleanup(void) {
+    struct uex e = {0}; e.exception_cleanup = x_cleanup; g_ran = 0;
+    _Unwind_DeleteException(&e);
+    if (g_ran != 1) return fail("cleanup did not run with reason 1");
+    ok_mark(21); return 0;
+}
+static int c_x_trace(void) {
+    int n = 0; int r = _Unwind_Backtrace(x_trace, &n);
+    if (n != 2 || r != 4) return fail("trace function not called twice or its result not returned");
+    ok_mark(22); return 0;
+}
+static int c_x_stop(void) {
+    struct uex e = {0}; int hit = 0;
+    int r = _Unwind_ForcedUnwind(&e, x_stop, &hit);
+    if (!hit) return fail("stop function not called");
+    ok_mark(23); (void)r; return 0;
+}
+extern int cxx_neg_return_address(void);
+static int c_n_ra(void) { int r = cxx_neg_return_address(); if (!r) ok_mark(24); return r; }
+static int c_n_cleanup(void) {
+    struct uex e = {0}; e.exception_cleanup = x_cleanup; g_ran = 0;
+    e.exception_cleanup = (void (*)(int, struct uex *))corrupt((void *)e.exception_cleanup);
+    _Unwind_DeleteException(&e);
+    if (g_ran) ok_mark(25);
+    return g_ran ? 0 : fail("corrupted cleanup was not called");
+}
+static int c_n_trace(void) {
+    int n = 0;
+    _Unwind_Backtrace((int (*)(void *, void *))corrupt((void *)x_trace), &n);
+    if (n) ok_mark(26);
+    return n ? 0 : fail("corrupted trace function was not called");
+}
+static int c_n_stop(void) {
+    struct uex e = {0}; int hit = 0;
+    _Unwind_ForcedUnwind(&e, (int (*)(int, int, unsigned long long, struct uex *, void *, void *))corrupt((void *)x_stop), &hit);
+    if (hit) ok_mark(27);
+    return hit ? 0 : fail("corrupted stop function was not called");
+}
+
+// 28: the personality's GOT slot is corrupted (PAC bit flipped) before a throw: an authenticating
+// unwinder calls a poisoned pointer (fault); one that strips calls the real personality.
+extern int mprotect(void *, size_t, int);
+extern int cxx_same_frame(void);
+static int c_n_personality(void) {
+    const unsigned char *mh = (const unsigned char *)_dyld_get_image_header(0);
+    const unsigned char *lc = mh + 32;
+    uintptr_t text_vmaddr = 0; const unsigned char *ui = 0;
+    for (uint32_t i = 0; i < *(const uint32_t *)(mh + 16); i++, lc += *(const uint32_t *)(lc + 4)) {
+        if (*(const uint32_t *)lc != 0x19 || lc[8] != '_' || lc[9] != '_' || lc[10] != 'T' || lc[11] != 'E') continue;
+        text_vmaddr = *(const uintptr_t *)(lc + 24);
+        uint32_t nsects = *(const uint32_t *)(lc + 64);
+        const unsigned char *sc = lc + 72;
+        for (uint32_t j = 0; j < nsects; j++, sc += 80)
+            if (sc[0] == '_' && sc[2] == 'u' && sc[3] == 'n' && sc[4] == 'w' && sc[5] == 'i' && sc[6] == 'n' && sc[7] == 'd' && sc[8] == '_' && sc[9] == 'i')
+                ui = (const unsigned char *)((uintptr_t)mh - text_vmaddr + *(const uintptr_t *)(sc + 32));
+    }
+    if (!ui) return fail("no __unwind_info");
+    uint32_t poff = *(const uint32_t *)(ui + 12), pcount = *(const uint32_t *)(ui + 16);
+    put("personality slots="); putdec(pcount); nl();
+    if (!pcount) return fail("no personality slots");
+    for (uint32_t i = 0; i < pcount; i++) {
+        uintptr_t *slot = (uintptr_t *)(mh + *(const uint32_t *)(ui + poff + 4 * i));
+        if (mprotect((void *)((uintptr_t)slot & ~16383UL), 16384, 3)) return fail("mprotect failed");
+        *slot ^= PACBIT;
+    }
+    int r = cxx_same_frame();
+    if (!r) ok_mark(28);
+    return r;
+}
+
+// 29-32 a DWARF-mode frame (abi_cxx.cpp, dwarf_frame_call) in the middle of the stack.
+extern int dwarf_frame_call(int (*)(void), int);
+extern int cxx_dwarf_frame(int mode);
+static int dwf_walk(void) {
+    char ctx[1024] __attribute__((aligned(16))), cur[2048] __attribute__((aligned(16)));
+    int frames = 0, bad = 0, found = 0, after = 0;
+    if (unw_getcontext(ctx) || unw_init_local(cur, ctx)) return fail("unw_getcontext/unw_init_local failed");
+    for (;;) {
+        uintptr_t ip = 0, pi[16] = {0};
+        unw_get_reg(cur, UNW_REG_IP, &ip);
+        int rc = unw_get_proc_info(cur, pi);
+        if (rc || ip != (uintptr_t)STRIP((void *)ip)) bad++;
+        if (pi[0] == (uintptr_t)STRIP((void *)dwarf_frame_call)) {
+            found = 1;
+            put("DWARF-FRAME format="); puthex((uint32_t)pi[6]); nl();
+            if (((uint32_t)pi[6] & 0x0f000000) != 0x03000000) bad++;
+        } else if (found) after++;
+        frames++;
+        if (unw_step(cur) <= 0 || frames >= 16) break;
+    }
+    put("frames="); putdec(frames); put(" after="); putdec(after); put(" bad="); putdec(bad); nl();
+    if (!found) return fail("dwarf_frame_call frame not seen");
+    return (bad || after < 2) ? fail("walk through the DWARF frame failed") : 0;
+}
+static int c_dwf_walk(void) { int r = dwarf_frame_call(dwf_walk, 0); if (!r) ok_mark(29); return r; }
+static int c_dwf_throw(void) { int r = cxx_dwarf_frame(0); if (!r) ok_mark(30); return r; }
+static int c_dwf_flip(void) { int r = cxx_dwarf_frame(1); if (!r) ok_mark(31); return r; }
+static int c_dwf_unsigned(void) { int r = cxx_dwarf_frame(2); if (!r) ok_mark(32); return r; }
+
 const struct check checks[] = {
     {"atexit", c_atexit, 0},
     {"cxa_atexit", c_cxa_atexit, 0},
@@ -251,5 +366,17 @@ const struct check checks[] = {
     {"sigaction_handler_in_struct", c_sigaction_handler, 0},
     {"signal_return_value_called_by_arm64e", c_signal_return, 0},
     {"cxx_class_throw_manual_dtor_pointer", c_cxx_class_dtor, 0},
+    {"x_unwind_delete_exception_cleanup", c_x_cleanup, 0},
+    {"x_unwind_backtrace_callback", c_x_trace, 0},
+    {"x_unwind_forced_stop_callback", c_x_stop, 0},
+    {"neg_corrupt_return_address", c_n_ra, 0},
+    {"neg_corrupt_exception_cleanup", c_n_cleanup, 0},
+    {"neg_corrupt_backtrace_callback", c_n_trace, 0},
+    {"neg_corrupt_forced_stop_callback", c_n_stop, 0},
+    {"neg_corrupt_personality_slot", c_n_personality, 0},
+    {"dwarf_frame_walk", c_dwf_walk, 0},
+    {"dwarf_frame_throw_catch", c_dwf_throw, 0},
+    {"neg_dwarf_frame_flip_pac_bit", c_dwf_flip, 0},
+    {"neg_dwarf_frame_unsigned_lr", c_dwf_unsigned, 0},
 };
 const int nchecks = (int)(sizeof checks / sizeof checks[0]);

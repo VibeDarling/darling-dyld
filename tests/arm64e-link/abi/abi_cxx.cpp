@@ -69,4 +69,62 @@ int cxx_class_manual_throw(int strip_dtor) {
     return g_dtor_runs >= 1 ? 0 : 3;
 }
 
+
+// 24: a signed return address is corrupted (a PAC bit flipped) in the frame that throws. An authenticating
+// unwinder ends the walk at that frame (no handler, terminate); one that strips resumes at the catch.
+__attribute__((noinline)) static void corrupt_and_throw(void) {
+    unsigned long *saved_lr = (unsigned long *)__builtin_frame_address(0) + 1;
+    *saved_lr ^= 1UL << 50;
+    throw_int(1);
+}
+int cxx_neg_return_address(void) {
+    try { corrupt_and_throw(); } catch (int) { return 0; }
+    return 2;
+}
+
+
+// 29-32: a frame that unwinds in DWARF mode (not compact). Apple's clang emits no negate_ra_state CFI for
+// Mach-O, so such a frame in an arm64e image saves a signed return address (pacibsp, IB key, entry SP =
+// CFA) with plain CFI offsets. The .cfi_escape (DW_CFA_GNU_args_size) is not expressible as a compact
+// encoding and forces DWARF mode, as a function with a cleanup attribute does under clang. mode 1 flips a
+// PAC bit in the saved lr before the callee runs, mode 2 overwrites it with the raw unsigned address.
+#if __has_feature(ptrauth_returns)
+#define DWF_SIGN "pacibsp\n"
+#define DWF_RET "retab\n"
+#define DWF_CORRUPT                                                                   \
+    "ldr x9, [sp, #8]\n"                                                              \
+    "cmp w1, #1\n b.eq Ldwf_flip\n cmp w1, #2\n b.ne Ldwf_call\n"                     \
+    "xpaci x9\n b Ldwf_store\n"                                                       \
+    "Ldwf_flip: eor x9, x9, #0x4000000000000\n"                                       \
+    "Ldwf_store: str x9, [sp, #8]\n"
+#else
+#define DWF_SIGN ""
+#define DWF_RET "ret\n"
+#define DWF_CORRUPT ""
+#endif
+#if __has_feature(ptrauth_calls)
+#define DWF_CALL "blraaz x0\n"
+#else
+#define DWF_CALL "blr x0\n"
+#endif
+__asm__(
+    ".text\n.globl _dwarf_frame_call\n.p2align 2\n_dwarf_frame_call:\n"
+    ".cfi_startproc\n"
+    DWF_SIGN
+    "stp x29, x30, [sp, #-16]!\n"
+    ".cfi_def_cfa_offset 16\n.cfi_offset w29, -16\n.cfi_offset w30, -8\n"
+    ".cfi_escape 0x2e, 0x00\n"
+    "mov x29, sp\n.cfi_def_cfa w29, 16\n"
+    DWF_CORRUPT
+    "Ldwf_call: " DWF_CALL
+    "ldp x29, x30, [sp], #16\n"
+    DWF_RET
+    ".cfi_endproc\n");
+extern "C" int dwarf_frame_call(int (*)(void), int);
+__attribute__((noinline)) static int thrower_cb(void) { throw_int(5); return 0; }
+int cxx_dwarf_frame(int mode) {
+    try { dwarf_frame_call(thrower_cb, mode); } catch (int v) { return v == 5 ? 0 : 1; }
+    return 2;
+}
+
 }

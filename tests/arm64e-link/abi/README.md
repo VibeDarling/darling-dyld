@@ -60,6 +60,31 @@ rare `ok` of a C++ check in a signed build may be a collision too; the tables co
 - `mutate` mode hands the pointer in the form an adapter would: stripped (01-10, 18, and 20's destructor pointer), re-signed for the block copy (17) and for the handler `signal` returns (19); in 16 it strips what Darling's dyld signed (the call must fault).
 - control: plain arm64, no PAC instruction in the file (checked by the build script).
 
+## Checks 21-32: unwinder pointer authentication
+
+Added for the PAC-aware Darling libunwind (VibeDarling/darling-libunwind). They exercise libunwind with
+function pointers and frames the arm64e executable signs, and corrupt the signature to show that the
+unwinder authenticates instead of stripping. Expected results are for a libunwind that authenticates;
+against the unmodified one, 29 fails, 30 faults and 32 is `ok` (the unsigned return address resumes).
+
+| # | check | what it does | arm64e expectation |
+|---|---|---|---|
+| 21 | x_unwind_delete_exception_cleanup | `_Unwind_DeleteException` on an exception whose `exception_cleanup` the compiler signed (IA, discriminator 0) | ok |
+| 22 | x_unwind_backtrace_callback | `_Unwind_Backtrace` with a signed trace function | ok |
+| 23 | x_unwind_forced_stop_callback | `_Unwind_ForcedUnwind` with a signed stop function | ok |
+| 24 | neg_corrupt_return_address | flip a PAC bit in the saved lr of the throwing frame, then throw | faulted (terminate) |
+| 25-27 | neg_corrupt_* | flip a PAC bit in the cleanup, trace or stop pointer | faulted |
+| 28 | neg_corrupt_personality_slot | flip a PAC bit in the personality GOT slot (found through `__unwind_info`), then throw | faulted |
+| 29 | dwarf_frame_walk | walk through a hand-written frame forced into DWARF unwind mode (`.cfi_escape`), saved lr signed with pacibsp and no negate_ra_state CFI, as Apple's compilers emit for Mach-O | ok |
+| 30 | dwarf_frame_throw_catch | C++ throw and catch through that frame | ok |
+| 31 | neg_dwarf_frame_flip_pac_bit | same, saved lr with a PAC bit flipped | faulted |
+| 32 | neg_dwarf_frame_unsigned_lr | same, saved lr overwritten with the raw unsigned address (1 in 128 per boot: the correct signature may be zero) | faulted |
+
+The negative checks mean nothing in the plain-arm64 control (it has no signatures; a flipped bit just corrupts
+the pointer) and in the `noret*` variants (an arm64e image with unsigned return addresses, which libunwind
+no longer walks). Read them in the `arm64e` column. A strip in place of the authentication makes 24-27, 28,
+31 and 32 `ok`.
+
 ## Results
 
 Guest: the private Darling build (superproject `b456e0f1b`, dyld `a5ac1eb`), host Apple M1 under
