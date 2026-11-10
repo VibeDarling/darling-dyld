@@ -2,10 +2,17 @@
 // symbol, authMask, blockArg, structArg, return fix, argCount, status, evidence. Argument numbers count from 0.
 // Provenance: the probed rows are the checks of tests/arm64e-link/abi (L2 ABI probe); every other row follows from the
 // public prototype listed by the T0 facts scan of the callback-taking imports of the C++ runtime, ObjC and Foundation
-// closures (tests/darling-arm64e-callback-imports.tsv): a code pointer argument in a register is ShapeOnly, anything the
+// closures, plus exports found later by review and by the report mode (tests/darling-arm64e-callback-imports.tsv lists every
+// row but the probed ones and __tlv_atexit, and the test fails if the table and the file differ): a code pointer argument in
+// a register is ShapeOnly, anything the
 // probe did not run (blocks beyond dispatch_async and dispatch_once, structs that hold code pointers, callbacks passed on the
-// stack) is Unsupported and warns when an arm64e image imports it. The last group of hand rows (heapsort to
-// objc_retainBlock) are callback-taking exports that the T0 lists do not contain, checked against the SDK headers.
+// stack) is Unsupported and warns when an arm64e image imports it.
+//
+// What this means for programs: dispatch_async and dispatch_once with a block that captures an object or a __block
+// variable (copy and dispose helpers, which arm64e signs), and with any heap block, stop with SIGTRAP and a message that
+// names the symbol and the arm64e shim. Most Objective-C dispatch_async calls are in that group. Only blocks with plain
+// captures on the stack, and global blocks, run. That is deliberate (the alternative corrupts shared blocks) and is the
+// evidence that the shim (decision Q3 option B) is needed from L5.
 #define BLK "a block argument: only dispatch_async and dispatch_once are shown (L2 checks 07-09)"
 #define STACKARG "the callback is not passed in a register, which the thunks do not handle"
 #define STRUCT "a struct that holds a code pointer: only the sigaction handler is shown (L2 check 18)"
@@ -22,8 +29,8 @@
 	{ "_signal", 0x2, 0, 0, ReturnFix::SignInstalledHandler, 2, AdapterStatus::Probed, "L2 check 19" },
 	{ "__Block_copy", 0x0, 0, 0, ReturnFix::ResignCopiedBlock, 1, AdapterStatus::Probed, "L2 check 17; a block with helpers aborts with a message (needs the arm64e shim)" },
 	{ "__tlv_atexit", 0x1, 0, 0, ReturnFix::None, 2, AdapterStatus::ShapeOnly, "the shape of L2 checks 01 and 03; imported by test programs, not in the T0 lists" },
-	{ "___cxa_throw", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::Probed, "L2 check 20 (the destructor pointer __cxa_throw stores; found by the report mode in a guest run)" },
-	{ "___cxa_thread_atexit", 0x1, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "libcxxabi cxxabi.h: dtor is argument 0; the shape of L2 check 02" },
+	{ "___cxa_throw", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "cxxabi.h: dest is argument 2, the destructor that __cxa_throw stores (the shape of L2 check 20, which passes with that pointer stripped and still faults here for the unwinder, T1); found by the report mode" },
+	{ "___cxa_thread_atexit", 0x1, 0, 0, ReturnFix::None, 1, AdapterStatus::ShapeOnly, "libcxxabi cxxabi.h: dtor is argument 0; the shape of L2 check 02" },
 	{ "_heapsort", 0x8, 0, 0, ReturnFix::None, 4, AdapterStatus::ShapeOnly, "stdlib.h: compar is argument 3; the shape of L2 check 06" },
 	{ "_psort", 0x8, 0, 0, ReturnFix::None, 4, AdapterStatus::ShapeOnly, "stdlib.h: compar is argument 3; the shape of L2 check 06" },
 	{ "_tsearch", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "search.h: compar is argument 2; called during the call only" },
@@ -32,8 +39,8 @@
 	{ "_twalk", 0x2, 0, 0, ReturnFix::None, 2, AdapterStatus::ShapeOnly, "search.h: the action is argument 1; called during the call only" },
 	{ "_lfind", 0x10, 0, 0, ReturnFix::None, 5, AdapterStatus::ShapeOnly, "search.h: compar is argument 4; called during the call only" },
 	{ "_lsearch", 0x10, 0, 0, ReturnFix::None, 5, AdapterStatus::ShapeOnly, "search.h: compar is argument 4; called during the call only" },
-	{ "_ftw", 0x2, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "ftw.h: fn is argument 1; called during the call only" },
-	{ "_nftw", 0x2, 0, 0, ReturnFix::None, 4, AdapterStatus::ShapeOnly, "ftw.h: fn is argument 1; called during the call only" },
+	{ "_ftw", 0x2, 0, 0, ReturnFix::None, 2, AdapterStatus::ShapeOnly, "ftw.h: fn is argument 1; called during the call only" },
+	{ "_nftw", 0x2, 0, 0, ReturnFix::None, 2, AdapterStatus::ShapeOnly, "ftw.h: fn is argument 1; called during the call only" },
 	{ "_dispatch_barrier_async_f", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "dispatch/queue.h: work is argument 2; the shape of _dispatch_async_f" },
 	{ "_dispatch_barrier_sync_f", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "dispatch/queue.h: work is argument 2; the shape of _dispatch_sync_f" },
 	{ "_dispatch_async_and_wait_f", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "dispatch/queue.h: work is argument 2; the shape of _dispatch_async_f" },

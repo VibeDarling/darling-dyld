@@ -1801,7 +1801,8 @@ static void overrideSplitCacheGotSlots()
 			const ImageLoader* foundIn;
 			uintptr_t found;
 			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) ) {
-				// the importer is a cache image, which is arm64e; a callback-taking export of a plain image gets a thunk
+				// the importer is a cache image, which is arm64e; a callback-taking export of a plain image gets a thunk. found is
+				// the exporter's own definition, so unlike a resolved bind it can never be an interposer's address
 				*address = dyld3::darling::adaptedTarget(symbol, found, dyld3::darling::cpusubtypeIsArm64e(foundIn->machHeader()->cpusubtype));
 				if ( verbose )
 					dyld::log("dyld: patched %s %s -> %s\n", installPath, symbol, foundIn->getPath());

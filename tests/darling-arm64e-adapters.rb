@@ -47,31 +47,10 @@ HAND = {
   '_signal' => [0x2, 0, 0, 1, 2, 0],                       # sig_t signal(int, sig_t)
   '__Block_copy' => [0x0, 0, 0, 2, 1, 0],                  # void* _Block_copy(const void*)
   '__tlv_atexit' => [0x1, 0, 0, 0, 2, 1],                  # (void (*termFunc)(void*), void* objAddr); not in the T0 lists
-  # callback-taking exports that the T0 lists lack: libcxxabi's cxxabi.h (found by the report mode) and the SDK headers
-  '___cxa_throw' => [0x4, 0, 0, 0, 3, 0],                  # (thrown_exception, tinfo, void (*dest)(void*))
-  '___cxa_thread_atexit' => [0x1, 0, 0, 0, 3, 1],          # (void (*)(void*), void*, void*)
-  '_heapsort' => [0x8, 0, 0, 0, 4, 1],                     # stdlib.h (base, nel, width, compar)
-  '_psort' => [0x8, 0, 0, 0, 4, 1],
-  '_tsearch' => [0x4, 0, 0, 0, 3, 1],                      # search.h (key, rootp, compar)
-  '_tfind' => [0x4, 0, 0, 0, 3, 1],
-  '_tdelete' => [0x4, 0, 0, 0, 3, 1],
-  '_twalk' => [0x2, 0, 0, 0, 2, 1],                        # (root, action)
-  '_lfind' => [0x10, 0, 0, 0, 5, 1],                       # (key, base, nelp, width, compar)
-  '_lsearch' => [0x10, 0, 0, 0, 5, 1],
-  '_ftw' => [0x2, 0, 0, 0, 3, 1],                          # ftw.h (path, fn, nfds)
-  '_nftw' => [0x2, 0, 0, 0, 4, 1],                         # (path, fn, nfds, flags)
-  '_dispatch_barrier_async_f' => [0x4, 0, 0, 0, 3, 1],     # dispatch/queue.h (queue, context, work)
-  '_dispatch_barrier_sync_f' => [0x4, 0, 0, 0, 3, 1],
-  '_dispatch_async_and_wait_f' => [0x4, 0, 0, 0, 3, 1],
-  '_dispatch_group_notify_f' => [0x8, 0, 0, 0, 4, 1],      # dispatch/group.h (group, queue, context, work)
-  '_heapsort_b' => [0, 0, 0, 0, 0, 3],                     # block comparators
-  '_psort_b' => [0, 0, 0, 0, 0, 3],
-  '_sigset' => [0, 0, 0, 0, 0, 3],                         # returns a disposition, takes SIG_HOLD
-  '_objc_retainBlock' => [0, 0, 0, 0, 0, 3],               # returns a stored block
 }.freeze
 # The callback-taking imports of the C++ runtime, ObjC and Foundation closures from the T0 facts scan: class, public prototype note.
 FIXTURE = File.readlines(File.join(root, 'tests/darling-arm64e-callback-imports.tsv'), chomp: true).drop(1).map { |l| l.split("\t") }
-              .to_h { |sym, cls, note, present| [sym, [cls, note, present]] }
+              .to_h { |sym, cls, note, present, source| [sym, [cls, note, present, source]] }
 UNWIND = %w[__Unwind_RaiseException __Unwind_Resume __Unwind_DeleteException].freeze
 
 # What the facts say a symbol needs, derived here from the prototype note and not from the table
@@ -84,7 +63,7 @@ def derived(sym, cls, note)
 end
 
 SPEC = HAND.dup
-FIXTURE.each { |sym, (cls, note, present)| SPEC[sym] ||= derived(sym, cls, note) if present == 'OK' }
+FIXTURE.each { |sym, (cls, note, present, _source)| SPEC[sym] ||= derived(sym, cls, note) if present == 'OK' }
 SPEC.freeze
 # the symbols the L4 set and the L2 probe import (plan shared-cache-m3-l4.md Q1)
 L4_AND_L2 = %w[___cxa_atexit _atexit _pthread_key_create _pthread_create _pthread_once __tlv_atexit _qsort _dispatch_async
@@ -180,8 +159,8 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     'an auth thunk strips (xpaci) instead of authenticating' => ['0xDAC133E0 | i', '0xDAC143E0 | i'],
     'an auth thunk authenticates 0, 1 and -1 too' => ['0x54000049;', '0xD503201F;'],
     'an auth thunk loses its branch' => ['words[n++] = 0xD61F0200;', 'words[n++] = kNop;'],
-    'the call thunk strips instead of authenticating a code pointer' => ['a[i] = authenticateHandler(a[i]);', 'a[i] = stripCode(a[i]);'],
-    'a code pointer of 0, 1 or -1 is authenticated' => [/if \( isSpecialHandler\(pointer\) \)\s+return pointer;/, ''],
+    'the call thunk strips instead of authenticating a code pointer' => ['const HandlerArg arg = authenticateHandler(a[i]);', 'const HandlerArg arg = { stripCode(a[i]), true };'],
+    'a code pointer of 0, 1 or -1 is authenticated' => [/if \( isSpecialHandler\(pointer\) \)\s+return \{ pointer, false \};/, ''],
     'a block invoke is stripped instead of authenticated' => ['const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);', 'const uint64_t plainInvoke = stripCode((uint64_t)block->invoke);'],
     'a block invoke is authenticated with discriminator 0 instead of its address' => ['const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);', 'const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, 0);'],
     'a heap block is rewritten in place instead of refused' => [/if \( block->flags & kBlockNeedsFree \)\s+refuseBlock\(row, "a heap block"\);/, ''],
@@ -196,16 +175,22 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     'Block_copy rewrites a block that was only retained' => ['&& (result != originalBlock)', ''],
     'Block_copy re-signs without address diversity' => ['&copy->invoke, true, 0, 0)', 'nullptr, false, 0, 0)'],
     'signal signs a handler that nobody installed through an adapter' => ['if ( wasInstalledHere(sig, result) )', 'if ( true )'],
-    'signal signs SIG_IGN and SIG_ERR' => [/if \( !isSpecialHandler\(result\) \) \{(\s+if \( wasInstalledHere)/, 'if ( true ) {\1'],
-    'signal does not remember the handler it installed' => ['recordInstalledHandler(sig, a[1]);', ''],
+    'signal does not remember the handler it installed' => ['recordInstalledHandler(sig, ((genuine >> 1) & 1) ? a[1] : 0);', ''],
     'signal remembers a handler whose installation failed' => ['if ( !failed )', 'if ( true )'],
-    'a handler that failed authentication is remembered' => ['if ( validSignal(sig) && authenticated(plainHandler) )', 'if ( validSignal(sig) )'],
-    'sigaction does not remember the handler it installed' => ['recordInstalledHandler(sig, structCopy[0]);', ''],
+    'a handler that failed authentication counts as genuine' => ['return { result, false };', 'return { result, true };'],
+    'sigaction does not remember the handler it installed' => ['recordInstalledHandler(sig, structGenuine ? structCopy[0] : 0);', ''],
     'sigaction judges its int result by the whole register' => ['if ( ((int)result == 0) && (a[row->structArg - 1] != 0) )', 'if ( (result == 0) && (a[row->structArg - 1] != 0) )'],
-    'sigaction strips the handler instead of authenticating it' => ['structCopy[0] = authenticateHandler(structCopy[0]);', 'structCopy[0] = stripCode(structCopy[0]);'],
-    'a pointer that was never handed out is accepted when it fails authentication' => ['if ( !authenticated(result) && wasHandedOut(pointer) )', 'if ( !authenticated(result) )'],
+    'sigaction strips the handler instead of authenticating it' => ['const HandlerArg arg = authenticateHandler(structCopy[0]);', 'const HandlerArg arg = { stripCode(structCopy[0]), true };'],
+    'a pointer that was never handed out is accepted when it fails authentication' => ['if ( wasHandedOut(pointer) )', 'if ( true )'],
     'a signal() result that plain code installed is not remembered as handed out' => [/else\s+recordHandedOut\(result\);/, ''],
-    'a sigaction old action is not remembered as handed out' => ['recordHandedOut(*(const uint64_t*)a[row->structArg]);', ''],
+    'a sigaction old action is not remembered as handed out' => ['recordHandedOut(oldCopy[0]);', ''],
+    'signal records a handler that the ring accepted as installed by arm64e code' => ['recordInstalledHandler(sig, ((genuine >> 1) & 1) ? a[1] : 0);', 'recordInstalledHandler(sig, a[1]);'],
+    'every handler argument counts as genuinely signed' => ['genuine |= (uint8_t)(arg.genuine << i);', 'genuine |= (uint8_t)(1 << i);'],
+    'sigaction records a handler that the ring accepted as installed' => ['recordInstalledHandler(sig, structGenuine ? structCopy[0] : 0);', 'recordInstalledHandler(sig, structCopy[0]);'],
+    'sigaction gives the callee the caller\'s old-action memory' => ['a[row->structArg] = (uint64_t)oldCopy;', ''],
+    'sigaction does not copy the old action out' => ['memcpy(callerOld, oldCopy, sizeof(oldCopy));', ''],
+    'the handed out ring is one slot too long' => ['% kHandedOutCount;', '% (kHandedOutCount + 1);'],
+    'the handed out ring is one slot too short' => ['% kHandedOutCount;', '% (kHandedOutCount - 1);'],
     'the handed out ring keeps one entry' => ['__atomic_fetch_add(&sHandedOutNext, 1, __ATOMIC_RELAXED) % kHandedOutCount', '0'],
     'the signal number is the whole register' => ['return (int32_t)reg;', 'return (reg >> 32) ? 0 : (int32_t)reg;'],
     'the last signal number is out of range' => ['(sig < kSignalCount)', '(sig <= kSignalCount)'],
