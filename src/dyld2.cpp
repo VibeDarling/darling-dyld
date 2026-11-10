@@ -1826,6 +1826,28 @@ static void overrideSplitCacheGotSlots()
 }
 #endif
 
+#if defined(DARLING) && defined(__arm64__)
+// Cache code reads its thread pointer with `mrs Xt, TPIDRRO_EL0`, which Linux leaves at zero. Rewrite those reads for
+// every cache image before any of them runs, from the sidecar table next to the cache (see DarlingTSDIslands.h). Runs at
+// the end of link() with overrideSplitCacheGotSlots(), under the same lock and for the same reason: no cache image has run
+// yet. Cheap once an image is done, and a no-op without a split cache or a cache image in the process.
+static void translateSplitCacheTSDReads()
+{
+	if ( (sSharedCacheLoadInfo.loadAddress == nullptr) || !sSharedCacheLoadInfo.loadAddress->isSplitCache() )
+		return;
+	for (const ImageLoader* image : sAllImages) {
+		if ( !image->inSharedCache() )
+			continue;
+		dyld3::darling_tsd::PatchStats stats;
+		if ( const char* error = dyld3::translateSplitCacheTSD(sSharedCacheLoadInfo, image->machHeader(), &stats) )
+			halt(mkstringf("TSD translation of '%s': %s\n", image->getPath(), error));
+		if ( gLinkContext.verboseMapping && (stats.sites != 0) )
+			dyld::log("dyld: TSD reads of %s: %u sites, %u veneers, %u cpu-index, %u nops, %u left to the trap\n", image->getPath(),
+					  stats.sites, stats.veneers, stats.cpuZeroed, stats.nops, stats.trapped);
+	}
+}
+#endif
+
 void initializeMainExecutable()
 {
 	// record that we've reached this step
@@ -5327,6 +5349,9 @@ void link(ImageLoader* image, bool forceLazysBound, bool neverUnload, const Imag
 		image->link(gLinkContext, forceLazysBound, false, neverUnload, loaderRPaths, path);
 #ifdef DARLING
 		overrideSplitCacheGotSlots();
+#endif
+#if defined(DARLING) && defined(__arm64__)
+		translateSplitCacheTSDReads();
 #endif
 	}
 	catch (const char* msg) {

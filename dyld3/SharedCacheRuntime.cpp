@@ -47,6 +47,7 @@
 
 #include "dyld_cache_format.h"
 #include "SharedCacheRuntime.h"
+#include "DarlingTSDIslands.h"
 #include "Loading.h"
 #include "BootArgs.h"
 
@@ -1467,7 +1468,8 @@ static const char* loadSplitFileMappings(int fd, uint64_t fileLength, const dyld
 }
 
 // Deferred on purpose, not oversights:
-// - No translateDarlingCacheTSD pass: the TSD rewrite and its veneer reach for a split cache is a separate design.
+// - No translateDarlingCacheTSD pass (it scans whole mappings and its veneers reach 128 MB of 3.7 GB): the TSD reads of a split
+//   cache are translated per image by translateSplitCacheTSD() from a sidecar table.
 // - Protections: each mapping gets its raw initProt, whereas the legacy mapCachePrivate path adds VM_PROT_WRITE to a
 //   DATA_CONST mapping unless gEnableSharedCacheDataConst is set. dyld2.cpp makes up the difference after mapping.
 // - Authenticated pointers are signed with the running process's own keys; this never changes, resets or
@@ -1681,6 +1683,73 @@ const char* splitCacheMainFilePath(const char* dir, uint32_t cputype, uint32_t c
         return "the cache file path is too long";
     return nullptr;
 }
+
+#if defined(__arm64__)
+// The sidecar table, its patcher and the /proc/self/mem handle, created by the first translateSplitCacheTSD().
+// Everything here runs under dyld's lock.
+static struct {
+    bool                        ready;
+    darling_tsd::SiteTable      table;
+    darling_tsd::Patcher*       patcher;
+    darling_tsd::ProcSelfMemory* memory;
+} sSplitTSD;
+
+// Reads the whole file into 8-byte aligned memory that is never freed (the table stays in use for the process).
+static const char* readSiteTable(const char* path, void** bytes, size_t* length)
+{
+    const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if ( fd < 0 )
+        return "cannot open the TSD site table <main cache file>.tsdsites; make it with tests/darling-tsd/emit_tsd_sites.py";
+    struct stat st;
+    void* buffer = nullptr;
+    if ( (::fstat(fd, &st) != 0) || (st.st_size <= 0) || (st.st_size > (off_t)(64 << 20)) ) {
+        ::close(fd);
+        return "the TSD site table has no usable size";
+    }
+    *length = (size_t)st.st_size;
+    buffer = ::malloc(*length);
+    const bool ok = (buffer != nullptr) && preadAll(fd, 0, buffer, *length);
+    ::close(fd);
+    if ( !ok ) {
+        ::free(buffer);
+        return "cannot read the TSD site table";
+    }
+    *bytes = buffer;
+    return nullptr;
+}
+
+static const char* openSplitTSDTranslation(const SharedCacheLoadInfo& cache)
+{
+    char path[sizeof(cache.path) + 16];
+    if ( (strlcpy(path, cache.path, sizeof(path)) >= sizeof(path)) || (strlcat(path, ".tsdsites", sizeof(path)) >= sizeof(path)) )
+        return "the TSD site table path is too long";
+    void* bytes = nullptr;
+    size_t length = 0;
+    if ( const char* error = readSiteTable(path, &bytes, &length) )
+        return error;
+    if ( const char* error = sSplitTSD.table.parse(bytes, length) )
+        return error;
+    if ( memcmp(sSplitTSD.table.uuid(), cache.loadAddress->header.uuid, sizeof(cache.loadAddress->header.uuid)) != 0 )
+        return "the TSD site table was made from another cache (UUID differs)";
+    sSplitTSD.patcher = new darling_tsd::Patcher(sSplitTSD.table, (uintptr_t)cache.loadAddress, sys_thread_get_native_tsd_slot_offset());
+    if ( const char* error = sSplitTSD.patcher->init() )
+        return error;
+    sSplitTSD.memory = new darling_tsd::ProcSelfMemory();
+    if ( !sSplitTSD.memory->ok() )
+        return "cannot open /proc/self/mem to translate the cache's TSD reads";
+    return nullptr;
+}
+
+const char* translateSplitCacheTSD(const SharedCacheLoadInfo& cache, const mach_header* image, darling_tsd::PatchStats* stats)
+{
+    if ( !sSplitTSD.ready ) {
+        if ( const char* error = openSplitTSDTranslation(cache) )
+            return error;
+        sSplitTSD.ready = true;
+    }
+    return sSplitTSD.patcher->patchImage((uintptr_t)image, sSplitTSD.memory->memory(), stats);
+}
+#endif
 #endif // DARLING && !TARGET_OS_SIMULATOR
 
 

@@ -31,6 +31,9 @@
 
 #include "DyldSharedCache.h"
 #include "PointerAuth.h"
+#if defined(DARLING) && defined(__arm64__)
+#include "DarlingTSDIslands.h"
+#endif
 
 namespace dyld3 {
 
@@ -88,6 +91,15 @@ const char* splitCacheDirError(const char* dir);
 // nullptr on success, else why it cannot be built: a bad dir, an architecture without a cache or
 // without split mapper support, or a path longer than pathSize.
 const char* splitCacheMainFilePath(const char* dir, uint32_t cputype, uint32_t cpusubtype, char* path, size_t pathSize);
+
+#if defined(__arm64__)
+// Rewrites the `mrs Xt, TPIDRRO_EL0` reads of one image of the mapped split cache to read Darling's TSD slot instead
+// (see DarlingTSDIslands.h). The sites come from the sidecar table "<main cache file>.tsdsites", made by
+// tests/darling-tsd/emit_tsd_sites.py from the same cache; it is loaded on the first call and must carry the main
+// file's UUID. Call it once per cache image before any of its code runs; a second call for an image does nothing.
+// nullptr on success, else why not (the caller halts: a half-translated cache image would read a null TSD base).
+const char* translateSplitCacheTSD(const SharedCacheLoadInfo& cache, const mach_header* image, darling_tsd::PatchStats* stats);
+#endif
 #endif
 
 
