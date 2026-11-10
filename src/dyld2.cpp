@@ -249,6 +249,7 @@ struct EnvironmentVariables {
 	bool						hasOverride;
                             //  DYLD_SHARED_CACHE_DIR           ==> sSharedCacheOverrideDir
                             //  DYLD_SHARED_CACHE_SPLIT_DIR     ==> sSharedCacheSplitDir (Darling only)
+                            //  DYLD_SHARED_CACHE_SPLIT_POLICY  ==> sSharedCacheSplitPolicy (Darling only)
 							//	DYLD_ROOT_PATH					==> gLinkContext.rootPaths
 							//	DYLD_IMAGE_SUFFIX				==> gLinkContext.imageSuffix
 							//	DYLD_PRINT_OPTS					==> gLinkContext.verboseOpts
@@ -318,6 +319,7 @@ static dyld3::SharedCacheLoadInfo	sSharedCacheLoadInfo;
 static const char*					sSharedCacheOverrideDir;
 #ifdef DARLING
 static const char*					sSharedCacheSplitDir;	// DYLD_SHARED_CACHE_SPLIT_DIR, null when not set
+static const char*					sSharedCacheSplitPolicy;	// DYLD_SHARED_CACHE_SPLIT_POLICY, null when not set
 #endif
        bool							gSharedCacheOverridden = false;
 ImageLoader::LinkContext			gLinkContext;
@@ -2361,6 +2363,10 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	// A restricted process must not choose which cache it maps, so this needs the path permission as well.
 	else if ( (strcmp(key, "DYLD_SHARED_CACHE_SPLIT_DIR") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
 		sSharedCacheSplitDir = value;
+	}
+	// The policy replaces the list of libraries the cache serves, so it is as restricted as the directory.
+	else if ( (strcmp(key, "DYLD_SHARED_CACHE_SPLIT_POLICY") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
+		sSharedCacheSplitPolicy = value;
 	}
 #endif
 	else if ( strcmp(key, "DYLD_USE_CLOSURES") == 0 ) {
@@ -4444,6 +4450,12 @@ static const char* basename(const char* path)
 // directory, only the files in it.
 static bool mapSplitSharedCache(const macho_header* mainExecutableMH)
 {
+	// a bad policy is fatal even for a process that then maps nothing: the setup is wrong whatever the architecture
+	if ( sSharedCacheSplitPolicy != nullptr ) {
+		size_t errorLine;
+		if ( const char* error = dyld3::loadSplitCachePolicy(sSharedCacheSplitPolicy, &errorLine) )
+			halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_POLICY '%s': %s (line %lu)\n", basename(sSharedCacheSplitPolicy), error, (unsigned long)errorLine));
+	}
 	char path[sizeof(sSharedCacheLoadInfo.path)];
 	if ( const char* error = dyld3::splitCacheMainFilePath(sSharedCacheSplitDir, mainExecutableMH->cputype, mainExecutableMH->cpusubtype, path, sizeof(path)) )
 		halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_DIR: %s\n", error));
@@ -4456,6 +4468,14 @@ static bool mapSplitSharedCache(const macho_header* mainExecutableMH)
 	if ( !dyld3::mapSplitCachePrivate(path, gLinkContext.verboseMapping, &sSharedCacheLoadInfo, &stats) )
 		halt(mkstringf("could not map the split dyld cache '%s': %s\n", basename(path), sSharedCacheLoadInfo.errorMessage ? sSharedCacheLoadInfo.errorMessage : "no reason given"));
 	installSharedCacheGlobalState(true);
+	if ( gLinkContext.verboseMapping ) {
+		const dyld3::SharedCacheAllowList& allowList = dyld3::sharedCacheAllowList();
+		for (size_t i = 0; i != allowList.count; ++i) {
+			dyld3::SharedCacheFindDylibResults found;
+			if ( !dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, allowList.paths[i], &found) || (strcmp(found.pathInCache, allowList.paths[i]) != 0) )
+				dyld::log("dyld: '%s' is not the install name of an image in the split dyld cache, ignored\n", allowList.paths[i]);
+		}
+	}
 	return true;
 }
 #endif
