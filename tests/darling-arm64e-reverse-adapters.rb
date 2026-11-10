@@ -111,6 +111,7 @@ Dir.mktmpdir('rev-adapters') do |dir|
     'the thunk calls the forward helper' => ['return emitCallThunkWith(words, row, real, (uint64_t)isEntry, (uint64_t)&callReverseRow);', 'return emitCallThunkWith(words, row, real, (uint64_t)isEntry, callThunkHelperAddress());'],
     'the thunk does not carry its predicate' => ['putLiteral(&words[18], aux);', 'putLiteral(&words[18], 0);'],
     'the thunk cache ignores the predicate' => ['(sThunks[i].row == row) && (sThunks[i].real == real) && (sThunks[i].aux == aux)', '(sThunks[i].row == row) && (sThunks[i].real == real)'],
+    'the reverse path accepts what the forward ring handed out' => ['return ringHolds(sHandedBack, pointer);', 'return ringHolds(sHandedBack, pointer) || ringHolds(sHandedOut, pointer);'],
     'a plain exporter is adapted' => ["if ( (sMode == AdapterMode::Off) || !targetIsArm64e )\n\t\treturn target;\n\tconst ReverseRow* row", "if ( (sMode == AdapterMode::Off) )\n\t\treturn target;\n\tconst ReverseRow* row"],
     'the kill switch does nothing in this direction' => ["if ( (sMode == AdapterMode::Off) || !targetIsArm64e )\n\t\treturn target;\n\tconst ReverseRow* row", "if ( !targetIsArm64e )\n\t\treturn target;\n\tconst ReverseRow* row"],
     'an unsupported row is bound as if supported' => ["if ( row->status == AdapterStatus::Unsupported ) {\n\t\tdyld::warn(\"arm64e adapters: %s is bound by a plain image", "if ( false ) {\n\t\tdyld::warn(\"arm64e adapters: %s is bound by a plain image"],

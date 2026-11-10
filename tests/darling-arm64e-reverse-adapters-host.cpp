@@ -255,6 +255,32 @@ static void checkPredicateIsolation()
 	CHECK(gSeen[0] == oracleSign(kOtherEntry, 0), "a thunk did not consult its own predicate");
 }
 
+// The two directions keep separate handed-out rings. A handler that plain code invented and the forward direction handed
+// out is not a handler this direction authenticated: it must not be signed for an arm64e callee.
+static void checkRingIsolation()
+{
+	Fn8 sig = (Fn8)adaptedTarget("_signal", (uint64_t)&fakeCallee, false);
+	Fn8 set = thunkFor("__ZSt13set_terminatePFvvE");
+	const uint64_t invented = 0x0000000400005000ULL;
+	uint64_t args[8]; memcpy(args, kS, sizeof(args));
+	// the forward signal() hands out a result that plain code invented (it fails authentication)
+	args[0] = 26; args[1] = invented;
+	gResult = invented; gCalls = 0;
+	CHECK(callWith(sig, args) == invented, "the forward signal() changed the handler it returned");
+	CHECK(gCalls == 1, "the forward callee was not called");
+	// the forward ring took it: passing it back is accepted instead of replaced by a failed authentication
+	gResult = 0;
+	callWith(sig, args);
+	CHECK(gSeen[1] == invented, "the forward ring did not take the value it handed out (this check would be vacuous)");
+	// the reverse direction signs only function entries and its own ring: this value stays as it is
+	memcpy(args, kS, sizeof(args));
+	args[0] = invented;
+	gResult = 0; gCalls = 0;
+	callWith(set, args);
+	CHECK(gCalls == 1, "the reverse callee was not called");
+	CHECK(gSeen[0] == invented, "the reverse path signed a value that only the forward ring handed out (%llx)", (unsigned long long)gSeen[0]);
+}
+
 static void checkFunctionStarts()
 {
 	// deltas 0x10, 0x20, 0x08 give the starts 0x10, 0x30, 0x38; a zero delta ends the table
@@ -411,6 +437,7 @@ int main(int argc, char** argv)
 	checkReturnAuthentication();
 	checkRoundTrip();
 	checkPredicateIsolation();
+	checkRingIsolation();
 	checkFunctionStarts();
 	checkArgPositions();
 	checkEveryRow();
