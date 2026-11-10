@@ -468,22 +468,122 @@ static void checkHandlerRoundTrip()
 	}
 	gHook = nullptr;
 
-	// the ring holds the last 64: older ones are refused again, the newest still work
+	// The ring holds exactly the last 64: every one of them is accepted again, whatever slot the count had reached, and older
+	// ones are refused. Shifting the start by 0..64 puts the wrap-around at every slot, so a ring that is a slot too long
+	// or too short loses a handler in one of the rounds.
 	if ( !gFpac ) {
-		const uint64_t first = codeWithSignatureAfter(0x000000010000a000ULL, 0);
-		std::vector<uint64_t> handedOut;
-		for (int i = 0; i != 70; ++i) {
-			handedOut.push_back((i == 0) ? first : codeWithSignatureAfter(first + 0x40 * (i + 1) * 4, 0));
-			gFakeResult = handedOut.back();
+		uint64_t next = 0x000000010000a000ULL;
+		auto fresh = [&]() { next = codeWithSignatureAfter(next + 0x40, 0); return next; };
+		for (int shift = 0; shift <= 64; ++shift) {
+			for (int i = 0; i != shift; ++i) {
+				gFakeResult = fresh();
+				sig(19, signedNew, 0, 0, 0, 0, 0, 0);
+			}
+			std::vector<uint64_t> handedOut;
+			for (int i = 0; i != 64; ++i) {
+				handedOut.push_back(fresh());
+				gFakeResult = handedOut.back();
+				sig(19, signedNew, 0, 0, 0, 0, 0, 0);
+			}
+			gFakeResult = 0;
+			int refused = 0;
+			for (uint64_t h : handedOut) {
+				sig(19, h, 0, 0, 0, 0, 0, 0);
+				refused += gSeen[1] != h;
+			}
+			CHECK(refused == 0, "round trip: %d of the last 64 handed out handlers were refused (shift %d)", refused, shift);
+		}
+		const uint64_t old = fresh();
+		gFakeResult = old;
+		sig(19, signedNew, 0, 0, 0, 0, 0, 0);
+		for (int i = 0; i != 64; ++i) {
+			gFakeResult = fresh();
 			sig(19, signedNew, 0, 0, 0, 0, 0, 0);
 		}
 		gFakeResult = 0;
-		for (size_t i = handedOut.size() - 10; i != handedOut.size(); ++i) {
-			sig(19, handedOut[i], 0, 0, 0, 0, 0, 0);
-			CHECK(gSeen[1] == handedOut[i], "round trip: one of the newest handed out handlers was refused");
-		}
-		sig(19, first, 0, 0, 0, 0, 0, 0);
-		CHECK(gSeen[1] != first, "round trip: a handler that fell out of the ring was still accepted");
+		sig(19, old, 0, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] != old, "round trip: a handler that fell out of the ring was still accepted");
+	}
+}
+
+// A value that plain code installed and that the ring then accepted is not a signature that arm64e code made: it is never
+// remembered as installed, so it is never signed on its way back. (A pointer that came back from signal() unsigned,
+// passed in again, installed and returned, used to come out signed IA, discriminator 0: a signing oracle for any value
+// that plain code can plant.)
+static void checkNoSigningOracle()
+{
+	Fn8 sig = thunkFor("_signal");
+	Fn8 act = thunkFor("_sigaction");
+	const uint64_t handlerA = oracleSign(codeWithSignature(0), 0);
+	const uint64_t V = codeWithSignatureAfter(0x4142434440ULL, 0);
+	struct Act { uint64_t handler; uint32_t mask; int32_t flags; };
+
+	// plain code installed V (through _sigset, say: an unsupported row that binds the raw function)
+	gFakeResult = V;
+	CHECK(sig(30, handlerA, 0, 0, 0, 0, 0, 0) == V, "oracle: a plain handler came back changed");
+	// arm64e code restores it: accepted through the ring, installed
+	gFakeResult = 0;
+	sig(30, V, 0, 0, 0, 0, 0, 0);
+	CHECK(gSeen[1] == V, "oracle: the restore of V was not accepted");
+	// and the next signal() returns it: it must not come out signed
+	gFakeResult = V;
+	CHECK(sig(30, handlerA, 0, 0, 0, 0, 0, 0) == V, "oracle: V, accepted through the ring, was signed IA with discriminator 0");
+
+	// the same through sigaction: restored with V in a struct, then returned by signal()
+	Act actV = { V, 0, 0 };
+	gFakeResult = V;
+	sig(29, handlerA, 0, 0, 0, 0, 0, 0);
+	gFakeResult = 0;
+	act(29, (uint64_t)&actV, 0, 0, 0, 0, 0, 0);
+	gFakeResult = V;
+	CHECK(sig(29, handlerA, 0, 0, 0, 0, 0, 0) == V, "oracle: V, installed by sigaction through the ring, was signed");
+
+	// a handler that plain code planted after arm64e code had installed its own is not the recorded one any more
+	gFakeResult = 0;
+	sig(28, handlerA, 0, 0, 0, 0, 0, 0);
+	gFakeResult = V;
+	sig(28, handlerA, 0, 0, 0, 0, 0, 0);
+	sig(28, V, 0, 0, 0, 0, 0, 0);
+	gFakeResult = oracleStrip(handlerA);
+	CHECK(sig(28, handlerA, 0, 0, 0, 0, 0, 0) == oracleStrip(handlerA), "oracle: a stale record signed a handler that plain code had put back");
+}
+
+// The old action is taken from the callee's private copy and copied out; memory that the caller, or another thread, can
+// write while the call runs is not read again. The deterministic equivalent of the race: the callee writes the legitimate
+// old handler into the copy it was given, and the "other thread" writes a forged one into the caller's memory during the
+// call; what is remembered as handed out is the legitimate one.
+static uint64_t* gCallerOld;
+static uint64_t gLegitOld, gForgedOld;
+static void raceOnOldAction(const uint64_t* a)
+{
+	if ( a[2] )
+		((uint64_t*)a[2])[0] = gLegitOld;
+	gCallerOld[0] = gForgedOld;
+}
+
+static void checkOldActionRace()
+{
+	Fn8 act = thunkFor("_sigaction");
+	Fn8 sig = thunkFor("_signal");
+	const uint64_t handlerA = oracleSign(codeWithSignature(0), 0);
+	gLegitOld = codeWithSignatureAfter(0x0000000100020000ULL, 0);
+	gForgedOld = codeWithSignatureAfter(0x0000000100030000ULL, 0);
+	struct Act { uint64_t handler; uint32_t mask; int32_t flags; };
+	Act fresh = { handlerA, 0, 0 };
+	Act old = { 0, 0, 0 };
+	gCallerOld = &old.handler;
+	gHook = raceOnOldAction;
+	gFakeResult = 0;
+	act(27, (uint64_t)&fresh, (uint64_t)&old, 0, 0, 0, 0, 0);
+	gHook = nullptr;
+	CHECK(old.handler == gLegitOld, "race: the caller's old action is not what the callee wrote (0x%llx)", (unsigned long long)old.handler);
+	CHECK(gSeen[2] != (uint64_t)&old, "race: the callee was given the caller's own old-action memory");
+	if ( !gFpac ) {
+		gFakeResult = 0;
+		sig(27, gForgedOld, 0, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] != gForgedOld, "race: a value written into the caller's memory during the call was accepted");
+		sig(27, gLegitOld, 0, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] == gLegitOld, "race: the legitimate old handler was refused");
 	}
 }
 
@@ -679,7 +779,7 @@ static void checkSigaction()
 	// sigaction returns an int: the upper half of x0 is not its business
 	gFakeResult = 0xdead00000000ULL;
 	t(28, (uint64_t)&act, (uint64_t)oact, 0, 0, 0, 0, 0);
-	CHECK(gSeen[0] == 28 && gSeen[2] == (uint64_t)oact, "sigaction: the other arguments changed");
+	CHECK(gSeen[0] == 28 && gSeen[2] != (uint64_t)oact, "sigaction: the signal number changed or the callee was given the caller's old-action memory");
 	CHECK(gSeen[1] != (uint64_t)&act, "sigaction: the caller's struct was passed on in place");
 	CHECK(seen.handler == plainHandler && seen.mask == 0xa5a5 && seen.flags == 0x42, "sigaction: handler 0x%llx mask 0x%x flags 0x%x", (unsigned long long)seen.handler, seen.mask, seen.flags);
 	CHECK(act.handler == handler, "sigaction: the caller's struct changed");
@@ -798,6 +898,8 @@ int main(int argc, char** argv)
 	checkSigaction();
 	checkHandlerRoundTrip();
 	checkSignalNumbers();
+	checkNoSigningOracle();
+	checkOldActionRace();
 	checkBind();
 	checkSeal();
 	checkThunkPages();

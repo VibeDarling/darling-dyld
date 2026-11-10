@@ -289,8 +289,17 @@ static BlockLiteral* mirrorOfGlobalBlock(const BlockLiteral* block, uint64_t pla
 // thread that is inside an adapter must not meet a lock that thread holds. Every slot is one aligned word, read and
 // written with relaxed atomics, and a stale or lost entry only makes a pointer come back unsigned or be refused.
 
-// The handler that each signal was last given through a signal or sigaction row (already authenticated, so plain code
-// has it as it is), so that signal() can sign what it hands back only when arm64e code installed it.
+// The handler that each signal was last given through a signal or sigaction row, as plain code has it, and only when
+// that handler really authenticated (a signature that arm64e code made); 0 when the last install was anything else. It
+// is the one thing signal() signs on the way back.
+//
+// Every value this module signs gets signed by one of two paths, and each needs a real signature first:
+//   1. signal() result R: signed only when R equals the table entry of its signal, which only a successful
+//      authentication ever wrote (so R is a pointer that arm64e code signed itself, re-signed for the same code);
+//   2. _Block_copy copy: its invoke is signed from the original's invoke, only when that authenticated at the original's
+//      own address.
+// A pointer that the ring below accepted (plain code's own value) is never recorded, so it is never signed. dlsym, the GOT
+// override and the fixups sign or bind addresses that dyld itself resolved, not values that a caller supplies.
 static const int32_t kSignalCount = 32;
 static uint64_t sInstalledHandlers[kSignalCount];
 
@@ -305,9 +314,11 @@ static inline bool validSignal(int32_t sig)
 	return (sig > 0) && (sig < kSignalCount);
 }
 
+// plainHandler is 0 for an install that did not authenticate (a ring-accepted value, SIG_DFL, SIG_IGN, garbage): the
+// handler that was recorded before is no longer the installed one
 static void recordInstalledHandler(int32_t sig, uint64_t plainHandler)
 {
-	if ( validSignal(sig) && authenticated(plainHandler) )
+	if ( validSignal(sig) )
 		__atomic_store_n(&sInstalledHandlers[sig], plainHandler, __ATOMIC_RELAXED);
 }
 
@@ -342,15 +353,20 @@ static void recordHandedOut(uint64_t plainHandler)
 }
 
 // A handler argument: key IA, discriminator 0 (what paciza makes, and the compiler for a C function pointer). What does
-// not authenticate stays unusable unless it is exactly a plain handler handed out above.
-static uint64_t authenticateHandler(uint64_t pointer)
+// not authenticate stays unusable unless it is exactly a plain handler handed out above. genuine says that the signature
+// was real: only then may the handler be remembered as one that arm64e code installed.
+struct HandlerArg { uint64_t value; bool genuine; };
+
+static HandlerArg authenticateHandler(uint64_t pointer)
 {
 	if ( isSpecialHandler(pointer) )
-		return pointer;
+		return { pointer, false };
 	const uint64_t result = authenticateIA(pointer, 0);
-	if ( !authenticated(result) && wasHandedOut(pointer) )
-		return pointer;
-	return result;
+	if ( authenticated(result) )
+		return { result, true };
+	if ( wasHandedOut(pointer) )
+		return { pointer, false };
+	return { result, false };
 }
 
 // Rewriting a shared block would corrupt it for its other users, and the proxy block that would serve both needs an
@@ -367,9 +383,13 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 {
 	uint64_t a[8];
 	memcpy(a, regs, sizeof(a));
+	uint8_t genuine = 0;	// bit i: argument i was a real signature
 	for (unsigned i = 0; i != 8; ++i) {
-		if ( (row->authMask >> i) & 1 )
-			a[i] = authenticateHandler(a[i]);
+		if ( (row->authMask >> i) & 1 ) {
+			const HandlerArg arg = authenticateHandler(a[i]);
+			a[i] = arg.value;
+			genuine |= (uint8_t)(arg.genuine << i);
+		}
 	}
 
 	// An address-diversified invoke is authenticated with the address of its own field. A stack block is rewritten for the
@@ -395,12 +415,24 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 		}
 	}
 
-	// the callee reads the struct during the call only, and the caller's can be read-only
+	// The callee gets private copies of both structs: the caller's can be read-only, and another thread can write to the
+	// caller's memory while the call runs, so nothing is read from it again after the copy. The old action is copied
+	// out afterwards, and the handler that is remembered as handed out is the one in the private copy.
 	uint64_t structCopy[2];
+	uint64_t oldCopy[2];
+	bool structGenuine = false;
+	void* callerOld = nullptr;
 	if ( (row->structArg != 0) && (a[row->structArg - 1] != 0) ) {
 		memcpy(structCopy, (const void*)a[row->structArg - 1], sizeof(structCopy));
-		structCopy[0] = authenticateHandler(structCopy[0]);
+		const HandlerArg arg = authenticateHandler(structCopy[0]);
+		structCopy[0] = arg.value;
+		structGenuine = arg.genuine;
 		a[row->structArg - 1] = (uint64_t)structCopy;
+	}
+	if ( (row->structArg != 0) && (a[row->structArg] != 0) ) {
+		callerOld = (void*)a[row->structArg];
+		memcpy(oldCopy, callerOld, sizeof(oldCopy));
+		a[row->structArg] = (uint64_t)oldCopy;
 	}
 
 	// Block_copy: the original's signature is checked before anything is signed for the copy
@@ -420,12 +452,15 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 		*restoreSlot = restoreValue;
 	const int32_t sig = signalNumber(a[0]);
 	if ( row->structArg != 0 ) {
-		// sigaction returned 0: the handler in act is the one installed, and the old action in oact (the argument after
-		// act) holds the handler that plain code has, which arm64e code may pass back
+		// sigaction returned 0: the handler in act is the one installed (remembered only when its signature was real), and
+		// the old action holds the handler that plain code has, which arm64e code may pass back
 		if ( ((int)result == 0) && (a[row->structArg - 1] != 0) )
-			recordInstalledHandler(sig, structCopy[0]);
-		if ( ((int)result == 0) && (a[row->structArg] != 0) )
-			recordHandedOut(*(const uint64_t*)a[row->structArg]);
+			recordInstalledHandler(sig, structGenuine ? structCopy[0] : 0);
+		if ( callerOld != nullptr ) {
+			memcpy(callerOld, oldCopy, sizeof(oldCopy));
+			if ( (int)result == 0 )
+				recordHandedOut(oldCopy[0]);
+		}
 	}
 	switch ( row->ret ) {
 		case ReturnFix::None:
@@ -439,7 +474,7 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 					recordHandedOut(result);
 			}
 			if ( !failed )
-				recordInstalledHandler(sig, a[1]);
+				recordInstalledHandler(sig, ((genuine >> 1) & 1) ? a[1] : 0);
 			break;
 		}
 		case ReturnFix::ResignCopiedBlock:
