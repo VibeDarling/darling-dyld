@@ -576,14 +576,16 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 
 // ------------------------------------------------------------------------------------------ bind time
 
-// report mode: a symbol is named once, by a 64-bit FNV-1a hash (a name pointer may not outlive its image; a collision only
-// loses a line of a diagnostic)
+// report mode: a symbol is named once per direction, by a 64-bit FNV-1a hash (a name pointer may not outlive its image; a
+// collision only loses a line of a diagnostic)
 static uint64_t sReported[2048];
 static unsigned sReportedCount;
 
-static void reportMissingRow(const char* symbol)
+static void reportMissingRow(const char* symbol, const char* binder, const char* bound)
 {
 	uint64_t hash = 1469598103934665603ULL;
+	for (const char* c = binder; *c != '\0'; ++c)
+		hash = (hash ^ (uint8_t)*c) * 1099511628211ULL;
 	for (const char* c = symbol; *c != '\0'; ++c)
 		hash = (hash ^ (uint8_t)*c) * 1099511628211ULL;
 	for (unsigned i = 0; i != sReportedCount; ++i) {
@@ -593,7 +595,7 @@ static void reportMissingRow(const char* symbol)
 	if ( sReportedCount == sizeof(sReported) / sizeof(sReported[0]) )
 		return;
 	sReported[sReportedCount++] = hash;
-	dyld::warn("arm64e adapters: %s is bound by an arm64e image to a plain function and has no row\n", symbol);
+	dyld::warn("arm64e adapters: %s is bound by %s to %s and has no row\n", symbol, binder, bound);
 }
 
 uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e)
@@ -603,7 +605,7 @@ uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e)
 	const AdapterRow* row = findAdapterRow(symbol);
 	if ( row == nullptr ) {
 		if ( sMode == AdapterMode::Report )
-			reportMissingRow(symbol);
+			reportMissingRow(symbol, "an arm64e image", "a plain function");
 		return target;
 	}
 	if ( row->status == AdapterStatus::HandledElsewhere )

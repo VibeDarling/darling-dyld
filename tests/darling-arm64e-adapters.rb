@@ -213,7 +213,7 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     'an arm64e target is thunked' => ['if ( (sMode == AdapterMode::Off) || targetIsArm64e )', 'if ( sMode == AdapterMode::Off )'],
     'the kill switch does nothing' => ['if ( (sMode == AdapterMode::Off) || targetIsArm64e )', 'if ( targetIsArm64e )'],
     'report mode names a symbol every time' => [/if \( sReported\[i\] == hash \)\s+return;/, ''],
-    'report mode is always on' => [/if \( sMode == AdapterMode::Report \)\s+reportMissingRow\(symbol\);/, 'reportMissingRow(symbol);'],
+    'report mode is always on' => [/if \( sMode == AdapterMode::Report \)\s+reportMissingRow\(symbol, /, 'reportMissingRow(symbol, '],
     'the validator accepts a nine-argument row' => ['(r.argCount > 8)', '(r.argCount > 9)'],
     'the validator accepts a duplicate symbol' => ['return "a symbol has two rows";', ''],
     'the row of _atexit authenticates the wrong argument' => ['{ "_atexit", 0x1,', '{ "_atexit", 0x2,', :rows],
