@@ -191,6 +191,8 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     'sigaction does not copy the old action out' => ['const Access access = copyThroughPipe(callerOld, oldCopy, sizeof(oldCopy));', 'const Access access = Access::Ok;'],
     'the handed out ring is one slot too long' => ['% kHandedOutCount;', '% (kHandedOutCount + 1);'],
     'the handed out ring is one slot too short' => ['% kHandedOutCount;', '% (kHandedOutCount - 1);'],
+    'sigaction forwards the caller\'s act when it cannot be read' => [/if \( a\[row->structArg - 1\] != 0 \)\s+a\[row->structArg - 1\] = ~0ULL;/, ''],
+    'sigaction forwards the caller\'s old action when it cannot be written' => [/if \( a\[row->structArg\] != 0 \)\s+a\[row->structArg\] = ~0ULL;/, ''],
     'sigaction copies the caller\'s act with a plain memcpy' => ['copyThroughPipe(structCopy, (const void*)a[row->structArg - 1], sizeof(structCopy))', '(memcpy(structCopy, (const void*)a[row->structArg - 1], sizeof(structCopy)), Access::Ok)'],
     'sigaction does not check that the old action can be written' => ['&& (copyThroughPipe(old, current, sizeof(current)) == Access::Ok) )', ') '],
     'sigaction copies the old action out after a failed call' => ['if ( (row->structArg != 0) && ((int)result == 0) ) {', 'if ( row->structArg != 0 ) {'],

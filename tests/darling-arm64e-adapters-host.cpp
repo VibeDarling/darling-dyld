@@ -787,8 +787,26 @@ static void checkDispatch()
 	}
 }
 
-// A pointer that cannot be read or written goes through to the real call as the caller gave it, which answers EFAULT; the
-// thunk itself must not crash. Here the real call is the fake, which sees the caller's pointers.
+// A pointer that cannot be read or written never reaches the real call: both structs become (void*)-1, which the kernel
+// answers with EFAULT every time, and nothing is installed. Here the real call is the fake, which sees what it is given.
+static const uint64_t kInvalid = ~0ULL;
+static uint64_t gInstalled;			// what the fake "kernel" installed, read from act when act is a pointer it may read
+static void* gRacePage;
+static void installLikeTheKernel(const uint64_t* a)
+{
+	if ( a[1] != 0 && a[1] != kInvalid )
+		gInstalled = *(const uint64_t*)a[1];
+}
+// the second thread: the page becomes readable after the thunk has looked at it
+static void mapAfterTheCheck(const uint64_t* a)
+{
+	if ( gRacePage ) {
+		mprotect(gRacePage, 4096, PROT_READ | PROT_WRITE);
+		((uint64_t*)gRacePage)[0] = 0x4141414141ULL;	// a forged handler
+	}
+	installLikeTheKernel(a);
+}
+
 static void checkSigactionFaults()
 {
 	Fn8 act = thunkFor("_sigaction");
@@ -797,28 +815,46 @@ static void checkSigactionFaults()
 	Act good = { handlerA, 1, 2 };
 	Act oldGood = { 0, 0, 0 };
 	// a page that cannot be touched, a read-only page and the null page
-	void* unmapped = mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	uint64_t* none = (uint64_t*)mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	Act* readOnly = (Act*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	*readOnly = { 0x1111, 2, 3 };
 	mprotect(readOnly, 4096, PROT_READ);
-	const uint64_t bad[] = { (uint64_t)unmapped, 0x10 };
+	const uint64_t bad[] = { (uint64_t)none, 0x10 };
 
+	gHook = installLikeTheKernel;
 	gFakeResult = 0xffffffffULL;	// -1: what the real call answers for EFAULT
 	for (uint64_t b : bad) {
-		// invalid act, good old action
+		gInstalled = 0;
+		// invalid act, good old action: the real call gets -1 for both, and installs nothing
 		uint64_t result = act(5, b, (uint64_t)&oldGood, 0, 0, 0, 0, 0);
-		CHECK(gSeen[1] == b && (int)result == -1, "EFAULT: an unreadable act did not go through unchanged (0x%llx)", (unsigned long long)gSeen[1]);
-		// good act, invalid old action
+		CHECK(gSeen[1] == kInvalid && gSeen[2] == kInvalid && (int)result == -1, "EFAULT: an unreadable act reached the real call as 0x%llx, old action 0x%llx", (unsigned long long)gSeen[1], (unsigned long long)gSeen[2]);
+		CHECK(gInstalled == 0, "EFAULT: a handler was installed through an unreadable act");
+		// good act, invalid old action: the act is not forwarded either, so nothing can be installed before the old action fails
 		result = act(5, (uint64_t)&good, b, 0, 0, 0, 0, 0);
-		CHECK(gSeen[2] == b && gSeen[1] != (uint64_t)&good && (int)result == -1, "EFAULT: an unwritable old action did not go through unchanged");
+		CHECK(gSeen[1] == kInvalid && gSeen[2] == kInvalid && (int)result == -1 && gInstalled == 0, "EFAULT: an unwritable old action let the act through (0x%llx, installed 0x%llx)", (unsigned long long)gSeen[1], (unsigned long long)gInstalled);
 		// both
 		result = act(5, b, b, 0, 0, 0, 0, 0);
-		CHECK(gSeen[1] == b && gSeen[2] == b && (int)result == -1, "EFAULT: invalid act and old action");
+		CHECK(gSeen[1] == kInvalid && gSeen[2] == kInvalid && (int)result == -1, "EFAULT: invalid act and old action");
+		// an unreadable act with no old action stays a query-shaped call with -1
+		act(5, b, 0, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] == kInvalid && gSeen[2] == 0, "EFAULT: an unreadable act with no old action");
 	}
-	// an old action that can be read but not written is handed on as it is, and what it holds is untouched
+	// An old action that can be read but not written is refused the same way, and what it holds is untouched
 	const Act before = *readOnly;
+	gInstalled = 0;
 	act(5, (uint64_t)&good, (uint64_t)readOnly, 0, 0, 0, 0, 0);
-	CHECK(gSeen[2] == (uint64_t)readOnly && memcmp(readOnly, &before, sizeof(Act)) == 0, "EFAULT: a read-only old action was replaced by a private copy");
+	CHECK(gSeen[1] == kInvalid && gSeen[2] == kInvalid && gInstalled == 0 && memcmp(readOnly, &before, sizeof(Act)) == 0, "EFAULT: a read-only old action");
+
+	// The race: the page becomes readable between the thunk's check and the real call (here, while the real call runs). The
+	// caller's pointer must not have been handed on, so the real call never reads the forged struct.
+	gRacePage = none;
+	gHook = mapAfterTheCheck;
+	gInstalled = 0;
+	act(5, (uint64_t)none, 0, 0, 0, 0, 0, 0);
+	CHECK(gSeen[1] == kInvalid && gInstalled == 0, "race: the caller's page was handed to the real call (0x%llx, installed 0x%llx)", (unsigned long long)gSeen[1], (unsigned long long)gInstalled);
+	gRacePage = nullptr;
+	gHook = nullptr;
+	mprotect(none, 4096, PROT_NONE);
 
 	// a failed call leaves the caller's old action exactly as it was, whatever the callee wrote into the copy it was given
 	Act untouched = { 0x7777, 0x88, 0x99 };
@@ -835,7 +871,7 @@ static void checkSigactionFaults()
 	gHook = nullptr;
 }
 
-// no descriptor for the pipe: the call goes through unadapted, with a warning that says why
+// no descriptor for the pipe: the call fails closed (both structs -1, so EFAULT), with a warning that says why
 struct PipeAct { uint64_t handler; uint32_t mask; int32_t flags; };
 static Fn8 gPipeThunk;
 static PipeAct* gPipeAct;
@@ -845,7 +881,7 @@ static void withoutDescriptors()
 	setrlimit(RLIMIT_NOFILE, &none);
 	gFakeResult = 0;
 	gPipeThunk(5, (uint64_t)gPipeAct, 0, 0, 0, 0, 0, 0);
-	_exit(gSeen[1] == (uint64_t)gPipeAct ? 0 : 1);
+	_exit(gSeen[1] == ~0ULL ? 0 : 1);
 }
 
 static void checkNoDescriptors()

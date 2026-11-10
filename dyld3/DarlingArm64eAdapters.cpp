@@ -370,9 +370,12 @@ static HandlerArg authenticateHandler(uint64_t pointer)
 
 // The real sigaction() returns EFAULT for a pointer it cannot read or write, and an adapter that touches the caller's
 // structs must not crash instead. A pipe is a copy that the kernel does and that fails with EFAULT: write() reads the
-// source, read() writes the destination. When it fails the caller's own pointer goes through to the real call unchanged,
-// which then returns the error with the errno of the caller's libc (dyld's own errno is not the process's). The
-// descriptors exist for the length of one copy; no memory is mapped or probed in any other way.
+// source, read() writes the destination. When it fails, the real call gets (void*)-1 for both structs, never the caller's
+// pointer: the caller's memory could be mapped by another thread between the check and the call, and the real call would
+// then read a struct that was neither copied nor authenticated. -1 is not a user address, so the kernel answers EFAULT
+// every time, nothing is installed (the act copy-in fails first), and the answer carries the errno of the caller's libc;
+// returning -1 from the thunk instead would set dyld's own errno, which is not the process's. The descriptors exist for
+// the length of one copy; no memory is mapped or probed in any other way.
 enum class Access { Ok, Fault, NoResource };
 
 static Access copyThroughPipe(void* destination, const void* source, size_t length)
@@ -388,7 +391,7 @@ static Access copyThroughPipe(void* destination, const void* source, size_t leng
 
 static void warnNoDescriptors(const AdapterRow* row)
 {
-	dyld::warn("arm64e adapters: %s could not make a pipe to copy the caller's struct, so the call goes through unadapted\n", row->symbol);
+	dyld::warn("arm64e adapters: %s could not make a pipe to copy the caller's struct, so it fails with EFAULT\n", row->symbol);
 }
 
 // Rewriting a shared block would corrupt it for its other users, and the proxy block that would serve both needs an
@@ -439,11 +442,11 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 
 	// The callee gets private copies of both structs: the caller's can be read-only, and another thread can write to the
 	// caller's memory while the call runs, so nothing is read from it again after the copy. The old action goes back to
-	// the caller only when the call succeeded (a failed call leaves it as it was). A pointer that cannot be read, or an old
-	// action that cannot be written, goes through as the caller gave it, and the real call answers EFAULT.
+	// the caller only when the call succeeded (a failed call leaves it as it was). When either struct cannot be copied
+	// (or there is no descriptor for the pipe), the real call gets -1 for both and answers EFAULT.
 	uint64_t structCopy[2];
 	uint64_t oldCopy[2];
-	bool actCopied = false, structGenuine = false;
+	bool actCopied = false, structGenuine = false, uncopyable = false;
 	void* callerOld = nullptr;
 	if ( (row->structArg != 0) && (a[row->structArg - 1] != 0) ) {
 		const Access access = copyThroughPipe(structCopy, (const void*)a[row->structArg - 1], sizeof(structCopy));
@@ -454,8 +457,10 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 			actCopied = true;
 			a[row->structArg - 1] = (uint64_t)structCopy;
 		}
-		else if ( access == Access::NoResource ) {
-			warnNoDescriptors(row);
+		else {
+			uncopyable = true;
+			if ( access == Access::NoResource )
+				warnNoDescriptors(row);
 		}
 	}
 	if ( (row->structArg != 0) && (a[row->structArg] != 0) ) {
@@ -468,9 +473,19 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 			oldCopy[0] = oldCopy[1] = 0;
 			a[row->structArg] = (uint64_t)oldCopy;
 		}
-		else if ( access == Access::NoResource ) {
-			warnNoDescriptors(row);
+		else {
+			uncopyable = true;
+			if ( access == Access::NoResource )
+				warnNoDescriptors(row);
 		}
+	}
+	if ( uncopyable ) {
+		actCopied = false;
+		callerOld = nullptr;
+		if ( a[row->structArg - 1] != 0 )
+			a[row->structArg - 1] = ~0ULL;
+		if ( a[row->structArg] != 0 )
+			a[row->structArg] = ~0ULL;
 	}
 
 	// Block_copy: the original's signature is checked before anything is signed for the copy
