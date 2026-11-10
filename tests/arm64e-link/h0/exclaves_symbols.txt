@@ -1,0 +1,2 @@
+# The one libmalloc_exclaves_introspector symbol the TSD test executable imports.
+malloc_printf

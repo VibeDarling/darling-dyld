@@ -1,0 +1,34 @@
+{
+  "load_dylibs": [
+    {
+      "path": "/System/Library/PrivateFrameworks/libmalloc_exclaves_introspector.framework/Versions/A/libmalloc_exclaves_introspector",
+      "compat": "1.0.0"
+    },
+    {
+      "path": "/usr/lib/libSystem.B.dylib",
+      "compat": "1.0.0"
+    }
+  ],
+  "imports": [
+    {
+      "name": "_malloc_printf",
+      "lib": "/System/Library/PrivateFrameworks/libmalloc_exclaves_introspector.framework/Versions/A/libmalloc_exclaves_introspector"
+    },
+    {
+      "name": "_write",
+      "lib": "/usr/lib/libSystem.B.dylib"
+    }
+  ],
+  "build_version": {
+    "minos": "13.0.0",
+    "sdk": "13.0.0"
+  },
+  "auth_bind": {
+    "key": "IA",
+    "addr_div": true,
+    "diversity": 0
+  },
+  "plain_binds": [
+    "_malloc_printf"
+  ]
+}

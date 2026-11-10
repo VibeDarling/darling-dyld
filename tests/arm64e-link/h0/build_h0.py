@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build and structurally check the H0 test executable and its link-only stubs.
 
-  build_h0.py build --out DIR [--leaf libz|libexpat] [--libsystem stub|sdk] [--libz-symbols FILE]
+  build_h0.py build --out DIR [--leaf libz|libexpat|exclaves] [--libsystem stub|sdk] [--libz-symbols FILE]
   build_h0.py check EXE [--expected FILE]
 
 LD64 (in-tree ld64) comes from the environment; --libsystem sdk also needs SDKROOT.
@@ -33,6 +33,9 @@ STUBS = {
     # versions as in the cache's libexpat (compat 7.0.0, current 8.0.0)
     "libexpat": ("/usr/lib/libexpat.1.dylib", "libexpat_symbols.txt", "7.0.0", "8.0.0",
                  "libexpat.1.linkonly.dylib"),
+    # the TSD leaf: a framework library of the cache with one dependency (libSystem.B), versions as in the cache
+    "exclaves": ("/System/Library/PrivateFrameworks/libmalloc_exclaves_introspector.framework/Versions/A/libmalloc_exclaves_introspector",
+                 "exclaves_symbols.txt", "1.0.0", "1.0.0", "libmalloc_exclaves_introspector.linkonly.dylib"),
 }
 
 # leaf library under test: its program, the executable's name and its expected structure.
@@ -40,6 +43,8 @@ STUBS = {
 LEAVES = {
     "libz": {"source": "h0_zlib_main.c", "exe": "h0_zlib_main", "expected": "expected.json"},
     "libexpat": {"source": "expat_main.c", "exe": "h0_expat_main", "expected": "expected-expat.json"},
+    # the TSD test: a cache library with 4 TPIDRRO_EL0 reads (see tsd_main.c)
+    "exclaves": {"source": "tsd_main.c", "exe": "tsd_exclaves_main", "expected": "expected-tsd.json"},
 }
 
 
@@ -158,6 +163,8 @@ def check_exe(path, expected_file=None):
     ab = exp["auth_bind"]
     bound = []
     for f in dec["fixups"]:
+        if f["kind"] == "bind" and f["import"] in exp.get("plain_binds", []):
+            continue    # a function address taken as data: an unsigned pointer in __got, besides the signed one in __auth_got
         if f["kind"] != "auth_bind":
             problems.append("fixup at 0x%x is %s, expected only auth_bind" % (f["vmaddr"], f["kind"]))
             continue
@@ -180,6 +187,9 @@ def report(path):
     for (_c, p), v in zip(m.dylibs, m.dylib_versions):
         print("  LC_LOAD_DYLIB %s (current %s, compat %s)" % (p, rec.version_str(v[0]), rec.version_str(v[1])))
     for f in dec["fixups"]:
+        if f["kind"] == "bind":
+            print("  %-14s ordinal %d %-14s unsigned" % (f["section"].split(",")[1], f["lib_ordinal"], f["import"]))
+            continue
         print("  %-14s ordinal %d %-14s %s addr_div=%s diversity=%d" % (
             f["section"].split(",")[1], f["lib_ordinal"], f["import"], f["key"], f["addr_div"], f["diversity"]))
 

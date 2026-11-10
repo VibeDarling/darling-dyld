@@ -179,3 +179,13 @@ Darling's libSystem family (checked with llvm-nm against the private prefix).
 The real cache libz and libSystem versions (no cache access; they do not matter
 for the load, see above); that `darling` forwards the `DYLD_*` variables; the exact
 bind log wording; that dyld loads or runs the executable at all.
+
+## The TSD test (`--leaf exclaves`)
+
+`tsd_main.c` links `libmalloc_exclaves_introspector`, a cache library with 4 `mrs Xt, TPIDRRO_EL0` reads and
+libSystem.B as its only dependency, and checks that the first read was rewritten to a branch. Build it with
+`build_h0.py build --out DIR --leaf exclaves`. A guest run needs a dyld with that framework path on the allow-list
+(not committed: the list is fixed on purpose), `DYLD_SHARED_CACHE_SPLIT_DIR` set inside the guest, and the sidecar
+`dyld_shared_cache_arm64e.tsdsites` (from `tests/darling-tsd/emit_tsd_sites.py`) next to the cache files. Exit 0 means
+translated; 3 means the read is still an mrs (run with a table that omits the image to see it); the dyld halts when the
+table is missing. The program does not show that the translated read executes.
