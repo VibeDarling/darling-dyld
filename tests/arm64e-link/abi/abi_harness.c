@@ -65,6 +65,7 @@ void note(const char *what, void *p) { record(what, p, p, 0); }
 void ok_mark(int n) { put("OKMARK "); putdec(n); nl(); }
 int fail(const char *why) { put("CHECKFAIL "); put(why); nl(); return 1; }
 
+#ifndef ABI_NATIVE
 #define BLOCK_IS_GLOBAL (1 << 28)
 // Hand a block to the subject. Under mutation the invoke pointer is stripped: in place for a stack
 // block (the captures sit behind the header, so it cannot be copied), in a header copy for a
@@ -81,6 +82,7 @@ dispatch_block_t hand_block(const char *what, dispatch_block_t b, struct blk *sc
     l->invoke = STRIP(l->invoke);
     return b;
 }
+#endif
 
 // ------------------------------------------------------------------- fault handler
 // Image table captured before the check runs, so the handler can name the library a pc or lr
@@ -88,6 +90,9 @@ dispatch_block_t hand_block(const char *what, dispatch_block_t b, struct blk *sc
 #define MAX_IMAGES 160
 static struct { uintptr_t base; const char *name; } g_images_tab[MAX_IMAGES];
 static int g_nimages_tab;
+#ifdef ABI_NATIVE
+static void capture_images(void) { }   // no dyld image list: faults are located by address only
+#else
 static void capture_images(void) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n && g_nimages_tab < MAX_IMAGES; i++) {
@@ -96,6 +101,7 @@ static void capture_images(void) {
         g_nimages_tab++;
     }
 }
+#endif
 static void put_where(const char *label, uintptr_t a) {
     uintptr_t clean = (uintptr_t)STRIP((void *)a);
     int best = -1;
@@ -107,8 +113,18 @@ static void put_where(const char *label, uintptr_t a) {
 }
 
 static void on_fault(int sig, siginfo_min *si, void *uc) {
-    char *mc = uc ? *(char **)((char *)uc + UC_MCONTEXT_OFFSET) : 0;
     uintptr_t addr = (uintptr_t)si->si_addr;
+#ifdef ABI_NATIVE
+    uintptr_t pc = 0, lr = 0;
+#ifdef __aarch64__
+    pc = ((ucontext_t *)uc)->uc_mcontext.pc;
+    lr = ((ucontext_t *)uc)->uc_mcontext.regs[30];
+#endif
+    put("FAULT check="); putdec(g_check); put(" sig="); putdec(sig);
+    put(" si_code="); putdec(si->si_code); put(" si_addr="); puthex(addr);
+    put(" pc="); puthex(pc); put(" lr="); puthex(lr);
+#else
+    char *mc = uc ? *(char **)((char *)uc + UC_MCONTEXT_OFFSET) : 0;
     uintptr_t pc = mc ? *(uintptr_t *)(mc + MC_PC_OFFSET) : 0;
     uintptr_t lr = mc ? *(uintptr_t *)(mc + MC_LR_OFFSET) : 0;
     put("FAULT check="); putdec(g_check); put(" sig="); putdec(sig);
@@ -118,6 +134,7 @@ static void on_fault(int sig, siginfo_min *si, void *uc) {
         put(" far="); puthex(*(uintptr_t *)(mc + MC_FAR_OFFSET));
         put(" esr="); puthex(*(unsigned *)(mc + MC_ESR_OFFSET));
     }
+#endif
     put_where("pc", pc); put_where("lr", lr);
     nl();
     put("FAULT-PTR what="); put(g_what); put(" orig="); puthex(g_orig); put(" handed="); puthex(g_handed);
@@ -136,12 +153,20 @@ static void on_fault(int sig, siginfo_min *si, void *uc) {
 // The harness (not the subject) installs the handler with its own signature stripped, so a
 // fault report does not depend on the thing under test. sigaction stores the pointer raw.
 static void install_handlers(void) {
+    static const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT};
+#ifdef ABI_NATIVE
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO;
+    for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, 0);
+#else
     struct sigaction sa;
     sa.handler = STRIP((void *)on_fault);
     sa.mask = 0;
     sa.flags = SA_SIGINFO;
-    static const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT};
     for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, 0);
+#endif
 }
 
 // Harness self-test (abi_probe selftest): one child per verdict class and per fault location, so a
@@ -223,6 +248,59 @@ static const struct set *find_set(const char *name) {
     for (unsigned i = 0; i < sizeof sets / sizeof sets[0]; i++) if (streq(sets[i].name, name)) return &sets[i];
     return 0;
 }
+static const char *g_config = "none";   // $PROBE_CONFIG: which configuration this run measures
+
+// The expectation grammar is in abi_harness.h. spec_alts finds the alternatives that apply to
+// `config`: it returns the start of a "a|b" list and stores its length, or returns 0 when a keyed
+// spec has no entry for the configuration.
+static int spec_keyed(const char *spec) {
+    for (const char *q = spec; *q && *q != ';'; q++) if (*q == '=') return 1;
+    return 0;
+}
+static const char *spec_alts(const char *spec, const char *config, int *len) {
+    const char *p = spec;
+    int keyed = spec_keyed(spec);
+    for (;;) {
+        const char *key = p, *val = p;
+        int klen = 0;
+        if (keyed) {
+            while (*val && *val != '=') val++;
+            klen = (int)(val - key);
+            val++;
+        }
+        const char *end = val;
+        while (*end && *end != ',' && *end != ';') end++;
+        int match = !keyed;
+        if (keyed) {
+            int i = 0;
+            while (i < klen && config[i] == key[i]) i++;
+            match = i == klen && !config[i];
+        }
+        if (match) { *len = (int)(end - val); return val; }
+        if (*end != ',') return 0;
+        p = end + 1;
+    }
+}
+static int alt_has(const char *alts, int len, const char *verdict) {
+    int vl = 0; while (verdict[vl]) vl++;
+    for (int i = 0; i <= len;) {
+        int j = i; while (j < len && alts[j] != '|') j++;
+        if (j - i == vl) { int k = 0; while (k < vl && alts[i + k] == verdict[k]) k++; if (k == vl) return 1; }
+        if (j - i == 3 && alts[i] == 'a' && alts[i + 1] == 'n' && alts[i + 2] == 'y') return 1;
+        i = j + 1;
+    }
+    return 0;
+}
+// the TEXT of ";need=TEXT", copied into buf (empty if none)
+static void spec_need(const char *spec, char *buf, int sz) {
+    int n = 0; buf[0] = 0;
+    for (const char *q = spec; *q; q++)
+        if (q[0] == ';' && q[1] == 'n' && q[2] == 'e' && q[3] == 'e' && q[4] == 'd' && q[5] == '=') {
+            for (q += 6; *q && n < sz - 1; q++) buf[n++] = *q;
+            break;
+        }
+    buf[n] = 0;
+}
 static void putnum2(int n) { if (n < 10) put("0"); putdec(n); }
 
 #define WATCHDOG_TICKS 12   /* seconds */
@@ -280,9 +358,9 @@ static void print_prefixed(const char *buf) {
 static int driver(const char *self, const struct set *set, int mutate) {
     static char out[8192];
     int counts[4] = {0, 0, 0, 0};   // ok faulted hung failed
-    int mismatches = 0;
+    int mismatches = 0, expecting = 0;
     put("ABI-PROBE arch="); put(ARCH); put(" set="); put(set->name); put(" mutate="); putdec(mutate);
-    put(" variant="); put(ABI_VARIANT);
+    put(" variant="); put(ABI_VARIANT); put(" config="); put(g_config);
     put(" checks="); putdec(set->n); put(" fault_handler_signature_stripped_by_harness=1"); nl();
     for (int n = 1; n <= set->n; n++) {
         int status, hung, truncated;
@@ -302,7 +380,12 @@ static int driver(const char *self, const struct set *set, int mutate) {
         // Darling ends a process whose fault cannot be delivered (a fault inside its signal
         // trampoline, check 18) with exit status 137: a death, not a result
         else if (code > 128) { verdict = "faulted"; counts[1]++; }
-        else if (code == 0 && contains(out, mark)) { verdict = "ok"; counts[0]++; }
+        else if (code == 0 && contains(out, mark)) {
+            char need[64];
+            if (set->t[n - 1].expect) spec_need(set->t[n - 1].expect, need, sizeof need); else need[0] = 0;
+            if (need[0] && !contains(out, need)) counts[3]++;
+            else { verdict = "ok"; counts[0]++; }
+        }
         else counts[3]++;
         put("RESULT "); putnum2(n); put(" "); put(set->t[n - 1].name); put(" "); put(verdict);
         if (hung) put(" (no exit within the watchdog, killed)");
@@ -314,20 +397,32 @@ static int driver(const char *self, const struct set *set, int mutate) {
             contains(out, "expect_signed=yes orig_signed=no"))
             put(" pac_field_was_zero=yes");
         if (truncated) put(" output_truncated=yes");
-        if (set->t[n - 1].expect && !streq(set->t[n - 1].expect, verdict)) {
-            put(" EXPECT-MISMATCH expected="); put(set->t[n - 1].expect); mismatches++;
+        if (set->t[n - 1].expect) {
+            int alen = 0;
+            const char *alts = spec_alts(set->t[n - 1].expect, g_config, &alen);
+            expecting = 1;
+            if (!alts || !alt_has(alts, alen, verdict)) {
+                put(" EXPECT-MISMATCH expected="); put(alts ? "" : "(no entry for the configuration) ");
+                for (int i = 0; alts && i < alen; i++) write(1, alts + i, 1);
+                mismatches++;
+            } else if (spec_keyed(set->t[n - 1].expect) && !(alen == 2 && alts[0] == 'o' && alts[1] == 'k')) {
+                put(" expected_not_ok="); for (int i = 0; i < alen; i++) write(1, alts + i, 1);
+            }
         }
         nl();
     }
     put("SUMMARY arch="); put(ARCH); put(" set="); put(set->name); put(" mutate="); putdec(mutate);
+    put(" config="); put(g_config);
     put(" ok="); putdec(counts[0]); put(" faulted="); putdec(counts[1]);
     put(" hung="); putdec(counts[2]); put(" failed="); putdec(counts[3]);
     put(" expect_mismatches="); putdec(mismatches); nl();
-    if (streq(set->name, "selftest")) return mismatches ? 1 : 0;
+    if (streq(set->name, "selftest") || expecting) return mismatches ? 1 : 0;
     return counts[0] == set->n ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
+    const char *cfg = getenv("PROBE_CONFIG");
+    if (cfg && *cfg) g_config = cfg;
     sets[0].t = checks;
     sets[0].n = nchecks;
     const struct set *set = find_set(argc >= 5 ? argv[4] : "checks");

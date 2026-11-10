@@ -3,7 +3,8 @@
 
   tally.py LOG...        # run with python3 -I
 
-Columns come from the `ABI-PROBE ... variant=V ... mutate=M` header of each run. Logs without a
+Columns come from the `ABI-PROBE ... variant=V [config=C] ... mutate=M` header of each run (the l4 probe adds
+config=, which is appended to the column name). Logs without a
 SUMMARY for every run (an incomplete boot) are listed and skipped.
 """
 import collections
@@ -11,21 +12,25 @@ import re
 import sys
 
 
+HEAD = r"ABI-PROBE .*set=(\w+) mutate=(\d) variant=(\S+)(?: config=(\w+))?"
+
+
 def main(paths):
     tab = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
     names, zero_pac, mismatches, boots = {}, collections.Counter(), 0, 0
     for path in paths:
         text = open(path, errors="replace").read()
-        heads = re.findall(r"^ABI-PROBE .*set=(\w+) mutate=(\d) variant=(\S+)", text, re.M)
+        heads = re.findall("^" + HEAD, text, re.M)
         if not heads or text.count("SUMMARY") != len(heads):
             print("INCOMPLETE", path)
             continue
         boots += 1
         col = None
         for line in text.splitlines():
-            m = re.match(r"ABI-PROBE .*set=(\w+) mutate=(\d) variant=(\S+)", line)
+            m = re.match(HEAD, line)
             if m:
-                col = (m.group(3) + (" mutate" if m.group(2) == "1" else ""), m.group(1))
+                col = (m.group(3) + ("/" + m.group(4) if m.group(4) else "") + (" mutate" if m.group(2) == "1" else ""),
+                       m.group(1))
                 continue
             m = re.match(r"RESULT (\d+) (\S+) (ok|faulted|hung|failed)(.*)", line)
             if m:

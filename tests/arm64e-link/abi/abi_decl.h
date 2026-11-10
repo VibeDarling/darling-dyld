@@ -5,6 +5,23 @@
 #ifndef ABI_DECL_H
 #define ABI_DECL_H
 
+#ifdef ABI_NATIVE
+// Native build (the host validating the checks of l4/, which cannot run Mach-O): the system's own
+// declarations; abi_harness.c carries the few platform branches. The blocks, dispatch and unwinder
+// declarations below are for abi_checks.c and are not part of it.
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <ucontext.h>
+#include <unistd.h>
+typedef siginfo_t siginfo_min;
+extern char *getenv(const char *);
+#else
+
 typedef __SIZE_TYPE__ size_t;
 typedef long ssize_t;
 typedef __UINTPTR_TYPE__ uintptr_t;
@@ -14,6 +31,7 @@ typedef int pid_t;
 
 extern ssize_t write(int, const void *, size_t);
 extern ssize_t read(int, void *, size_t);
+extern char *getenv(const char *);
 extern void exit(int) __attribute__((noreturn));
 extern void _exit(int) __attribute__((noreturn));
 extern int close(int);
@@ -94,5 +112,7 @@ typedef struct { int si_signo, si_errno, si_code; pid_t si_pid; unsigned si_uid;
 #define MC_ESR_OFFSET 8
 #define MC_LR_OFFSET (16 + 29 * 8 + 8)
 #define MC_PC_OFFSET (16 + 29 * 8 + 24)
+
+#endif   // ABI_NATIVE
 
 #endif

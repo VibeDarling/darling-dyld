@@ -3,6 +3,10 @@
 #define ABI_HARNESS_H
 #include "abi_decl.h"
 
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
 #if __has_feature(ptrauth_intrinsics)
 #define ARCH "arm64e"
 #define HAS_PAC 1
@@ -12,7 +16,11 @@
 #define SIGN_FIELD(p, slot) ((void *)__builtin_ptrauth_sign_unauthenticated(                  \
     (void *)(p), 0, __builtin_ptrauth_blend_discriminator((void *)(slot), 0)))
 #else
+#ifdef ABI_NATIVE
+#define ARCH "native"
+#else
 #define ARCH "arm64"
+#endif
 #define HAS_PAC 0
 #define STRIP(p) ((void *)(p))
 #define SIGN_IA0(p) ((void *)(p))
@@ -25,7 +33,12 @@
 #define HAS_PAC_CALLS 0
 #endif
 
-// expect: the verdict a self-test must get (NULL for the real checks, whose verdicts are the data)
+// expect: the verdict a check must get, or NULL (the verdicts are the data). Grammar:
+//   "ok"                               one verdict (ok, faulted, hung, failed) or "a|b", or "any" (recorded only)
+//   "c1=ok,c2=any,c3=failed|faulted"   per configuration; the configuration is $PROBE_CONFIG ("none" if unset),
+//                                      and a configuration without an entry is a mismatch
+//   "<either form>;need=TEXT"          an ok verdict also needs TEXT in the child's output (what the child
+//                                      cannot see itself, such as output flushed by exit)
 struct check { const char *name; int (*fn)(void); const char *expect; };
 extern const struct check checks[];     // the numbered checks, defined in abi_checks.c
 extern const int nchecks;
@@ -43,6 +56,8 @@ void note(const char *what, void *p);   // record a pointer a plain lib produced
 void ok_mark(int n);                    // the check's callback or body ran
 int fail(const char *why);              // print a reason, return 1
 
+#ifndef ABI_NATIVE
 struct blk { void *isa; int flags; int reserved; void *invoke; void *desc; };   // Block_layout
 dispatch_block_t hand_block(const char *what, dispatch_block_t b, struct blk *scratch);
+#endif
 #endif
