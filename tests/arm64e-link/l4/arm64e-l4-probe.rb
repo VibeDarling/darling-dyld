@@ -381,6 +381,27 @@ Dir.mktmpdir('l4-probe-') do |tmp|
     check desc, !st.success? && e.match?(pattern), e[0, 300]
   end
 
+  # the plain dylib that z1..z8 load: plain arm64, imports exactly the two handler functions from libc++, no PAC instruction
+  plain_dir = File.join(tmp, 'plain')
+  _o, e, st = py(File.join(HERE, 'build_plain_dylib.py'), 'build', '--out', plain_dir, env: MACHO_ENV)
+  check 'build_plain_dylib.py builds l4_plain.dylib and its structural checks pass', st.success?, e[0, 500]
+  plain = File.join(plain_dir, 'l4_plain.dylib')
+  if st.success? && system('llvm-nm', '--version', out: File::NULL, err: File::NULL)
+    undefined, = Open3.capture2('llvm-nm', '-m', plain)
+    check 'l4_plain.dylib imports exactly std::set_terminate and std::get_terminate, both from libc++',
+          undefined.lines.grep(/\(undefined\)/).map { |l| l.split[2] }.sort == %w[__ZSt13get_terminatev __ZSt13set_terminatePFvvE] &&
+          undefined.lines.grep(/\(undefined\)/).all? { |l| l.include?('(from libc++)') }, undefined
+  end
+  if st.success?
+    pdata = File.binread(plain).bytes
+    poff = (0x1000...pdata.size - 4).step(4).find { |o| pdata[o, 4] == [0, 0, 0, 0] }
+    File.binwrite(File.join(tmp, 'plain_with_pac'), (pdata[0, poff] + [0x7F, 0x23, 0x03, 0xD5] + pdata[poff + 4..]).pack('C*'))
+    _o, e, st = py(File.join(HERE, 'build_plain_dylib.py'), 'check', File.join(tmp, 'plain_with_pac'), env: MACHO_ENV)
+    check 'a plain dylib carrying one PAC instruction is refused', !st.success? && e.include?("PAC instructions {'pacibsp': 1}"), e[0, 300]
+    _o, e, st = py(File.join(HERE, 'build_plain_dylib.py'), 'check', e64, env: MACHO_ENV)
+    check 'the arm64e executable is not accepted as the plain dylib', !st.success? && e.include?('cpusubtype') && e.include?('not an arm64 dylib'), e[0, 300]
+  end
+
   # an arm64e link without -init_offsets keeps the signed __mod_init_func that Darling's dyld would call raw
   mod = File.join(tmp, 'mod_init')
   snippet = "import sys; sys.path.insert(0, #{HERE.inspect}); import build_l4; build_l4.ARM64E_LD_ARGS = []; " \
