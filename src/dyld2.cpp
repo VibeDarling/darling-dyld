@@ -2344,8 +2344,9 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	else if ( (strcmp(key, "DYLD_SHARED_CACHE_SPLIT_DIR") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
 		sSharedCacheSplitDir = value;
 	}
-	else if ( strcmp(key, "DYLD_DARLING_ARM64E_ADAPTERS") == 0 ) {
-		// "off" binds the raw targets to arm64e importers again, to show what the adapters change
+	// gated like DYLD_SHARED_CACHE_SPLIT_DIR: a restricted process must not choose how its imports are bound
+	else if ( (strcmp(key, "DYLD_DARLING_ARM64E_ADAPTERS") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
+		// "off" binds the raw targets to arm64e importers again, to show what the adapters change; "report" also names the imports with no row
 		dyld3::darling::setAdapterMode(strcmp(value, "off") == 0 ? dyld3::darling::AdapterMode::Off : (strcmp(value, "report") == 0 ? dyld3::darling::AdapterMode::Report : dyld3::darling::AdapterMode::On));
 	}
 #endif

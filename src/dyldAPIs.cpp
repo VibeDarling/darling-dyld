@@ -78,7 +78,7 @@
 		const ImageLoader* callerImage = dyld::findImageContainingAddress(callerAddress);
 		if ( (callerImage == NULL) || !dyld3::darling::cpusubtypeIsArm64e(callerImage->machHeader()->cpusubtype) )
 			return result;
-		// a callback-taking export of a plain image is handed out as the thunk that strips the caller's signatures
+		// a callback-taking export of a plain image is handed out as the thunk that authenticates the caller's signatures
 		const ImageLoader* resultImage = dyld::findImageContainingAddress(result);
 		if ( resultImage != NULL )
 			result = (void*)dyld3::darling::adaptedTarget(machoName, (uint64_t)result, dyld3::darling::cpusubtypeIsArm64e(resultImage->machHeader()->cpusubtype));

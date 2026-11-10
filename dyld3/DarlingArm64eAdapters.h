@@ -25,8 +25,9 @@ enum class AdapterStatus : uint8_t {
 enum class ReturnFix : uint8_t {
 	None,
 	// signal(): argument 0 is the signal number. The handler installed through an adapter row is remembered per signal; the
-	// result is signed IA, discriminator 0, only when it is that handler (or SIG_DFL, SIG_IGN, SIG_ERR). Any other value
-	// is returned as plain code has it, so that a later authenticated call faults instead of running a forged pointer.
+	// result is signed IA, discriminator 0, only when it is that handler. SIG_DFL, SIG_IGN and SIG_ERR come back as they
+	// are, and so does any other value (plain code installed it), so that a later authenticated call faults instead of
+	// running a forged pointer. A handler that came back unsigned is accepted again when arm64e code passes it back.
 	SignInstalledHandler,
 	// _Block_copy(): when a copy was made, its invoke is signed for the copy's own address (IA, address diversified,
 	// discriminator 0) from the original's invoke, which is authenticated first; a failed authentication leaves the copy as is.
@@ -41,7 +42,7 @@ struct AdapterRow {
 	const char*		symbol;			// Mach-O name, with the leading underscore
 	uint8_t			authMask;		// bit i: argument i is a code pointer to authenticate
 	uint8_t			blockArg;		// argument number + 1 of a block pointer whose invoke is authenticated, 0 for none
-	uint8_t			structArg;		// argument number + 1 of a pointer to a struct whose first word is a signal handler (sigaction), 0 for none
+	uint8_t			structArg;		// argument number + 1 of a pointer to a struct whose first word is a signal handler, followed by the out struct of the old one (sigaction), 0 for none
 	ReturnFix		ret;
 	uint8_t			argCount;		// register arguments up to the last one the row touches; at most 8 (a call thunk takes no FP or stack arguments)
 	AdapterStatus	status;
@@ -61,7 +62,10 @@ const char* validateAdapterRows(const AdapterRow* rows, size_t count);
 
 // What an arm64e importer should bind for `symbol` when the resolved target is at `target`: a thunk when the table has
 // a row for it and the target is a plain image, otherwise `target`. An Unsupported row binds the target and warns.
-// The caller has checked that the importer is arm64e. Callers hold dyld's lock.
+// The caller has checked that the importer is arm64e. Interposing: an interposer's own address is not wrapped (the hook
+// compares it with the target image); the replacee of an interpose tuple in an arm64e image binds to the same thunk as
+// every other arm64e importer's reference to that symbol, so those match each other, but a plain image's direct reference
+// is the raw function and is not interposed by an arm64e interposer (not tested under a guest). Safe to call from several threads (the thunk cache has its own lock).
 uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e);
 
 // DYLD_DARLING_ARM64E_ADAPTERS: off binds the raw targets, as before the adapters existed. report also warns, once per
@@ -76,8 +80,6 @@ bool sealExecutablePage(void* page, size_t length);
 
 // The thunk bytes, exposed so a test can compare them with an assembler. Both return the number of words written.
 size_t emitAuthThunk(uint32_t* words, uint8_t authMask, uint64_t real);
-size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real);
-uint64_t callThunkHelperAddress();
 size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real);
 uint64_t callThunkHelperAddress();
 

@@ -1048,8 +1048,9 @@ void ImageLoaderMachOCompressed::doApplyFixups(const LinkContext& context, const
 		try {
 			uintptr_t symbolAddress = this->resolve(context, symbolName, symbolFlags, libOrdinal, &targetImage, patcher, NULL, true);
 #ifdef DARLING
-			// arm64e code binding a plain image's callback-taking export gets a thunk that strips the signatures
-			if ( (symbolAddress != 0) && (addend == 0) && (targetImage != NULL) && dyld3::darling::cpusubtypeIsArm64e(this->machHeader()->cpusubtype) )
+			// arm64e code binding a plain image's callback-taking export gets a thunk that authenticates the signatures; an
+			// address outside the target image (a missing weak import is 0) is an interposer's, which resolve applied and is arm64e code, and is not wrapped
+			if ( (addend == 0) && (targetImage != NULL) && targetImage->containsAddress((void*)symbolAddress) && dyld3::darling::cpusubtypeIsArm64e(this->machHeader()->cpusubtype) )
 				symbolAddress = dyld3::darling::adaptedTarget(symbolName, symbolAddress, dyld3::darling::cpusubtypeIsArm64e(targetImage->machHeader()->cpusubtype));
 #endif
 			targetAddrs.push_back((void*)(symbolAddress + addend));
