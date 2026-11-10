@@ -91,22 +91,36 @@ static bool controlsAreMeaningful(void)
 	return right != raw && signIB(raw, 0) != right && signDA(raw, 0) != right && signIA(raw, 1) != right && signIA(raw, (uint64_t)&right) != right;
 }
 
+static void retryOrDie(char* const argv[])
+{
+	const char* retries = getenv("TLV_TEST_RETRIES");
+	const int n = retries ? atoi(retries) : 0;
+	if ( n >= 64 ) { puts("no process with usable keys in 64 tries"); exit(1); }
+	char text[16]; snprintf(text, sizeof text, "%d", n + 1);
+	setenv("TLV_TEST_RETRIES", text, 1);
+	execv("/proc/self/exe", argv);
+	perror("execv"); exit(1);
+}
+
 int main(int argc, char** argv)
 {
 	if ( !(getauxval(AT_HWCAP) & (1UL << 30)) ) { puts("this host has no pointer authentication"); return 77; }
-	if ( !controlsAreMeaningful() ) {
-		const char* retries = getenv("TLV_TEST_RETRIES");
-		const int n = retries ? atoi(retries) : 0;
-		if ( n >= 64 ) { puts("no process with usable keys in 64 tries"); return 1; }
-		char text[16]; snprintf(text, sizeof text, "%d", n + 1);
-		setenv("TLV_TEST_RETRIES", text, 1);
-		execv("/proc/self/exe", argv);
-		perror("execv"); return 1;
-	}
+	if ( !controlsAreMeaningful() )
+		retryOrDie((char* const*)argv);
 	(void)argc;
 	const uint64_t raw = (uint64_t)tlv_get_addr;
 	const uint64_t right = signIA(raw, 0);
 	TLVDescriptor d = { 0, 0, 0 };
+
+	// Every negative control must really fail authentication in this process. A PAC field that happens to verify would
+	// let it pass vacuously, so the actual call sequence is run over each value first and the process restarted with new
+	// keys if one is accepted. The address of the thunk is the discriminator the diversity control signs with.
+	const uint64_t negatives[] = { raw, signIB(raw, 0), signDA(raw, 0), signIA(raw, 1), signIA(raw, (uint64_t)&d.thunk) };
+	for (unsigned i = 0; i != sizeof negatives / sizeof negatives[0]; ++i) {
+		d.thunk = (void* (*)(TLVDescriptor*))negatives[i];
+		if ( outcome(callLikeArm64e, &d) != 2 )
+			retryOrDie((char* const*)argv);
+	}
 
 	// The oracle itself: the arm64e call sequence accepts IA with discriminator 0 and nothing else.
 	d.thunk = (void* (*)(TLVDescriptor*))right;
