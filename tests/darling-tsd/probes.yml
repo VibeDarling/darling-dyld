@@ -1,0 +1,20 @@
+# Mutation probes: each edits a scratch copy of the named file and the host tests must then fail.
+- {name: table gap alignment check dropped, file: DarlingTSDIslands.cpp, from: "((g[i].start & 3) != 0) || ((g[i].size & 3) != 0) || (g[i].size < kVeneerBytes)", to: "false"}
+- {name: gap overlap check weakened, file: DarlingTSDIslands.cpp, from: "g[i-1].size > g[i].start", to: "g[i-1].size > g[i].start + 8"}
+- {name: gap with a site accepted, file: DarlingTSDIslands.cpp, from: "(g[gapIndex].start <= address)", to: "false"}
+- {name: site at the end of the last word of a gap accepted, file: DarlingTSDIslands.cpp, from: "<= address) )\n                ++gapIndex", to: "< address) )\n                ++gapIndex"}
+- {name: site ranges not tiled, file: DarlingTSDIslands.cpp, from: "r.firstSite != nextSite", to: "false"}
+- {name: sites may reach the next image, file: DarlingTSDIslands.cpp, from: "(address >= limit) ||", to: "false ||"}
+- {name: sites not ascending, file: DarlingTSDIslands.cpp, from: "siteOffset(s) <= previous", to: "siteOffset(s) < previous"}
+- {name: images may repeat, file: DarlingTSDIslands.cpp, from: "images[i-1].imageOffset >= r.imageOffset", to: "images[i-1].imageOffset > r.imageOffset"}
+- {name: length not compared, file: DarlingTSDIslands.cpp, from: "expected != length", to: "expected > length"}
+- {name: reserved word ignored, file: DarlingTSDIslands.cpp, from: "h->reserved != 0", to: "false"}
+- {name: findImage returns the neighbour, file: DarlingTSDIslands.cpp, from: "images[low].imageOffset != imageOffset", to: "false"}
+- {name: branch reach one word too long, file: DarlingTSDIslands.cpp, from: "delta >= (1LL << 27)", to: "delta > (1LL << 27)"}
+- {name: branch alignment unchecked, file: DarlingTSDIslands.cpp, from: "((delta & 3) != 0) ||", to: ""}
+- {name: veneer loads the wrong slot, file: DarlingTSDIslands.cpp, from: "(slotOffset / 8) << 10", to: "(slotOffset / 8 + 1) << 10"}
+- {name: veneer reads TPIDRRO, file: DarlingTSDIslands.cpp, from: "0xD53BD040U | reg", to: "0xD53BD060U | reg"}
+- {name: veneer branches back to the site, file: DarlingTSDIslands.cpp, from: "site + 4, ok", to: "site, ok"}
+- {name: veneer clobbers the flags, file: DarlingTSDIslands.cpp, from: "0xB5000040U | reg;", to: "0xF1000000U | (reg << 5) | reg;"}
+- {name: slot lower bound lost, file: DarlingTSDIslands.cpp, from: "slotOffset >= 16", to: "slotOffset >= 0"}
+- {name: slot alignment lost, file: DarlingTSDIslands.cpp, from: "(slotOffset & 7) == 0", to: "true"}
