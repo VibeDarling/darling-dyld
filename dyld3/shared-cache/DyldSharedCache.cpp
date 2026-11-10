@@ -1400,7 +1400,7 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
         uint64_t address = 0;
         ++stats->exports;
         stats->slots += e.locationsCount;
-        // the kind bits of the name word are not understood (the cache's other images treat some exports specially): leave those alone
+        // the kind bits of the name word are not interpreted here: leave those exports alone
         if ( (t.exports[e.imageExportIndex].nameKind >> 28) != 0 ) {
             stats->unexplained += e.locationsCount;
             if ( logFunc != nullptr )
