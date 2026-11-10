@@ -65,5 +65,6 @@
 - {name: range end off by one word, file: DarlingTSDIslands.cpp, from: "(length <= executable[i].size - (address - executable[i].start))", to: "(length < executable[i].size - (address - executable[i].start))"}
 - {name: no range accepted, file: DarlingTSDIslands.cpp, from: "    if ( (ranges == nullptr) || (rangeCount == 0) )", to: "    if ( false )"}
 - {name: reach not checked, file: DarlingTSDIslands.cpp, from: "return veneerReaches(site, leftAddress) ? (int)left : -1;", to: "return (int)left;"}
+- {name: no reopen after a fork, file: DarlingTSDIslands.cpp, from: "(fd >= 0) && (owner != (int)::getpid())", to: "false"}
 # Not killable on the host, by design: a short pwrite on /proc/self/mem cannot be provoked, and this CPU runs the
 # translated code correctly without the `ic ivau` of procSync (its instruction fetch is coherent with the kernel's copy).

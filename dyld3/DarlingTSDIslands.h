@@ -125,6 +125,8 @@ private:
 
 // Memory that reads in place and writes through /proc/self/mem, so a page that holds a neighbour's running code is
 // never unprotected. Writing a private file mapping this way copies the page, never the file.
+// A /proc/self/mem handle names the process that opened it, so memory() reopens it in a forked child; the child's
+// copy of the Patcher state (gap use, finished images) matches the memory it inherited and stays valid there.
 class ProcSelfMemory {
 public:
     ProcSelfMemory();
@@ -135,6 +137,7 @@ public:
     Memory memory();
 private:
     int fd;
+    int owner;      // pid that opened fd
 };
 
 // Disk images (plain arm64, text mapped writable): `mrs Xt, TPIDRRO_EL0; and Xt, Xt, #imm` (the pthread_self shape)

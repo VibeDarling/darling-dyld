@@ -319,7 +319,7 @@ const char* Patcher::patchImage(uintptr_t machHeader, const Memory& memory, Patc
     return nullptr;
 }
 
-ProcSelfMemory::ProcSelfMemory() : fd(::open("/proc/self/mem", O_RDWR | O_CLOEXEC))
+ProcSelfMemory::ProcSelfMemory() : fd(::open("/proc/self/mem", O_RDWR | O_CLOEXEC)), owner((int)::getpid())
 {
 }
 
@@ -357,6 +357,11 @@ static void procSync(void*, uintptr_t address, size_t length)
 
 Memory ProcSelfMemory::memory()
 {
+    if ( (fd >= 0) && (owner != (int)::getpid()) ) {    // forked: the inherited handle still writes the parent
+        ::close(fd);
+        fd = ::open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+        owner = (int)::getpid();
+    }
     return { &fd, procRead, procWrite, procSync };
 }
 
