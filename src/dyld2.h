@@ -117,6 +117,14 @@ namespace dyld {
 	extern const void*			imMemorySharedCacheHeader();
 	extern uintptr_t			fastBindLazySymbol(ImageLoader** imageLoaderCache, uintptr_t lazyBindingInfoOffset);
 	extern bool					inSharedCache(const char* path);
+
+	// A disk image loaded at a path that a split cache also serves. Recorded by loadPhase5; the split cache GOT override
+	// (overrideSplitCacheGotSlots) takes its exporters from these.
+	struct DiskOverrideOfCacheImage {
+		const ImageLoader*	image;
+		uint32_t			cacheImageIndex;	// position in the cache's image table
+	};
+	extern const std::vector<DiskOverrideOfCacheImage>&	diskOverridesOfCacheImages();
 #if LOG_BINDINGS
 	extern void					logBindings(const char* format, ...);
 #endif
