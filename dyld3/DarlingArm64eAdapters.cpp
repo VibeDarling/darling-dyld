@@ -336,25 +336,43 @@ static bool wasInstalledHere(int32_t sig, uint64_t handler)
 // not install through an adapter). Arm64e code that saves one and restores it passes it back as it got it, which does not
 // authenticate; an exact match is accepted, nothing else that fails is, so this is no way to make a forged pointer pass.
 // A ring: when it is full the oldest entry goes, and that handler can no longer be restored.
-static const unsigned kHandedOutCount = 64;
-static uint64_t sHandedOut[kHandedOutCount];
-static uint32_t sHandedOutNext;
+//
+// The ring is lock free: one aligned word per slot, read and written with relaxed atomics. The two directions each keep their own.
+static const unsigned kRingCount = 64;
+struct PointerRing {
+	uint64_t	slots[kRingCount];
+	uint32_t	next;
+};
 
-static bool wasHandedOut(uint64_t pointer)
+static bool ringHolds(const PointerRing& ring, uint64_t pointer)
 {
-	for (unsigned i = 0; i != kHandedOutCount; ++i) {
-		if ( __atomic_load_n(&sHandedOut[i], __ATOMIC_RELAXED) == pointer )
+	if ( pointer == 0 )
+		return false;
+	for (unsigned i = 0; i != kRingCount; ++i) {
+		if ( __atomic_load_n(&ring.slots[i], __ATOMIC_RELAXED) == pointer )
 			return true;
 	}
 	return false;
+}
+
+static void ringAdd(PointerRing& ring, uint64_t pointer)
+{
+	const uint32_t slot = __atomic_fetch_add(&ring.next, 1, __ATOMIC_RELAXED) % kRingCount;
+	__atomic_store_n(&ring.slots[slot], pointer, __ATOMIC_RELAXED);
+}
+
+static PointerRing sHandedOut;
+
+static bool wasHandedOut(uint64_t pointer)
+{
+	return ringHolds(sHandedOut, pointer);
 }
 
 static void recordHandedOut(uint64_t plainHandler)
 {
 	if ( isSpecialHandler(plainHandler) || wasHandedOut(plainHandler) )
 		return;
-	const uint32_t slot = __atomic_fetch_add(&sHandedOutNext, 1, __ATOMIC_RELAXED) % kHandedOutCount;
-	__atomic_store_n(&sHandedOut[slot], plainHandler, __ATOMIC_RELAXED);
+	ringAdd(sHandedOut, plainHandler);
 }
 
 // A handler argument: key IA, discriminator 0 (what paciza makes, and the compiler for a C function pointer). What does
