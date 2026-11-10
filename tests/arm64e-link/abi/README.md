@@ -35,7 +35,9 @@ child printed `OKMARK N`), `faulted` (fault handler exit 70, or killed by a sign
 `failed` (ran, wrong result). The child's handler prints signal, `si_code`, `si_addr`, `pc`, `lr`,
 the pointer handed over (`orig`, `handed`, `orig_signed`, `handed_signed`) and whether `si_addr`
 and `pc` carry PAC bits, and names the image that `pc` and `lr` lie in. The handler itself is
-installed with its signature stripped (the harness is not the subject). `selftest` runs six
+installed with its signature stripped (the harness is not the subject), except when `PROBE_CONFIG` is
+`c2` or `c3` (the L4 test under the dyld adapters, which poison a stripped code pointer): there it is the
+compiler-signed pointer, and so are the thread callbacks and the destructor of the self-test. `selftest` runs six
 deliberate children, each with an expected verdict that the driver compares in code
 (`EXPECT-MISMATCH`, `expect_mismatches=`, exit status 1): ok, fault in the main thread, in a thread,
 in a TSD destructor at thread exit, hang, failed, exit 0 without `OKMARK` (must be `failed`),

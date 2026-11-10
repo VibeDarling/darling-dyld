@@ -73,6 +73,64 @@ check 'no std::sort of an arithmetic range (libc++ extern template; the cache la
 check 'no home path or user name in the sources',
       Dir[File.join(HERE, '*')].reject { |f| File.basename(f) == File.basename(__FILE__) }.none? { |f| File.file?(f) && File.read(f).match?(%r{/home/|/Users/}) }
 
+# ---------------------------------------------------------------- the harness's handler policy
+# Under the dyld adapters (c2, c3) the harness has to hand over the compiler-signed pointer of its fault handler and thread
+# callbacks, because the adapters poison a stripped one; in every other configuration it strips. The host cannot run
+# Mach-O, so the policy is extracted from the harness and run natively with a STRIP that flips a bit.
+HARNESS = File.read(File.join(HERE, '..', 'abi', 'abi_harness.c'))
+
+def handler_policy_ok(harness, dir)
+  streq = harness[/^static int streq\(.*$/] or return [false, 'streq missing']
+  policy = harness[/^static int adapters_on\(void\).*$/] or return [false, 'adapters_on missing']
+  code = harness[/^static void \*harness_code\(void \*p\).*$/] or return [false, 'harness_code missing']
+  File.write(File.join(dir, 'policy.c'), <<~C)
+    #include <stdint.h>
+    #include <stdio.h>
+    #define STRIP(p) ((void *)((uintptr_t)(p) ^ 1))
+    static const char *g_config = "none";
+    #{streq}
+    #{policy}
+    #{code}
+    int main(void) {
+      static const char *signed_in[] = {"c2", "c3"};
+      static const char *stripped_in[] = {"c1", "native", "none", "", "c", "c2x", "c33", "C2"};
+      int bad = 0;
+      for (unsigned i = 0; i < 2; i++) { g_config = signed_in[i]; if (harness_code((void *)0x1000) != (void *)0x1000) { printf("%s was stripped\\n", g_config); bad++; } }
+      for (unsigned i = 0; i < 8; i++) { g_config = stripped_in[i]; if (harness_code((void *)0x1000) != (void *)0x1001) { printf("'%s' was not stripped\\n", g_config); bad++; } }
+      return bad;
+    }
+  C
+  _o, e, st = Open3.capture3('clang', '-O1', '-Wall', File.join(dir, 'policy.c'), '-o', File.join(dir, 'policy'))
+  return [false, e[0, 300]] unless st.success?
+  o, st = Open3.capture2e(File.join(dir, 'policy'))
+  [st.success?, o]
+end
+
+Dir.mktmpdir('l4-policy-') do |dir|
+  ok, why = handler_policy_ok(HARNESS, dir)
+  check 'the harness hands the compiler-signed handler pointer under c2 and c3 and a stripped one under every other configuration', ok, why
+  bare = HARNESS.scan(/STRIP\(\(void \*\)(?:on_fault|st_\w+)\)/)
+  check 'every code pointer the harness gives sigaction, pthread_create and pthread_key_create goes through harness_code',
+        bare.empty? && HARNESS.scan(/harness_code\(\(void \*\)(?:on_fault|st_\w+)\)/).size == 4, bare.inspect
+  policy_probes = [
+    ['no configuration signs', 'streq(g_config, "c2") || streq(g_config, "c3")', '0'],
+    ['c3 is stripped', 'streq(g_config, "c2") || streq(g_config, "c3")', 'streq(g_config, "c2")'],
+    ['c2 is stripped', 'streq(g_config, "c2") || streq(g_config, "c3")', 'streq(g_config, "c3")'],
+    ['every configuration signs', 'streq(g_config, "c2") || streq(g_config, "c3")', '1'],
+    ['the policy is inverted', 'adapters_on() ? p : STRIP(p)', 'adapters_on() ? STRIP(p) : p'],
+    ['a configuration matched by prefix', 'streq(g_config, "c2") ||', 'g_config[0] == \'c\' && g_config[1] == \'2\' ||']
+  ]
+  policy_killed = policy_probes.each_with_index.count do |(desc, old, new), i|
+    mutant = HARNESS.sub(old) { new }
+    mdir = File.join(dir, "m#{i}")
+    Dir.mkdir(mdir)
+    ok = HARNESS.scan(old).size == 1 && mutant != HARNESS && !handler_policy_ok(mutant, mdir)[0]
+    check "policy probe #{i + 1} killed: #{desc}", ok
+    ok
+  end
+  check "handler policy probes killed: #{policy_killed} of #{policy_probes.size}", policy_killed == policy_probes.size
+end
+
 # ---------------------------------------------------------------- native build and run
 def run_native(exe, config, *args)
   o, e, st = Open3.capture3({ 'PROBE_CONFIG' => config }, exe, *args)

@@ -37,6 +37,15 @@ void putyn(int v) { put(v ? "yes" : "no"); }
 void nl(void) { put("\n"); }
 
 // ------------------------------------------------------------------- harness state
+static int streq(const char *a, const char *b) { while (*a && *a == *b) a++, b++; return *a == *b; }
+static const char *g_config = "none";   // $PROBE_CONFIG: which configuration this run measures
+// c2 and c3 run under the dyld arm64e adapters, whose sigaction, pthread_create and pthread_key_create rows authenticate
+// a code pointer and hand a plain callee a poisoned one when it does not authenticate. A stripped pointer from the
+// harness would then never run, and every fault would die without a report. Everywhere else (the control, the
+// native run, the L2 probe on Darling's libraries without the adapters) the harness hands over stripped pointers
+// so that a report does not depend on the thing under test.
+static int adapters_on(void) { return streq(g_config, "c2") || streq(g_config, "c3"); }
+static void *harness_code(void *p) { return adapters_on() ? p : STRIP(p); }
 int g_mutate;
 int g_check;
 static const char *g_what = "";
@@ -150,8 +159,8 @@ static void on_fault(int sig, siginfo_min *si, void *uc) {
     _exit(70);
 }
 
-// The harness (not the subject) installs the handler with its own signature stripped, so a
-// fault report does not depend on the thing under test. sigaction stores the pointer raw.
+// The harness (not the subject) installs the handler itself, in the form harness_code gives it, so a fault report
+// does not depend on the thing under test. sigaction stores the pointer raw.
 static void install_handlers(void) {
     static const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT};
 #ifdef ABI_NATIVE
@@ -162,7 +171,7 @@ static void install_handlers(void) {
     for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, 0);
 #else
     struct sigaction sa;
-    sa.handler = STRIP((void *)on_fault);
+    sa.handler = harness_code((void *)on_fault);
     sa.mask = 0;
     sa.flags = SA_SIGINFO;
     for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, 0);
@@ -180,14 +189,14 @@ static int st_ok(void) { ok_mark(1); return 0; }
 static int st_fault_main(void) { *(volatile int *)8 = 1; return 0; }
 static int st_fault_thread(void) {
     pthread_t t;
-    pthread_create(&t, 0, (void *(*)(void *))STRIP((void *)st_thread_fault), 0);
+    pthread_create(&t, 0, (void *(*)(void *))harness_code((void *)st_thread_fault), 0);
     pthread_join(t, 0);
     return 0;
 }
 static int st_fault_tsd_dtor(void) {
     pthread_t t;
-    pthread_key_create(&st_key, (void (*)(void *))STRIP((void *)st_dtor));
-    pthread_create(&t, 0, (void *(*)(void *))STRIP((void *)st_thread_setkey), 0);
+    pthread_key_create(&st_key, (void (*)(void *))harness_code((void *)st_dtor));
+    pthread_create(&t, 0, (void *(*)(void *))harness_code((void *)st_thread_setkey), 0);
     pthread_join(t, 0);
     return 0;
 }
@@ -238,7 +247,6 @@ static struct set sets[] = {
 static const struct set *find_set(const char *name);
 
 // ----------------------------------------------------------------------------- driver
-static int streq(const char *a, const char *b) { while (*a && *a == *b) a++, b++; return *a == *b; }
 static int atoi_(const char *s) { int v = 0; while (*s >= '0' && *s <= '9') v = v * 10 + *s++ - '0'; return v; }
 static int contains(const char *hay, const char *needle) {
     for (; *hay; hay++) { const char *h = hay, *n = needle; while (*n && *h == *n) h++, n++; if (!*n) return 1; }
@@ -248,7 +256,6 @@ static const struct set *find_set(const char *name) {
     for (unsigned i = 0; i < sizeof sets / sizeof sets[0]; i++) if (streq(sets[i].name, name)) return &sets[i];
     return 0;
 }
-static const char *g_config = "none";   // $PROBE_CONFIG: which configuration this run measures
 
 // The expectation grammar is in abi_harness.h. spec_alts finds the alternatives that apply to
 // `config`: it returns the start of a "a|b" list and stores its length, or returns 0 when a keyed
@@ -361,7 +368,7 @@ static int driver(const char *self, const struct set *set, int mutate) {
     int mismatches = 0, expecting = 0;
     put("ABI-PROBE arch="); put(ARCH); put(" set="); put(set->name); put(" mutate="); putdec(mutate);
     put(" variant="); put(ABI_VARIANT); put(" config="); put(g_config);
-    put(" checks="); putdec(set->n); put(" fault_handler_signature_stripped_by_harness=1"); nl();
+    put(" checks="); putdec(set->n); put(" fault_handler_signature_stripped_by_harness="); putdec(!adapters_on()); nl();
     for (int n = 1; n <= set->n; n++) {
         int status, hung, truncated;
         const char *verdict = "failed";
