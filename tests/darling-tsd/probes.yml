@@ -53,3 +53,11 @@
 - {name: gap larger than 4 GiB accepted, file: DarlingTSDIslands.cpp, from: "(g[i].size > UINT32_MAX) || (g[i].start + g[i].size < g[i].start)", to: "(g[i].start + g[i].size < g[i].start)"}
 - {name: wrapping gap accepted, file: DarlingTSDIslands.cpp, from: "(g[i].size > UINT32_MAX) || (g[i].start + g[i].size < g[i].start)", to: "(g[i].size > UINT32_MAX)"}
 - {name: wrapping site accepted, file: DarlingTSDIslands.cpp, from: "            if ( address < r.imageOffset )\n                return \"TSD site table site wraps\";", to: ""}
+- {name: disk rewrite keeps the old TP+64 slot, file: DarlingTSDIslands.cpp, from: "((uint32_t)(slotOffset / 8) << 10) | (reg << 5) | reg;   // ldr Xt", to: "(8U << 10) | (reg << 5) | reg;   // ldr Xt"}
+- {name: disk rewrite ignores the register of the and, file: DarlingTSDIslands.cpp, from: "((instructions[k+1] & 0x1FU) == reg) && (((instructions[k+1] >> 5) & 0x1FU) == reg)", to: "true"}
+- {name: disk rewrite accepts any and width, file: DarlingTSDIslands.cpp, from: "(instructions[k+1] & 0xFFC00000U) == 0x92400000U", to: "(instructions[k+1] & 0x7F800000U) == 0x12000000U"}
+- {name: disk rewrite writes beyond the end, file: DarlingTSDIslands.cpp, from: "const bool andImmediate = (k + 1 != count) &&", to: "const bool andImmediate = (k + 1 <= count) &&"}
+- {name: disk rewrite does not report a missing slot, file: DarlingTSDIslands.cpp, from: "            complete = false;\n            continue;", to: "            continue;"}
+- {name: disk rewrite uses a bad slot, file: DarlingTSDIslands.cpp, from: "        if ( !isValidSlotOffset(slotOffset) ) {\n            complete = false;", to: "        if ( false ) {\n            complete = false;"}
+- {name: disk rewrite leaves the mrs, file: DarlingTSDIslands.cpp, from: "        instructions[k] = 0xD53BD040U | reg;                                    // mrs Xt, TPIDR_EL0", to: ""}
+- {name: disk rewrite counts nothing, file: DarlingTSDIslands.cpp, from: "        ++*rewritten;\n", to: ""}

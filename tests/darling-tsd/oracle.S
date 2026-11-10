@@ -66,3 +66,41 @@ tsd_spinner:
         ret
         .globl tsd_code_end
 tsd_code_end:
+
+// The on-disk image rewrite: inputs and what the assembler says they become (slot offset 0x170).
+        .balign 4
+        .globl oracle_disk_in
+oracle_disk_in:
+        mrs x9, TPIDRRO_EL0
+        and x9, x9, #0xfffffffffffffff8
+        ret
+        .globl oracle_disk_out
+oracle_disk_out:
+        mrs x9, TPIDR_EL0
+        ldr x9, [x9, #0x170]
+        ret
+        .globl oracle_disk_lone_in
+oracle_disk_lone_in:
+        mrs x9, TPIDRRO_EL0
+        ret
+        .globl oracle_disk_lone_out
+oracle_disk_lone_out:
+        mrs x9, TPIDR_EL0
+        ret
+// mrs into x9 followed by an and on another register, then a 32-bit and, then an mrs as the last word
+        .globl oracle_disk_miss_in
+oracle_disk_miss_in:
+        mrs x9, TPIDRRO_EL0
+        and x10, x10, #0xfffffffffffffff8
+        mrs x9, TPIDRRO_EL0
+        and w9, w9, #0xfffffff8
+        mrs x9, TPIDRRO_EL0
+        .globl oracle_disk_miss_out
+oracle_disk_miss_out:
+        mrs x9, TPIDR_EL0
+        and x10, x10, #0xfffffffffffffff8
+        mrs x9, TPIDR_EL0
+        and w9, w9, #0xfffffff8
+        mrs x9, TPIDR_EL0
+        .globl oracle_disk_end
+oracle_disk_end:

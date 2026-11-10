@@ -109,6 +109,7 @@ static void testEncoders() {
 
 void testPatcher();
 void testNativeRun();
+void testDiskRewrite();
 
 int main() {
     testParse();
@@ -116,6 +117,7 @@ int main() {
     testEncoders();
     testPatcher();
     testNativeRun();
+    testDiskRewrite();
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
