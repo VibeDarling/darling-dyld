@@ -74,7 +74,10 @@ Dir.mktmpdir('tlv-thunk-signing-') do |dir|
     abort "the missing __arm64__ guard did not fire (#{verdict})\n#{out}"
   end
   puts 'ok   guard: an aarch64 build without __arm64__ is a compile error'
-  next if ARGV.include?('--no-probes')
+  if ARGV.include?('--no-probes')
+    puts "skip PROBES (#{PROBES.size}) --no-probes"
+    next
+  end
 
   killed = 0
   PROBES.each_with_index do |(name, from, to), i|

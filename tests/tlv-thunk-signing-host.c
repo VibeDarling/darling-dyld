@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/auxv.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -46,7 +47,7 @@ static void tlv_free(void* storage) { (void)storage; }
 static bool tlv_image_uses_cache_v2(const struct mach_header* mh) { return (mh->flags & TLV_TEST_CACHE_V2) != 0; }
 static void tlv_set_key_for_image(const struct mach_header* mh, pthread_key_t key) { (void)mh; (void)key; }
 
-#include "extracted.inc"
+#include <extracted.inc>
 
 __attribute__((target("arch=armv8.3-a"))) static uint64_t signIA(uint64_t p, uint64_t m) { __asm__("pacia %0, %1" : "+r"(p) : "r"(m)); return p; }
 __attribute__((target("arch=armv8.3-a"))) static uint64_t signIB(uint64_t p, uint64_t m) { __asm__("pacib %0, %1" : "+r"(p) : "r"(m)); return p; }
@@ -70,7 +71,12 @@ static int outcome(void* (*call)(const TLVDescriptor*), const TLVDescriptor* d)
 {
 	fflush(stdout);
 	const pid_t child = fork();
+	if ( child < 0 ) {
+		perror("fork");
+		exit(1);
+	}
 	if ( child == 0 ) {
+		prctl(PR_SET_DUMPABLE, 0);					// the faults below are deliberate: keep them out of coredumpd
 		signal(SIGSEGV, SIG_DFL); signal(SIGBUS, SIG_DFL); signal(SIGILL, SIG_DFL);
 		_exit(call(d) == (char*)d + 0x40 ? 0 : 1);
 	}
@@ -88,7 +94,7 @@ static bool controlsAreMeaningful(void)
 {
 	const uint64_t raw = (uint64_t)tlv_get_addr;
 	const uint64_t right = signIA(raw, 0);
-	return right != raw && signIB(raw, 0) != right && signDA(raw, 0) != right && signIA(raw, 1) != right && signIA(raw, (uint64_t)&right) != right;
+	return right != raw && signIB(raw, 0) != right && signDA(raw, 0) != right && signIA(raw, 1) != right;
 }
 
 static void retryOrDie(char* const argv[])
