@@ -10,6 +10,7 @@
 require 'json'
 require 'tmpdir'
 require 'open3'
+require 'fileutils'
 
 HERE = __dir__
 LD64 = ENV['LD64'].to_s
@@ -188,6 +189,54 @@ Dir.mktmpdir('l4-filter-') do |dir|
     ok
   end
   check "adapter-warning filter probes killed: #{filter_killed} of #{filter_probes.size}", filter_killed == filter_probes.size
+end
+
+# ---------------------------------------------------------------- the matrix runner's guest command
+# run_matrix.sh is copied next to a stub of run_guest.sh that records the command it would run in the guest.
+MATRIX = File.read(File.join(HERE, 'run_matrix.sh'))
+
+def matrix_commands(script, dir, env)
+  FileUtils.mkdir_p([File.join(dir, 'l4'), File.join(dir, 'abi'), File.join(dir, 'probe'), File.join(dir, 'cache')])
+  File.write(File.join(dir, 'l4', 'run_matrix.sh'), script)
+  File.write(File.join(dir, 'abi', 'run_guest.sh'), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GUEST_LOG\"\n")
+  FileUtils.chmod(0o755, [File.join(dir, 'l4', 'run_matrix.sh'), File.join(dir, 'abi', 'run_guest.sh')])
+  File.write(File.join(dir, 'policy.txt'), "x\n")
+  log = File.join(dir, 'guest.log')
+  File.delete(log) if File.exist?(log)
+  base = { 'DARLING_GUEST_BUILD' => dir, 'PROBE_DIR' => File.join(dir, 'probe'), 'CACHE_DIR' => File.join(dir, 'cache'), 'GUEST_LOG' => log }
+  _o, e, st = Open3.capture3(base.merge(env), File.join(dir, 'l4', 'run_matrix.sh'), 't', '1', '1')
+  st.success? && File.exist?(log) ? File.read(log) : "FAILED #{e}"
+end
+
+def matrix_policy_ok(script, root)
+  FileUtils.mkdir_p(root)
+  policy = "/Volumes/SystemRoot#{File.realpath(root)}/policy.txt"
+  on = matrix_commands(script, root, 'L4_CONFIGS' => 'c3', 'L4_POLICY' => File.join(root, 'policy.txt'))
+  off = matrix_commands(script, root, 'L4_CONFIGS' => 'c3')
+  both = matrix_commands(script, root, 'L4_CONFIGS' => 'c2 c3', 'L4_POLICY' => File.join(root, 'policy.txt'))
+  c3_part = both[/PROBE_CONFIG=c3[^;]*/].to_s
+  on.scan('DYLD_SHARED_CACHE_SPLIT_POLICY=').size == 1 && on.include?(" DYLD_SHARED_CACHE_SPLIT_POLICY=#{policy} ") &&
+    on.include?('DYLD_SHARED_CACHE_SPLIT_DIR=') && !off.include?('POLICY') && off.include?('PROBE_CONFIG=c3 DYLD_SHARED_CACHE_SPLIT_DIR=') &&
+    c3_part.include?(policy) && !both[/PROBE_CONFIG=c2[^;]*/].to_s.include?('POLICY')
+end
+
+Dir.mktmpdir('l4-matrix-') do |dir|
+  check 'run_matrix.sh puts DYLD_SHARED_CACHE_SPLIT_POLICY, as the guest path of L4_POLICY, on the c3 command only and only when set',
+        matrix_policy_ok(MATRIX, dir)
+  matrix_probes = [
+    ['the policy is never set', '$policy \\$E', ' \\$E'],
+    ['the policy is set on every command', 'PROBE_CONFIG=c2 \\$E', 'PROBE_CONFIG=c2 DYLD_SHARED_CACHE_SPLIT_POLICY=/x \\$E'],
+    ['the policy is the host path, without the guest root', 'policy=" DYLD_SHARED_CACHE_SPLIT_POLICY=${GUEST_ROOT:-/Volumes/SystemRoot}$(cd', 'policy=" DYLD_SHARED_CACHE_SPLIT_POLICY=$(cd'],
+    ['the policy is set although L4_POLICY is empty', 'if [ -n "${L4_POLICY:-}" ]; then', 'if true; then'],
+    ['the policy file name is lost', '/$(basename "$L4_POLICY")', '']
+  ]
+  matrix_killed = matrix_probes.each_with_index.count do |(desc, old, new), i|
+    mdir = File.join(dir, "m#{i}")
+    ok = MATRIX.scan(old).size == 1 && !matrix_policy_ok(MATRIX.sub(old) { new }, mdir)
+    check "run_matrix probe #{i + 1} killed: #{desc}", ok
+    ok
+  end
+  check "run_matrix probes killed: #{matrix_killed} of #{matrix_probes.size}", matrix_killed == matrix_probes.size
 end
 
 # ---------------------------------------------------------------- native build and run

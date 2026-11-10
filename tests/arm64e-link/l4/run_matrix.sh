@@ -8,6 +8,8 @@
 # The variable is set inside the guest (on the test's own command), never on the launcher: the launcher
 # passes its environment to launchd, which would then load the cache itself (RUN-GUEST.md of the private guest
 # build). GUEST_ROOT (default /Volumes/SystemRoot) is where the guest sees the host's filesystem root.
+# L4_POLICY=<host file> sets DYLD_SHARED_CACHE_SPLIT_POLICY on the c3 command (the policy file of a dyld that has it: which cache
+# images are served over disk copies); without it c3 runs with the dyld's built-in allow-list.
 # c3 maps the cache once per child, 28 children per run: use a local copy of the cache, and run a config
 # per boot (L4_CONFIGS=c3) if the 300 s cap of run_guest.sh is not enough.
 set -u
@@ -20,7 +22,11 @@ for c in ${L4_CONFIGS:-c1 c2 c3 selftest}; do
     c1) cmd="$cmd; PROBE_CONFIG=c1 \$C" ;;
     c2) cmd="$cmd; PROBE_CONFIG=c2 \$E" ;;
     c3) : "${CACHE_DIR:?c3 needs CACHE_DIR}"
-        cmd="$cmd; PROBE_CONFIG=c3 DYLD_SHARED_CACHE_SPLIT_DIR=${GUEST_ROOT:-/Volumes/SystemRoot}$(cd "$CACHE_DIR" && pwd) \$E" ;;
+        policy=""
+        if [ -n "${L4_POLICY:-}" ]; then
+          policy=" DYLD_SHARED_CACHE_SPLIT_POLICY=${GUEST_ROOT:-/Volumes/SystemRoot}$(cd "$(dirname "$L4_POLICY")" && pwd)/$(basename "$L4_POLICY")"
+        fi
+        cmd="$cmd; PROBE_CONFIG=c3 DYLD_SHARED_CACHE_SPLIT_DIR=${GUEST_ROOT:-/Volumes/SystemRoot}$(cd "$CACHE_DIR" && pwd)$policy \$E" ;;
     selftest) cmd="$cmd; \$E selftest; \$C selftest" ;;
     *) echo "unknown config $c" >&2; exit 2 ;;
   esac
