@@ -3,8 +3,8 @@
 Rung L4 of the shared-cache ladder (plan: `shared-cache-m3-l4.md`, Q4). One arm64e executable
 (`l4_probe_arm64e`, 3.3a recipe) uses libc++, libc++abi and the unwinder. It runs in three
 configurations; the same sources built as plain arm64 are the control, and built natively on the host
-they validate the checks themselves. This directory is T4 (sources, stubs, builds, host test). The guest
-runs are T5 and are not in this README yet.
+they validate the checks themselves. This directory is T4 (sources, stubs, builds, host test); the guest
+runs of T5 are in "Measured in the guest" below, separate from the plan's expectations.
 
 ```
 LD64=/path/to/aarch64-apple-darwin20-ld SDKROOT=/path/to/Darling/MacOSX.sdk \
@@ -19,14 +19,15 @@ python3 -I tests/arm64e-link/abi/tally.py <build>/logs/run-PREFIX*.out  # per (a
 
 ## Files
 
-- `l4_checks.cpp`: the 28 checks, the expectation table, `l4_iface.h` (the harness as C++ sees it).
+- `l4_checks.cpp`: the 28 checks, the 8 diagnostics x1..x8 after them, the expectation table, `l4_iface.h` (the harness as C++ sees it).
 - `../abi/abi_harness.c`: the driver, reused (one child per check, `OKMARK`, fault handler, 12 s watchdog,
   self-test). It gained the per-configuration expectation grammar and a native branch for this test;
   `../abi/tally.py` gained a config column.
 - `build_l4.py`: build, stub generation, structural checks. `../h0/gen_stub.py` (extended:
   `undefined_names`, `exported_names`, `write_symbols`) and `../h0/build_h0.py` (a `libc++` stub entry,
   `check_stub` for plain arm64) are reused. `libcxxabi_exports.txt`: the 369 names of Darling's libc++abi.
-- `run_matrix.sh`: guest boots (calls `../abi/run_guest.sh`: shared lock, memory cap, `darling shutdown`).
+- `run_matrix.sh`: guest boots (calls `../abi/run_guest.sh`: shared lock, memory cap, `darling shutdown`);
+  `L4_POLICY=<host file>` sets `DYLD_SHARED_CACHE_SPLIT_POLICY` on the c3 command.
 - `arm64e-l4-probe.rb`: the host test.
 
 ## Build
@@ -86,6 +87,8 @@ recorded fact, never a fault. In c3 it also requires the image to be `/usr/lib/l
 | 25-26 | q5_atexit_and_static_destructor, q5_exit_flushes_cout | a static initialiser ran before `main`; atexit handlers in reverse order, then the static object's destructor, whose unflushed cout text must appear in the output; `exit` flushes cout |
 | 27-28 | q6_static_local_contention, q6_static_local_init_throws | 16 guarded statics, 8 threads released together, each initialised once and never seen half-built; `__cxa_guard_abort` after a throwing initialiser |
 
+| x1-x8 | x1_get_terminate, x2_set_get_terminate, x3_allocate_free_exception, x4-x7_init_primary_*, x8_get_unexpected_via_dlsym | diagnostics, not in the plan: public runtime API calls that bisect a throw failure; `__cxa_init_primary_exception` is found by `dlsym` with a null, a signed and a stripped destructor and a class typeinfo. Recorded only (`any` everywhere), so they never turn a run into a mismatch |
+
 The sources avoid `std::sort` of arithmetic ranges (T0: the `extern template` `__insertion_sort_incomplete`
 set is exported by Darling's libc++ but not by the cache's; a binary calling it would not bind against the
 cache). The host test checks this.
@@ -103,20 +106,86 @@ defect on the built binary (authenticated vtable binds with addend 0). When the 
 
 ## Host validation (this branch)
 
-Host test: 81 checks, `ALL PASS`, with LD64, SDKROOT, LIBCXX_INCLUDE, DARLING_USR_LIB and CACHE_EXPORTS_DIR
-(the T0 export lists) set; 79 without the last. The native part alone needs only clang and g++.
-Native run (libstdc++, aarch64 Linux, no PAC): 26 `ok`, the two q1 checks `failed` as the table says,
-`expect_mismatches=0`; with `PROBE_CONFIG=c3` exactly checks 1 and 2 mismatch, with an unknown config all 28.
-16 mutation probes, each rebuilt natively and each changing the verdict of exactly the named check:
+Host test: 118 checks, `ALL PASS`, with LD64, SDKROOT, LIBCXX_INCLUDE, DARLING_USR_LIB and CACHE_EXPORTS_DIR
+(the T0 export lists) set; 113 without the last two. The native part alone needs only clang and g++.
+Native run (libstdc++, aarch64 Linux, no PAC): 34 `ok` (the 26 plan checks and x1..x8), the two q1 checks `failed` as the
+table says, `expect_mismatches=0`; with `PROBE_CONFIG=c3` exactly checks 1 and 2 mismatch, with an unknown config all 36.
+The harness's own changes are tested natively on code extracted from `../abi/abi_harness.c` and `run_matrix.sh`, with 17 probes:
+the handler policy (signed under c2 and c3, stripped everywhere else; 6 probes), the filter for dyld's adapter warnings (6) and
+the policy variable of the matrix runner (5). Mutation probes on the checks: 19, each rebuilt natively and each changing the verdict of exactly the named check:
 dropped rethrow (05), a changed value through the frames (04), the cleanup destructor order (07), a
 non-caught exception type (08, faulted), a lambda that does not throw (09), `catch(...)` replaced (06,
 faulted), a lost capture (20), `call_once` bypassed (23), a thread-local destructor that does not count (24),
 a lost atexit registration (25), a static destructor that prints nothing (25, the `need` text), `_Exit` instead
 of `exit` (26, the `need` text), a non-static local (27), a first initialisation that does not throw (28), a
-cout line not printed (19, the `need` text), and an expectation table that says `faulted` (every `EXP_STD`
-check mismatches). Measured against the T0 export lists of the cache (names only): every stub name is
+cout line not printed (19, the `need` text), three diagnostics (x2, x3, x8), and an expectation table that says `faulted`
+(every `EXP_STD` check mismatches). Measured against the T0 export lists of the cache (names only): every stub name is
 exported by the cache's libc++ and libc++abi respectively.
 libc++ is not installed on the host, so the native run uses libstdc++ only.
+
+## Measured in the guest (T5, one private guest build)
+
+Facts from the first guest runs, not the plan's expectations (those are the tables above and "What T5 needs").
+
+Build under test: a dyld with the TSD wiring, the arm64e adapters (`feat/shared-cache-m3-l4-adapters`) and the policy file
+(PR #37), plus the libdyld change that signs the TLV thunk of an arm64e image (`feat/dyld-tlv-thunk-signing`); a libunwind with
+the T1 changes (PR 4); this test with the harness changes of this branch. The cache is a hard-linked copy of the 13 unmodified
+files with the `.tsdsites` sidecar for 3649 images. The policy file names libz, libexpat, libc++.1 and libc++abi, not
+libunwind. Every number below is identical in all 6 boots of its configuration; one boot of 19 hung to the 300 s cap with an
+empty log and was repeated. Counts are over the 36 checks (28 plan checks and x1..x8); the figure for the plan's 28 follows.
+
+| config | ok | faulted | failed | the 28 plan checks |
+|---|---|---|---|---|
+| c1 (plain arm64, Darling's libs) | 30 | 0 | 6 | 26 ok, 2 failed (01, 02 as the table says) |
+| c2 (arm64e, Darling's libc++ and libc++abi) | 18 | 12 | 6 | 14 ok, 12 faulted, 2 failed (01, 02) |
+| c3 (arm64e, cache) | 18 | 18 | 0 | 14 ok, 14 faulted |
+
+- c1: `expect_mismatches=0`. x4-x7 fail because `dlsym` finds no `__cxa_init_primary_exception` in Darling's libc++abi (recorded,
+  `any`). The test is proven on the control.
+- c2 ok: 03-07, 10, 15, 16, 20-22, 24, 27, 28, x1-x3, x8. c2 faulted: 08, 09, 11-14, 17, 18, 19, 23, 25, 26. Failed: 01, 02, x4-x7.
+  Causes of the faults:
+  - 08, 09, 19, 25, 26: SIGTRAP at a compiler-emitted `brk #0xc472` in this executable right after `autda` of the vtable pointer
+    of an object that Darling's libc++ created (`std::runtime_error`, `ostream`/`cout`, a `std::function` target). Plain libc++
+    writes unsigned vtable pointers and the arm64e client authenticates them. pc and `si_addr` carry no PAC bits.
+  - 17, 18: SIGSEGV in Darling's libc++ calling a signed pointer into this executable (`si_addr` is an executable address
+    with PAC bits): vtable entries of classes defined here (the shared_ptr control block, a locale facet).
+  - 23: SIGSEGV with pc at a signed callback of this executable and lr in libc++: `std::__call_once(flag, void*, void(*)(void*))`
+    takes a callback and has no adapter row (`__ZNSt3__111__call_onceERVmPvPFvS2_E` is in the adapters' report-mode list).
+  - 11-14: SIGSEGV in Darling's libc++abi at a pointer with PAC bits, typeinfo defined in this executable (the ld64 addend defect).
+  - 24 faulted before the libdyld change: pc was `tlv_get_addr` with PAC error bits, because libdyld stored the thunk unsigned and
+    an arm64e image calls it with `blraaz`. With the change it is ok. Without it c2 was 13 ok and 13 faulted of the 28.
+- c3: checks 01 and 02 pass: `std::locale::classic` at `0x1804108c4` in `/usr/lib/libc++.1.dylib` and `__cxa_throw` at `0x1804a2040` in
+  `/usr/lib/libc++abi.dylib`, both inside the cache range (base `0x180000000`, size `0x166464000`). Passing: 01, 02, 15-22, 24-27,
+  x1-x3, x8 (strings, containers, shared_ptr, streams, cout, threads, thread_local destructor, atexit, exit flush and guard
+  contention on the cache's libc++). Faulted: 03-14, 23, 28, x4-x7.
+  - Every faulted check except 14 (and the known 11-13) is one failure: SIGTRAP (`TRAP_BRKPT`, `si_addr` = pc, no PAC bits) at
+    `/usr/lib/libc++abi.dylib` + `0x15a5c`, lr + `0x15a3c`. The nearest export at or below that offset in the cache image's export
+    trie (an interface fact) is `___cxa_init_primary_exception` (`0x159d4`, next export `0x15b50`), called by `__cxa_throw`.
+  - x1-x8 bisect it with public API only: `std::get_terminate`, `std::set_terminate`, `get_unexpected` (by `dlsym`),
+    `__cxa_allocate_exception` and `__cxa_free_exception` work. Calling `__cxa_init_primary_exception(obj, &typeid(int), nullptr)`
+    directly traps at the same pc whether the destructor is null, signed or stripped and whether the typeinfo is `int` or
+    `std::runtime_error` (x4-x7). The trap does not depend on any argument the test controls.
+  - Check 14 faults differently: SIGSEGV at a pointer with PAC bits, pc at libc++abi + `0x143f8`.
+  - Before the libdyld change every c3 throw faulted at `tlv_get_addr`, reached from libc++abi + `0x20b8` (the exception
+    globals' thread-local).
+  - Understanding the `0x15a5c` trap needs the cache's implementation: it was not investigated, and is a decision for the owner.
+  - dyld printed `split cache GOT override: patched=6425 missing=1431 unexplained=90` and about 96 "arm64e adapters: X is imported by
+    an arm64e image and has no adapter" warnings per child (malloc zones, block sorts, dispatch, xpc, corecrypto callbacks, `__Block_*`;
+    the test uses none of them). The driver drops those lines (`ADAPTER-WARNINGS-DROPPED n`).
+- With the unmodified harness (handler stripped) every c2 and c3 fault died as a plain SIGSEGV or exit 137 with no report, because
+  the adapters poison a code pointer that does not authenticate. Nothing is logged when dyld poisons a pointer.
+
+Mutation probes m1-m6 of the plan, each in a rebuilt dyld or libunwind, one at a time (the checks that changed against the
+baselines above; one guest child per check, because a driver run of several mutants died with no output):
+
+| probe | change | config | checks that changed |
+|---|---|---|---|
+| m1 | policy without libc++abi | c3 | 02 failed; collateral: 15 and 20 abort (SIGABRT) with the cache's libc++ over Darling's libc++abi |
+| m2 | libunwind without return-address authentication | c2 | 03, 04, 05, 07, 10, 28 abort with "terminating with uncaught exception"; 06 stays ok (same-frame catch) |
+| m3 | libunwind without personality authentication | c2 | 03-07, 10, 28 SIGSEGV at the signed personality |
+| m4 | no `___cxa_atexit` row | c2, c3 | every check faults (exit 70): the executable's startup registers destructors through it |
+| m5 | no `_pthread_create` row | c2, c3 | new faults: 20, 21, 22, 24, 27 (and 10 in c2) |
+| m6 | adapter hook off for the main program's binds | c2, c3 | every child dies of SIGSEGV with no report |
 
 ## What T5 needs
 
@@ -134,12 +203,11 @@ libc++ is not installed on the host, so the native run uses libstdc++ only.
 - Mutation probes m1-m6 of the plan: the checks that should name them are 02 (m1: no libc++abi in the
   allow-list, so `__cxa_throw` stays on disk), 03-10 (m2, m3: unwinder without the return-address or
   personality strip), 25 and every exit (m4: no `__cxa_atexit` row), 20-24 and 27 (m5: no `pthread_create`
-  row), the main program's binds (m6). These are the plan's expectations, not measurements.
+  row), the main program's binds (m6). These are the plan's expectations; the measurements are above.
 
 ## Not verified
 
-Everything that needs the guest: that the executable loads, that Darling's dyld runs the main program's
-`__init_offsets`, that `_dyld_get_shared_cache_range` covers libc++ in a split cache, that the c1 control passes on
-Darling's libc++ 15 (the plan requires it), and every c2 and c3 verdict. The signed `__tlv_bootstrap` in
-the main program's thread-local descriptors (`__thread_vars`, the `thread_local` check) is untested. The native run
+The guest runs above measured that the executable loads, that the c1 control passes on Darling's libc++, that
+`_dyld_get_shared_cache_range` covers libc++ and libc++abi in a split cache, and every c2 and c3 verdict. Still open: the cause of the c3 trap in the cache's `__cxa_init_primary_exception` (every c3 throw), and a
+run on a dyld without the experiments (the libdyld change is a separate branch, not part of this one). The `thread_local` check depended on the libdyld thunk signing. The native run
 uses libstdc++, not libc++. The cache's libc++ may behave differently from LLVM 15 headers in ways the export names do not show.
