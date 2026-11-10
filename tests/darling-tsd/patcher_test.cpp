@@ -303,6 +303,37 @@ static void testMany() {
     CHECK(disjoint && checked == veneers);
 }
 
+// The reach of a veneer differs by side (it returns to site + 4 from its fifth word): when the nearer gap is just out of
+// reach on its side, the farther one on the other side may still fit.
+static void testAsymmetricReach() {
+    const uint32_t limit = 1U << 27;
+    const uint32_t imageB = 0x20000000;
+    const uint32_t siteB = 0x100;
+    struct Case { uint32_t left, right; int usedLeft, usedRight; };
+    const Case cases[] = {
+        { imageB + siteB - limit + 4, imageB + siteB + limit - 8, 20, 0 },      // right is nearer but 4 bytes too far
+        { imageB + siteB - limit + 4, imageB + siteB + limit - 12, 0, 20 },     // both reach, right is nearer
+        { imageB + siteB - limit - 4, imageB + siteB + limit - 8, 0, 0 },       // neither reaches
+    };
+    for (const Case& c : cases) {
+        TableBuilder b;
+        b.images = { { 0, {} }, { imageB, { encodeSite(siteB, kTSDRead, 9) } } };
+        b.gaps = { { c.left, 0x40 }, { c.right, 0x40 } };
+        ModelMemory m;
+        m.addRegion(kBase + imageB, 0x1000, kNop);
+        m.setWord(kBase + imageB + siteB, kMRSTPIDRRO | 9);
+        m.addRegion(kBase + c.left, 0x40, 0);
+        m.addRegion(kBase + c.right, 0x40, 0);
+        SiteTable table; CHECK(b.parse(table) == nullptr);
+        Patcher p(table, kBase, kSlot);
+        std::vector<ExecutableRange> ranges = rangesOf(m);
+        CHECK(p.init(ranges.data(), (uint32_t)ranges.size()) == nullptr);
+        PatchStats st;
+        CHECK(p.patchImage(kBase + imageB, m.memory(), &st) == nullptr);
+        CHECK((int)p.bytesUsed(0) == c.usedLeft && (int)p.bytesUsed(1) == c.usedRight);
+    }
+}
+
 // Writes go through /proc/self/mem, which ignores protections: a table must not name memory outside the executable
 // mappings of the cache.
 static void testExecutableRanges() {
@@ -356,5 +387,6 @@ void testPatcher() {
     testPlacement();
     testReach();
     testMany();
+    testAsymmetricReach();
     testExecutableRanges();
 }

@@ -180,8 +180,9 @@ bool Patcher::nextWithRoom(int64_t* index, int step, uintptr_t* address) const
     return false;
 }
 
-// The nearest gap with room whose veneer the site can branch to and return from, or -1. Gaps are sorted, so the
-// nearer of the two nearest candidates is the nearest overall, and if it is out of reach so is every other.
+// The nearest gap with room whose veneer the site can branch to and return from, or -1. Gaps are sorted, so on each
+// side the first gap with room is the nearest, and if that one is out of reach so is every later one on that side.
+// The two sides have different limits (the veneer branches back to site + 4 from its fifth word), so both are tried.
 int Patcher::placeVeneer(uintptr_t site) const
 {
     uint32_t low = 0;
@@ -197,13 +198,11 @@ int Patcher::placeVeneer(uintptr_t site) const
     int64_t right = (int64_t)low;
     uintptr_t leftAddress = 0;
     uintptr_t rightAddress = 0;
-    const bool haveLeft = nextWithRoom(&left, -1, &leftAddress);
-    const bool haveRight = nextWithRoom(&right, +1, &rightAddress);
-    if ( haveLeft && (!haveRight || (site - leftAddress <= rightAddress - site)) )
-        return veneerReaches(site, leftAddress) ? (int)left : -1;
-    if ( haveRight )
-        return veneerReaches(site, rightAddress) ? (int)right : -1;
-    return -1;
+    const bool useLeft = nextWithRoom(&left, -1, &leftAddress) && veneerReaches(site, leftAddress);
+    const bool useRight = nextWithRoom(&right, +1, &rightAddress) && veneerReaches(site, rightAddress);
+    if ( useLeft && (!useRight || (site - leftAddress <= rightAddress - site)) )
+        return (int)left;
+    return useRight ? (int)right : -1;
 }
 
 static bool isAllZero(const uint8_t* bytes, size_t length)
