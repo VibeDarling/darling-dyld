@@ -17,7 +17,7 @@ runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
 runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
 override_fn = dyld2[/^static struct \{ uint64_t patched, missing, unexplained; \} sSplitCachePatchTotals;.*?^static void overrideSplitCacheGotSlots\(\).*?^\}/m] or abort 'overrideSplitCacheGotSlots missing'
 record_struct = dyld2_h[/^\tstruct DiskOverrideOfCacheImage \{.*?^\t\};/m] or abort 'DiskOverrideOfCacheImage missing'
-allow_list = runtime[/^\/\/ libz is a leaf library.*?^bool sharedCachePathIsAllowListed\(.*?^\}/m] or abort 'allow-list code missing'
+allow_list = runtime[/^static const char\* const kSharedCacheServedOverDisk\[\].*?^bool sharedCachePathIsAllowListed\(.*?^\}/m] or abort 'allow-list code missing'
 allow_decl = runtime_h[/^struct SharedCacheAllowList \{.*?^\};/m] or abort 'SharedCacheAllowList missing'
 
 # The hook: at the end of link() (under dyld's lock), after the image and everything it needs are linked, and nowhere else.
