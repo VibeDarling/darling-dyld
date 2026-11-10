@@ -1,0 +1,3 @@
+# libSystem symbols the H0 test executable imports. Only write is needed: the
+# executable has LC_MAIN, so dyld's own start code calls main and then exit.
+write

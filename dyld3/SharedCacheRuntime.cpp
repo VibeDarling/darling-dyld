@@ -47,6 +47,7 @@
 
 #include "dyld_cache_format.h"
 #include "SharedCacheRuntime.h"
+#include "DarlingTSDIslands.h"
 #include "Loading.h"
 #include "BootArgs.h"
 
@@ -391,8 +392,60 @@ static void verboseSharedCacheMappingsToConsole(const shared_file_mapping_slide_
 static bool cacheRangeContains(uint64_t start, uint64_t length,
                                uint64_t address, uint64_t size)
 {
-    return length <= UINT64_MAX - start && address >= start
-        && address - start <= length && size <= length - (address - start);
+    return dyld_cache_range_contains(start, length, address, size);
+}
+
+// A mapping protection must be non-empty, within read/write/execute and never writable and executable at once.
+static bool cacheProtectionIsValid(uint32_t prot)
+{
+    return (prot != 0) && ((prot & ~(VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE)) == 0)
+        && !((prot & VM_PROT_WRITE) && (prot & VM_PROT_EXECUTE));
+}
+
+static bool cacheMappingTableFits(const dyld_cache_header& header, uint64_t headerPageSize)
+{
+    if ( !dyld_cache_header_is_split(header) )
+        return header.mappingOffset <= 0x168;
+    return cacheRangeContains(0, headerPageSize, header.mappingOffset,
+                              uint64_t(header.mappingCount) * sizeof(dyld_cache_mapping_info));
+}
+
+// Mappings of one file of a split cache must be sane and in ascending, non-overlapping VM order.
+// Which one is text, data or linkedit is not known from its position there.
+static bool splitFileMappingsAreValid(const dyld_cache_mapping_info* mappings, uint32_t count)
+{
+    for (uint32_t i = 0; i != count; ++i) {
+        if ( !cacheProtectionIsValid(mappings[i].maxProt) )
+            return false;
+        if ( (i + 1 != count) && (mappings[i].address + mappings[i].size > mappings[i + 1].address) )
+            return false;
+    }
+    return true;
+}
+
+// DyldSharedCache reads the header and its tables through the first mapping of the main file, so that
+// mapping has to start the region at file offset 0 and hold every table the header points to.
+static bool splitHeaderIsMapped(const dyld_cache_header& header, uint64_t address, uint64_t fileOffset, uint64_t size)
+{
+    return address == header.sharedRegionStart && fileOffset == 0
+        && cacheRangeContains(0, size, header.mappingOffset, uint64_t(header.mappingCount) * sizeof(dyld_cache_mapping_info))
+        && cacheRangeContains(0, size, header.mappingWithSlideOffset, uint64_t(header.mappingWithSlideCount) * sizeof(dyld_cache_mapping_and_slide_info))
+        && cacheRangeContains(0, size, header.imagesOffsetSplit, uint64_t(header.imagesCountSplit) * sizeof(dyld_cache_image_info));
+}
+
+// The signature blob must end the file (an unsigned file has offset == length and size 0, and fails the
+// registration that follows) and no mapping may reach into it, so every mapped byte is signed.
+static bool splitSignatureCoversMappings(const dyld_cache_header& header, const dyld_cache_mapping_info* mappings,
+                                         uint32_t count, uint64_t fileLength)
+{
+    if ( !cacheRangeContains(0, fileLength, header.codeSignatureOffset, header.codeSignatureSize)
+      || (header.codeSignatureOffset + header.codeSignatureSize != fileLength) )
+        return false;
+    for (uint32_t i = 0; i != count; ++i) {
+        if ( mappings[i].fileOffset + mappings[i].size > header.codeSignatureOffset )
+            return false;
+    }
+    return true;
 }
 
 static bool preflightCacheFile(const SharedCacheOptions& options, SharedCacheLoadInfo* results, CacheInfo* info)
@@ -431,7 +484,9 @@ static bool preflightCacheFile(const SharedCacheOptions& options, SharedCacheLoa
         ::close(fd);
         return false;
     }
-    if ( (cache->header.mappingCount < 3) || (cache->header.mappingCount > DyldSharedCache::MaxMappings) || (cache->header.mappingOffset > 0x168) ) {
+    if ( (cache->header.mappingCount < (dyld_cache_header_is_split(cache->header) ? 1 : 3))
+      || (cache->header.mappingCount > DyldSharedCache::MaxMappings)
+      || !cacheMappingTableFits(cache->header, sizeof(firstPage)) ) {
         results->errorMessage = "shared cache file mappings are invalid";
         ::close(fd);
         return false;
@@ -451,33 +506,53 @@ static bool preflightCacheFile(const SharedCacheOptions& options, SharedCacheLoa
             return false;
         }
     }
-    if (  (textMapping->fileOffset != 0)
-      || ((fileMappings[0].address + fileMappings[0].size) > firstDataMapping->address)
-      || ((fileMappings[0].fileOffset + fileMappings[0].size) != firstDataMapping->fileOffset)
-      || (cache->header.codeSignatureOffset > cacheFileLength)
-      || (cache->header.codeSignatureSize != cacheFileLength - cache->header.codeSignatureOffset)
-      || (textMapping->maxProt != (VM_PROT_READ|VM_PROT_EXECUTE))
-      || (linkeditMapping->maxProt != VM_PROT_READ) ) {
-        results->errorMessage = "shared cache text/linkedit mappings are invalid";
-        ::close(fd);
-        return false;
-    }
-
-    // Check the __DATA mappings
-    for (unsigned i = 1; i != (cache->header.mappingCount - 1); ++i) {
-        if ( ((fileMappings[i].address + fileMappings[i].size) > fileMappings[i + 1].address)
-          || ((fileMappings[i].fileOffset + fileMappings[i].size) != fileMappings[i + 1].fileOffset)
-          || (fileMappings[i].maxProt != (VM_PROT_READ|VM_PROT_WRITE)) ) {
-            results->errorMessage = "shared cache data mappings are invalid";
+    if ( dyld_cache_header_is_split(cache->header) ) {
+        // Extents were validated above, so the sums in the checks below cannot wrap.
+        if ( !splitFileMappingsAreValid(fileMappings, cache->header.mappingCount) ) {
+            results->errorMessage = "shared cache split mappings are invalid";
+            ::close(fd);
+            return false;
+        }
+        if ( !splitHeaderIsMapped(cache->header, fileMappings[0].address, fileMappings[0].fileOffset, fileMappings[0].size) ) {
+            results->errorMessage = "shared cache split header is not mapped at the region start";
+            ::close(fd);
+            return false;
+        }
+        if ( !splitSignatureCoversMappings(cache->header, fileMappings, cache->header.mappingCount, cacheFileLength) ) {
+            results->errorMessage = "shared cache split signature does not cover its mappings";
             ::close(fd);
             return false;
         }
     }
+    else {
+        if (  (textMapping->fileOffset != 0)
+          || ((fileMappings[0].address + fileMappings[0].size) > firstDataMapping->address)
+          || ((fileMappings[0].fileOffset + fileMappings[0].size) != firstDataMapping->fileOffset)
+          || (cache->header.codeSignatureOffset > cacheFileLength)
+          || (cache->header.codeSignatureSize != cacheFileLength - cache->header.codeSignatureOffset)
+          || (textMapping->maxProt != (VM_PROT_READ|VM_PROT_EXECUTE))
+          || (linkeditMapping->maxProt != VM_PROT_READ) ) {
+            results->errorMessage = "shared cache text/linkedit mappings are invalid";
+            ::close(fd);
+            return false;
+        }
 
-    if ( (textMapping->address != cache->header.sharedRegionStart) || ((linkeditMapping->address + linkeditMapping->size) > (cache->header.sharedRegionStart+cache->header.sharedRegionSize)) ) {
-        results->errorMessage = "shared cache file mapping addressses invalid";
-        ::close(fd);
-        return false;
+        // Check the __DATA mappings
+        for (unsigned i = 1; i != (cache->header.mappingCount - 1); ++i) {
+            if ( ((fileMappings[i].address + fileMappings[i].size) > fileMappings[i + 1].address)
+              || ((fileMappings[i].fileOffset + fileMappings[i].size) != fileMappings[i + 1].fileOffset)
+              || (fileMappings[i].maxProt != (VM_PROT_READ|VM_PROT_WRITE)) ) {
+                results->errorMessage = "shared cache data mappings are invalid";
+                ::close(fd);
+                return false;
+            }
+        }
+
+        if ( (textMapping->address != cache->header.sharedRegionStart) || ((linkeditMapping->address + linkeditMapping->size) > (cache->header.sharedRegionStart+cache->header.sharedRegionSize)) ) {
+            results->errorMessage = "shared cache file mapping addressses invalid";
+            ::close(fd);
+            return false;
+        }
     }
 
     // Use the same format discriminator as the slide-table consumer below.
@@ -876,6 +951,12 @@ static bool mapCacheSystemWide(const SharedCacheOptions& options, SharedCacheLoa
 }
 #endif // TARGET_OS_SIMULATOR
 
+static int mmapProtection(uint32_t vmProt)
+{
+    return ((vmProt & VM_PROT_READ) ? PROT_READ : 0) | ((vmProt & VM_PROT_WRITE) ? PROT_WRITE : 0)
+         | ((vmProt & VM_PROT_EXECUTE) ? PROT_EXEC : 0);
+}
+
 #if defined(DARLING)
 // Reserve with a hint, never MAP_FIXED: a collision must not replace live code.
 // Once acquired, the file mappings may safely replace our own reservation.
@@ -917,16 +998,9 @@ class DarlingTSDReadVeneers {
     unsigned long slot = 0;
     bool committed = false;
     static const size_t capacity = 1024 * 1024;
-    static bool branch(uintptr_t from, uintptr_t to, uint32_t& encoded) {
-        int64_t delta = (int64_t)to - (int64_t)from;
-        if ((delta & 3) || delta < -(1LL << 27) || delta >= (1LL << 27))
-            return false;
-        encoded = 0x14000000U | ((uint32_t)(delta >> 2) & 0x03FFFFFFU);
-        return true;
-    }
 public:
     DarlingTSDReadVeneers(uintptr_t cacheStart, unsigned long offset) : slot(offset) {
-        if (offset < 16 || offset > 32760 || (offset & 7) || cacheStart <= capacity)
+        if (!darling_tsd::isValidSlotOffset(offset) || cacheStart <= capacity)
             return;
         void* desired = (void*)(cacheStart - capacity);
         void* mapped = ::mmap(desired, capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -941,18 +1015,17 @@ public:
     }
     uint32_t translate(uint32_t reg, uintptr_t original) {
         if (reg == 31) return 0xD503201FU; // MRS XZR has no observable result
-        uint32_t entryBranch, returnBranch;
-        if (!memory || used + 20 > capacity
-            || !branch(original, (uintptr_t)memory + used, entryBranch)
-            || !branch((uintptr_t)memory + used + 16, original + 4, returnBranch))
+        if (!memory || used + darling_tsd::kVeneerBytes > capacity)
             return 0x0000DA00U | reg;
-        uint32_t* code = (uint32_t*)((uintptr_t)memory + used);
-        code[0] = 0xD53BD040U | reg; // mrs Xd, TPIDR_EL0
-        code[1] = 0xF9400000U | ((uint32_t)(slot / 8) << 10) | (reg << 5) | reg;
-        code[2] = 0xB5000040U | reg; // cbnz Xd, +8 (preserves NZCV)
-        code[3] = 0x0000DA00U | reg; // uninitialized slot: existing TSD trap
-        code[4] = returnBranch;
-        used += 20;
+        const uintptr_t veneer = (uintptr_t)memory + used;
+        bool ok = true;
+        uint32_t code[5];
+        const uint32_t entryBranch = darling_tsd::encodeBranch(original, veneer, &ok);
+        darling_tsd::encodeVeneer(reg, slot, veneer, original, code, &ok);
+        if (!ok)
+            return 0x0000DA00U | reg;
+        memcpy((void*)veneer, code, sizeof(code));
+        used += darling_tsd::kVeneerBytes;
         return entryBranch;
     }
     size_t count() const { return used / 20; }
@@ -998,10 +1071,7 @@ static bool translateDarlingCacheTSD(const CacheInfo& info, const char** errorMe
         }
         if (changed)
             sys_icache_invalidate(start, size);
-        int protection = PROT_EXEC;
-        if (mapping.sms_init_prot & VM_PROT_READ) protection |= PROT_READ;
-        if (mapping.sms_init_prot & VM_PROT_WRITE) protection |= PROT_WRITE;
-        if (::mprotect(start, size, protection) != 0) {
+        if (::mprotect(start, size, mmapProtection(mapping.sms_init_prot)) != 0) {
             *errorMessage = "could not restore private cache text protections";
             return false;
         }
@@ -1075,13 +1145,7 @@ static bool mapCachePrivate(const SharedCacheOptions& options, SharedCacheLoadIn
         void* mmapAddress = (void*)(uintptr_t)(info.mappings[i].sms_address);
         size_t size = (size_t)(info.mappings[i].sms_size);
         //dyld::log("dyld: mapping address %p with size 0x%08lX\n", mmapAddress, size);
-        int protection = 0;
-        if ( info.mappings[i].sms_init_prot & VM_PROT_EXECUTE )
-            protection   |= PROT_EXEC;
-        if ( info.mappings[i].sms_init_prot & VM_PROT_READ )
-            protection   |= PROT_READ;
-        if ( info.mappings[i].sms_init_prot & VM_PROT_WRITE )
-            protection   |= PROT_WRITE;
+        int protection = mmapProtection(info.mappings[i].sms_init_prot);
         off_t offset = info.mappings[i].sms_file_offset;
         if ( ::mmap(mmapAddress, size, protection, MAP_FIXED | MAP_PRIVATE, info.fd, offset) != mmapAddress ) {
             // failed to map some chunk of this shared cache file
@@ -1143,6 +1207,578 @@ static bool mapCachePrivate(const SharedCacheOptions& options, SharedCacheLoadIn
 
 
 
+#if defined(DARLING) && !TARGET_OS_SIMULATOR
+// Split caches (a main file plus ".NN" sub-cache files) mapped privately at their preferred address.
+// Plain slide-info-v5 entries are rebased; authenticated ones are signed with this process's keys.
+
+static const uint32_t kSplitMaxFileMappings = 16;
+static const uint32_t kSplitMaxMappings     = 64;
+static const uint32_t kSplitMaxSubCaches    = 32;
+static const uint64_t kSplitMaxSlideInfo    = 64ULL * 1024 * 1024;
+
+struct SplitMapping {
+    dyld_cache_mapping_and_slide_info   info;
+    uint32_t                            file;
+};
+
+struct SplitCacheFiles {
+    int         fds[kSplitMaxSubCaches + 1];
+    uint32_t    count = 0;
+    ~SplitCacheFiles() {
+        for (uint32_t i = 0; i != count; ++i)
+            ::close(fds[i]);
+    }
+};
+
+static bool preadAll(int fd, uint64_t offset, void* buffer, size_t length)
+{
+    uint8_t* out = (uint8_t*)buffer;
+    while ( length != 0 ) {
+        ssize_t n = ::pread(fd, out, length, (off_t)offset);
+        if ( n <= 0 )
+            return false;
+        out += n;
+        offset += (uint64_t)n;
+        length -= (size_t)n;
+    }
+    return true;
+}
+
+// Why signing is impossible on this host, or nullptr when it is possible. dyld is a Darwin binary and has no
+// getauxval(), so AT_HWCAP is read from the auxiliary vector the host kernel exposes (arm64 HWCAP_PACA).
+static const char* splitCachePointerAuthError()
+{
+#if defined(__aarch64__) || defined(__arm64__)
+    static const uint64_t kAtNull = 0;
+    static const uint64_t kAtHwcap = 16;
+    static const uint64_t kHwcapPaca = 1ULL << 30;
+    const int fd = dyld3::open("/proc/self/auxv", O_RDONLY, 0);
+    if ( fd == -1 )
+        return "split cache has authenticated pointers but the host auxiliary vector cannot be opened to check pointer authentication";
+    const char* error = "split cache has authenticated pointers but the host auxiliary vector has no AT_HWCAP";
+    for (uint64_t i = 0; i != 128; ++i) {
+        uint64_t entry[2];
+        if ( !preadAll(fd, i * sizeof(entry), entry, sizeof(entry)) ) {
+            error = "split cache has authenticated pointers but the host auxiliary vector is unreadable";
+            break;
+        }
+        if ( entry[0] == kAtNull )
+            break;
+        if ( entry[0] == kAtHwcap ) {
+            error = ((entry[1] & kHwcapPaca) != 0) ? nullptr
+                  : "split cache has authenticated pointers but the host has no pointer authentication (HWCAP_PACA is not set)";
+            break;
+        }
+    }
+    ::close(fd);
+    return error;
+#else
+    return "split cache has authenticated pointers but pointer authentication needs an arm64 host";
+#endif
+}
+
+struct SplitAuthPolicy {
+    SplitCacheAuthMode  mode;
+    bool                verified;   // the host check runs once, when the first authenticated entry is met
+};
+
+static bool splitTarget(const dyld_cache_slide_info5& header, uint64_t runtimeOffset, uint64_t sharedRegionStart,
+                        uint64_t sharedRegionSize, uint64_t* target, const char** error)
+{
+    if ( header.value_add > UINT64_MAX - runtimeOffset ) {
+        *error = "split cache slide info target overflows";
+        return false;
+    }
+    *target = header.value_add + runtimeOffset;
+    if ( !cacheRangeContains(sharedRegionStart, sharedRegionSize, *target, 0) ) {
+        *error = "split cache slide info target lies outside the cache region";
+        return false;
+    }
+    return true;
+}
+
+// Rebases the entries of one mapping's slide info in place (slide 0): plain ones become pointers, authenticated
+// ones are signed (or left, per the policy). Any structural doubt is an error: nothing here is allowed to
+// write outside the page its chain started in.
+static bool rebaseSlideInfoV5(uint8_t* mappingContent, uint64_t mappingSize,
+                              uint64_t sharedRegionStart, uint64_t sharedRegionSize,
+                              const uint8_t* slideInfo, uint64_t slideInfoSize,
+                              SplitAuthPolicy* policy, SplitCacheMapStats* stats, const char** error)
+{
+    if ( slideInfoSize < sizeof(dyld_cache_slide_info5) ) {
+        *error = "split cache slide info is truncated";
+        return false;
+    }
+    dyld_cache_slide_info5 header;
+    memcpy(&header, slideInfo, sizeof(header));
+    if ( header.version != 5 ) {
+        *error = "split cache slide info has an unknown version";
+        return false;
+    }
+    const uint64_t pageSize = header.page_size;
+    if ( (pageSize < sizeof(uint64_t)) || ((pageSize & (pageSize - 1)) != 0) || (pageSize > UINT16_MAX + 1ULL) ) {
+        *error = "split cache slide info has an invalid page size";
+        return false;
+    }
+    if ( header.page_starts_count > (slideInfoSize - sizeof(header)) / sizeof(uint16_t) ) {
+        *error = "split cache slide info page_starts exceed the slide info";
+        return false;
+    }
+    if ( header.page_starts_count > mappingSize / pageSize ) {
+        *error = "split cache slide info covers more pages than its mapping";
+        return false;
+    }
+    const uint8_t* pageStarts = slideInfo + sizeof(header);
+    for (uint32_t page = 0; page != header.page_starts_count; ++page) {
+        uint16_t start;
+        memcpy(&start, pageStarts + page * sizeof(uint16_t), sizeof(start));
+        if ( start == DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE )
+            continue;
+        if ( (start & 7) != 0 ) {
+            *error = "split cache slide info chain start is misaligned";
+            return false;
+        }
+        if ( start > pageSize - sizeof(uint64_t) ) {
+            *error = "split cache slide info chain starts outside its page";
+            return false;
+        }
+        uint8_t* pageContent = mappingContent + (uint64_t)page * pageSize;
+        uint64_t offset = start;
+        for (;;) {
+            uint64_t* location = (uint64_t*)(pageContent + offset);
+            dyld_cache_slide_pointer5 pointer;
+            pointer.raw = *location;
+            uint64_t target;
+            if ( pointer.auth.auth ) {
+                if ( policy->mode == kSplitCacheAuthLeaveAlone ) {
+                    ++stats->authLeftAlone;
+                }
+                else {
+                    if ( !policy->verified ) {
+                        if ( (*error = splitCachePointerAuthError()) != nullptr )
+                            return false;
+                        policy->verified = true;
+                    }
+                    if ( !splitTarget(header, pointer.auth.runtimeOffset, sharedRegionStart, sharedRegionSize, &target, error) )
+                        return false;
+                    // Slide info key bit: 0 = IA, 1 = DA; signPointer() numbers the keys IA, IB, DA, DB.
+                    *location = MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(target, location, pointer.auth.addrDiv,
+                                    (uint16_t)pointer.auth.diversity, pointer.auth.keyIsData ? 2 : 0);
+                    ++stats->authSigned;
+                }
+            }
+            else {
+                if ( !splitTarget(header, pointer.regular.runtimeOffset, sharedRegionStart, sharedRegionSize, &target, error) )
+                    return false;
+                *location = target | ((uint64_t)pointer.regular.high8 << 56);
+                ++stats->plainRebased;
+            }
+            const uint64_t strides = pointer.regular.next;
+            if ( strides == 0 )
+                break;
+            if ( strides * sizeof(uint64_t) > (pageSize - sizeof(uint64_t)) - offset ) {
+                *error = "split cache slide info chain leaves its page";
+                return false;
+            }
+            offset += strides * sizeof(uint64_t);
+        }
+        ++stats->pagesWithChains;
+    }
+    return true;
+}
+
+static bool splitMappingsOverlap(const dyld_cache_mapping_and_slide_info& a, const dyld_cache_mapping_and_slide_info& b)
+{
+    return a.address < b.address + b.size && b.address < a.address + a.size;
+}
+
+static const char* openSplitCacheFile(const char* path, SplitCacheFiles& files, int* fd, uint64_t* length,
+                                      dyld_cache_header* header, const dyld_cache_header* mainHeader)
+{
+    if ( files.count > kSplitMaxSubCaches )
+        return "split cache has too many files";
+    *fd = dyld3::open(path, O_RDONLY, 0);
+    if ( *fd == -1 )
+        return "split cache file open() failed";
+    files.fds[files.count++] = *fd;
+    struct stat statBuf;
+    if ( ::fstat(*fd, &statBuf) != 0 )
+        return "split cache file fstat() failed";
+    *length = (uint64_t)statBuf.st_size;
+    if ( (*length < sizeof(*header)) || !preadAll(*fd, 0, header, sizeof(*header)) )
+        return "split cache file header unreadable";
+    if ( strncmp(header->magic, "dyld_v1", 7) != 0 )
+        return "split cache file has wrong magic";
+    // A sub-cache must be of the same architecture and platform as the main file.
+    if ( (mainHeader != nullptr)
+      && ((memcmp(header->magic, mainHeader->magic, sizeof(header->magic)) != 0) || (header->platform != mainHeader->platform)) )
+        return "split cache sub-cache does not match the main file";
+    return nullptr;
+}
+
+// Appends this file's mappings to all[] after checking each against the region, the file and the
+// mappings of every file loaded before it.
+static const char* loadSplitFileMappings(int fd, uint64_t fileLength, const dyld_cache_header& header, uint32_t fileIndex,
+                                         uint64_t regionStart, uint64_t regionSize, SplitMapping* all, uint32_t* total)
+{
+    const uint32_t count = header.mappingWithSlideCount;
+    const uint64_t pageSize = (uint64_t)getpagesize();
+    if ( (count == 0) || (count > kSplitMaxFileMappings) || (*total + count > kSplitMaxMappings) )
+        return "split cache file has an invalid mapping count";
+    if ( (header.mappingWithSlideOffset % alignof(dyld_cache_mapping_and_slide_info) != 0)
+      || !cacheRangeContains(0, fileLength, header.mappingWithSlideOffset, uint64_t(count) * sizeof(dyld_cache_mapping_and_slide_info)) )
+        return "split cache mapping table lies outside its file";
+    for (uint32_t i = 0; i != count; ++i) {
+        SplitMapping& m = all[*total];
+        if ( !preadAll(fd, header.mappingWithSlideOffset + uint64_t(i) * sizeof(m.info), &m.info, sizeof(m.info)) )
+            return "split cache mapping table unreadable";
+        m.file = fileIndex;
+        // mmap rounds a size up to a page, which would expose bytes past the mapping.
+        if ( (m.info.size == 0) || (m.info.size % pageSize != 0)
+          || (m.info.address % pageSize != 0) || (m.info.fileOffset % pageSize != 0) )
+            return "split cache mapping is empty or misaligned";
+        // Each file's header is read through its first mapping (a sub-cache's at regionStart + cacheVMOffset).
+        if ( (i == 0) && (m.info.fileOffset != 0) )
+            return "split cache file does not start with its header";
+        if ( !cacheRangeContains(regionStart, regionSize, m.info.address, m.info.size) )
+            return "split cache mapping lies outside the shared region";
+        if ( !cacheRangeContains(0, fileLength, m.info.fileOffset, m.info.size) )
+            return "split cache mapping lies outside its file";
+        if ( (m.info.slideInfoFileSize != 0)
+          && (!cacheRangeContains(0, fileLength, m.info.slideInfoFileOffset, m.info.slideInfoFileSize)
+              || (m.info.slideInfoFileSize > kSplitMaxSlideInfo)) )
+            return "split cache slide info lies outside its file";
+        if ( !cacheProtectionIsValid(m.info.maxProt) || !cacheProtectionIsValid(m.info.initProt) )
+            return "split cache mapping protections are invalid";
+        for (uint32_t j = 0; j != *total; ++j) {
+            if ( splitMappingsOverlap(all[j].info, m.info) )
+                return "split cache mappings overlap";
+        }
+        ++*total;
+    }
+    return nullptr;
+}
+
+// Deferred on purpose, not oversights:
+// - No translateDarlingCacheTSD pass (it scans whole mappings and its veneers reach 128 MB of 3.7 GB): the TSD reads of a split
+//   cache are translated per image by translateSplitCacheTSD() from a sidecar table.
+// - Protections: each mapping gets its raw initProt, whereas the legacy mapCachePrivate path adds VM_PROT_WRITE to a
+//   DATA_CONST mapping unless gEnableSharedCacheDataConst is set. dyld2.cpp makes up the difference after mapping.
+// - Authenticated pointers are signed with the running process's own keys; this never changes, resets or
+//   disables a key, it only executes the PAC instructions.
+// - authMode defaults to signing, the production behaviour; kSplitCacheAuthLeaveAlone (and authLeftAlone) exist for
+//   host tests on machines without PAC and for no other caller.
+bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLoadInfo* results, SplitCacheMapStats* stats,
+                          SplitCacheAuthMode authMode)
+{
+    memset(stats, 0, sizeof(*stats));
+    results->loadAddress = nullptr;
+    results->slide = 0;
+    results->errorMessage = nullptr;
+
+    SplitAuthPolicy policy = { authMode, false };
+    SplitCacheFiles files;
+    SplitMapping mappings[kSplitMaxMappings];
+    uint32_t mappingCount = 0;
+    const char* error = nullptr;
+    int mainFd;
+    uint64_t mainLength;
+    dyld_cache_header mainHeader;
+    const size_t mainPathLength = strlen(mainCachePath);
+
+    if ( mainPathLength >= sizeof(results->path) ) {
+        results->errorMessage = "split cache path is too long";
+        return false;
+    }
+    if ( (error = openSplitCacheFile(mainCachePath, files, &mainFd, &mainLength, &mainHeader, nullptr)) != nullptr ) {
+        results->errorMessage = error;
+        return false;
+    }
+    const uint64_t regionStart = mainHeader.sharedRegionStart;
+    const uint64_t regionSize = mainHeader.sharedRegionSize;
+    const uint32_t subCacheCount = mainHeader.subCacheArrayCount;
+    if ( !dyld_cache_header_is_split(mainHeader) || (regionStart == 0) || (regionSize == 0) || (subCacheCount > kSplitMaxSubCaches)
+      || !cacheRangeContains(0, mainLength, mainHeader.subCacheArrayOffset, uint64_t(subCacheCount) * sizeof(dyld_subcache_entry)) ) {
+        results->errorMessage = "split cache main file header is invalid";
+        return false;
+    }
+    if ( (error = loadSplitFileMappings(mainFd, mainLength, mainHeader, 0, regionStart, regionSize, mappings, &mappingCount)) != nullptr ) {
+        results->errorMessage = error;
+        return false;
+    }
+    if ( !splitHeaderIsMapped(mainHeader, mappings[0].info.address, mappings[0].info.fileOffset, mappings[0].info.size)
+      || (mainHeader.mappingCount != mainHeader.mappingWithSlideCount) ) {
+        results->errorMessage = "split cache main file does not map its header tables at the region start";
+        return false;
+    }
+    // The legacy mapping array is what DyldSharedCache reads, so it must describe the same mappings.
+    for (uint32_t i = 0; i != mainHeader.mappingCount; ++i) {
+        dyld_cache_mapping_info legacy;
+        if ( !preadAll(mainFd, mainHeader.mappingOffset + uint64_t(i) * sizeof(legacy), &legacy, sizeof(legacy))
+          || (legacy.address != mappings[i].info.address) || (legacy.size != mappings[i].info.size)
+          || (legacy.fileOffset != mappings[i].info.fileOffset) ) {
+            results->errorMessage = "split cache main file mapping tables disagree";
+            return false;
+        }
+    }
+
+    for (uint32_t i = 0; i != subCacheCount; ++i) {
+        dyld_subcache_entry entry;
+        if ( !preadAll(mainFd, mainHeader.subCacheArrayOffset + uint64_t(i) * sizeof(entry), &entry, sizeof(entry)) ) {
+            results->errorMessage = "split cache sub-cache table unreadable";
+            return false;
+        }
+        const size_t suffixLength = strnlen(entry.fileSuffix, sizeof(entry.fileSuffix));
+        if ( (suffixLength == 0) || (suffixLength == sizeof(entry.fileSuffix)) || (memchr(entry.fileSuffix, '/', suffixLength) != nullptr)
+          || (mainPathLength + suffixLength >= sizeof(results->path)) ) {
+            results->errorMessage = "split cache sub-cache file suffix is invalid";
+            return false;
+        }
+        char path[sizeof(results->path)];
+        memcpy(path, mainCachePath, mainPathLength);
+        memcpy(path + mainPathLength, entry.fileSuffix, suffixLength);
+        path[mainPathLength + suffixLength] = '\0';
+
+        int fd;
+        uint64_t length;
+        dyld_cache_header header;
+        if ( (error = openSplitCacheFile(path, files, &fd, &length, &header, &mainHeader)) != nullptr ) {
+            results->errorMessage = error;
+            return false;
+        }
+        // Placement comes from the main file's cacheVMOffset below: a sub-cache's own header names its
+        // first mapping as sharedRegionStart and has no region size.
+        if ( memcmp(header.uuid, entry.uuid, sizeof(entry.uuid)) != 0 ) {
+            results->errorMessage = "split cache sub-cache does not match the main file";
+            return false;
+        }
+        const uint32_t firstMapping = mappingCount;
+        if ( (error = loadSplitFileMappings(fd, length, header, i + 1, regionStart, regionSize, mappings, &mappingCount)) != nullptr ) {
+            results->errorMessage = error;
+            return false;
+        }
+        if ( mappings[firstMapping].info.address - regionStart != entry.cacheVMOffset ) {
+            results->errorMessage = "split cache sub-cache vm offset does not match its first mapping";
+            return false;
+        }
+    }
+
+    // Reserve the whole region first so that a collision fails before any live mapping is replaced.
+    DarlingCacheReservation reservation;
+    if ( !reservation.acquire(regionStart, regionSize) ) {
+        results->errorMessage = "could not reserve unoccupied private shared cache region";
+        return false;
+    }
+    for (uint32_t i = 0; i != mappingCount; ++i) {
+        void* address = (void*)(uintptr_t)mappings[i].info.address;
+        if ( ::mmap(address, (size_t)mappings[i].info.size, PROT_READ, MAP_FIXED | MAP_PRIVATE,
+                    files.fds[mappings[i].file], (off_t)mappings[i].info.fileOffset) != address ) {
+            results->errorMessage = "could not mmap() part of split dyld cache";
+            return false;
+        }
+    }
+
+    for (uint32_t i = 0; i != mappingCount; ++i) {
+        const dyld_cache_mapping_and_slide_info& info = mappings[i].info;
+        if ( info.slideInfoFileSize == 0 )
+            continue;
+        uint8_t* slideInfo = (uint8_t*)::malloc((size_t)info.slideInfoFileSize);
+        bool ok = (slideInfo != nullptr) && preadAll(files.fds[mappings[i].file], info.slideInfoFileOffset, slideInfo, (size_t)info.slideInfoFileSize);
+        if ( !ok ) {
+            ::free(slideInfo);
+            results->errorMessage = "split cache slide info unreadable";
+            return false;
+        }
+        // The file mapping is private, so writing to it copies pages on demand and never touches the file.
+        void* content = (void*)(uintptr_t)info.address;
+        ok = (::mprotect(content, (size_t)info.size, PROT_READ | PROT_WRITE) == 0);
+        if ( ok )
+            ok = rebaseSlideInfoV5((uint8_t*)content, info.size, regionStart, regionSize, slideInfo, info.slideInfoFileSize, &policy, stats, &error);
+        else
+            error = "could not make split cache data writable for rebasing";
+        ::free(slideInfo);
+        if ( !ok ) {
+            results->errorMessage = error;
+            return false;
+        }
+    }
+
+    for (uint32_t i = 0; i != mappingCount; ++i) {
+        if ( ::mprotect((void*)(uintptr_t)mappings[i].info.address, (size_t)mappings[i].info.size,
+                        mmapProtection(mappings[i].info.initProt)) != 0 ) {
+            results->errorMessage = "could not apply split cache mapping protections";
+            return false;
+        }
+    }
+
+    stats->files = files.count;
+    stats->mappings = mappingCount;
+    results->loadAddress = (const DyldSharedCache*)(uintptr_t)regionStart;
+    strlcpy(results->path, mainCachePath, sizeof(results->path));
+    if ( verbose ) {
+        // The path names the host's store; the log carries the file name only.
+        const char* fileName = strrchr(results->path, '/');
+        dyld::log("mapped split dyld cache private to process (%s): %u mappings in %u files, %llu plain pointers rebased, %llu authenticated pointers signed, %llu authenticated pointers left in on-disk form\n",
+                  (fileName != nullptr) ? fileName + 1 : results->path, mappingCount, files.count, (unsigned long long)stats->plainRebased,
+                  (unsigned long long)stats->authSigned, (unsigned long long)stats->authLeftAlone);
+    }
+    reservation.keep();
+    return true;
+}
+// The longest directory accepted: the main file name and a sub-cache suffix must still fit in SharedCacheLoadInfo::path.
+static const size_t kSplitCacheDirMaxLength = 200;
+
+const char* splitCacheArchName(uint32_t cputype, uint32_t cpusubtype)
+{
+    const uint32_t subtype = cpusubtype & ~CPU_SUBTYPE_MASK;
+    if ( cputype == CPU_TYPE_ARM64 ) {
+        if ( subtype == CPU_SUBTYPE_ARM64E )
+            return "arm64e";
+        if ( (subtype == CPU_SUBTYPE_ARM64_ALL) || (subtype == CPU_SUBTYPE_ARM64_V8) )
+            return "arm64";
+        return nullptr;
+    }
+    if ( cputype == CPU_TYPE_X86_64 )
+        return "x86_64";
+    return nullptr;
+}
+
+bool splitCacheArchHasMapper(uint32_t cputype, uint32_t cpusubtype)
+{
+    return (cputype != CPU_TYPE_X86_64) && (splitCacheArchName(cputype, cpusubtype) != nullptr);
+}
+
+const char* splitCacheDirError(const char* dir)
+{
+    if ( dir == nullptr )
+        return "no directory given";
+    const size_t length = strnlen(dir, kSplitCacheDirMaxLength + 1);
+    if ( length == 0 )
+        return "the directory is empty";
+    if ( dir[0] != '/' )
+        return "the directory is not an absolute path";
+    if ( length > kSplitCacheDirMaxLength )
+        return "the directory path is too long";
+    for (size_t i = 0; i != length; ++i) {
+        if ( ((unsigned char)dir[i] < 0x20) || (dir[i] == 0x7f) )
+            return "the directory path contains a control character";
+    }
+    return nullptr;
+}
+
+const char* splitCacheMainFilePath(const char* dir, uint32_t cputype, uint32_t cpusubtype, char* path, size_t pathSize)
+{
+    if ( const char* error = splitCacheDirError(dir) )
+        return error;
+    const char* arch = splitCacheArchName(cputype, cpusubtype);
+    if ( arch == nullptr )
+        return "the main executable's architecture has no dyld shared cache";
+    if ( cputype == CPU_TYPE_X86_64 )
+        return "the split cache mapper does not support x86_64 caches";
+    const size_t dirLength = strlen(dir);
+    const char* separator = (dir[dirLength - 1] == '/') ? "" : "/";
+    if ( (strlcpy(path, dir, pathSize) >= pathSize) || (strlcat(path, separator, pathSize) >= pathSize)
+      || (strlcat(path, DYLD_SHARED_CACHE_BASE_NAME, pathSize) >= pathSize) || (strlcat(path, arch, pathSize) >= pathSize) )
+        return "the cache file path is too long";
+    return nullptr;
+}
+
+#if defined(__arm64__)
+// The sidecar table, its patcher and the /proc/self/mem handle, created by the first translateSplitCacheTSD().
+// Everything here runs under dyld's lock.
+static struct {
+    bool                        ready;
+    darling_tsd::SiteTable      table;
+    darling_tsd::Patcher*       patcher;
+    darling_tsd::ProcSelfMemory* memory;
+} sSplitTSD;
+
+// Reads the whole file into 8-byte aligned memory that is never freed (the table stays in use for the process).
+static const char* readSiteTable(const char* path, void** bytes, size_t* length)
+{
+    const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if ( fd < 0 )
+        return "cannot open the TSD site table <main cache file>.tsdsites; make it with tests/darling-tsd/emit_tsd_sites.py";
+    struct stat st;
+    void* buffer = nullptr;
+    if ( (::fstat(fd, &st) != 0) || (st.st_size <= 0) || (st.st_size > (off_t)(64 << 20)) ) {
+        ::close(fd);
+        return "the TSD site table has no usable size";
+    }
+    *length = (size_t)st.st_size;
+    buffer = ::malloc(*length);
+    const bool ok = (buffer != nullptr) && preadAll(fd, 0, buffer, *length);
+    ::close(fd);
+    if ( !ok ) {
+        ::free(buffer);
+        return "cannot read the TSD site table";
+    }
+    *bytes = buffer;
+    return nullptr;
+}
+
+static const char* openSplitTSDTranslation(const SharedCacheLoadInfo& cache)
+{
+    char path[sizeof(cache.path) + 16];
+    if ( (strlcpy(path, cache.path, sizeof(path)) >= sizeof(path)) || (strlcat(path, ".tsdsites", sizeof(path)) >= sizeof(path)) )
+        return "the TSD site table path is too long";
+    void* bytes = nullptr;
+    size_t length = 0;
+    if ( const char* error = readSiteTable(path, &bytes, &length) )
+        return error;
+    if ( const char* error = sSplitTSD.table.parse(bytes, length) )
+        return error;
+    if ( memcmp(sSplitTSD.table.uuid(), cache.loadAddress->header.uuid, sizeof(cache.loadAddress->header.uuid)) != 0 )
+        return "the TSD site table was made from another cache (UUID differs)";
+    sSplitTSD.patcher = new darling_tsd::Patcher(sSplitTSD.table, (uintptr_t)cache.loadAddress, sys_thread_get_native_tsd_slot_offset());
+    // the cache's executable mappings: the only memory the translation may write
+    static const uint32_t kMaxRanges = 64;
+    darling_tsd::ExecutableRange ranges[kMaxRanges];
+    darling_tsd::ExecutableRange* const rangesOut = ranges;
+    __block uint32_t rangeCount = 0;
+    __block bool tooMany = false;
+    cache.loadAddress->forEachRegion(^(const void*, uint64_t vmAddr, uint64_t size, uint32_t initProt, uint32_t, uint64_t) {
+        if ( (initProt & VM_PROT_EXECUTE) == 0 )
+            return;
+        if ( rangeCount == kMaxRanges )
+            tooMany = true;
+        else
+            rangesOut[rangeCount++] = { (uintptr_t)vmAddr, (uintptr_t)size };
+    });
+    if ( tooMany )
+        return "the cache has more executable mappings than the TSD translation tracks";
+    if ( const char* error = sSplitTSD.patcher->init(ranges, rangeCount) )
+        return error;
+    sSplitTSD.memory = new darling_tsd::ProcSelfMemory();
+    if ( !sSplitTSD.memory->ok() )
+        return "cannot open /proc/self/mem to translate the cache's TSD reads";
+    return nullptr;
+}
+
+const char* translateSplitCacheTSD(const SharedCacheLoadInfo& cache, const mach_header* image, darling_tsd::PatchStats* stats)
+{
+    if ( !sSplitTSD.ready ) {
+        if ( const char* error = openSplitTSDTranslation(cache) )
+            return error;
+        sSplitTSD.ready = true;
+    }
+    return sSplitTSD.patcher->patchImage((uintptr_t)image, sSplitTSD.memory->memory(), stats);
+}
+#endif
+
+bool splitCacheMainFileIsMissing(const char* dir, const char* mainFilePath)
+{
+    // Only "the directory exists and has no such file" counts. A bad directory and a file that is there but cannot be
+    // read stay errors for the mapper to report, so that a mistake in the setup is never mistaken for a missing architecture.
+    struct stat statBuf;
+    if ( dyld3::stat(dir, &statBuf) != 0 )
+        return false;
+    // lstat: a symbolic link that points nowhere is a broken store, not a missing architecture.
+    return (::lstat(mainFilePath, &statBuf) != 0) && (errno == ENOENT);
+}
+#endif // DARLING && !TARGET_OS_SIMULATOR
+
+
 bool loadDyldCache(const SharedCacheOptions& options, SharedCacheLoadInfo* results)
 {
     results->loadAddress        = 0;
@@ -1174,19 +1810,22 @@ bool loadDyldCache(const SharedCacheOptions& options, SharedCacheLoadInfo* resul
 
 bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dylibPathToFind, SharedCacheFindDylibResults* results)
 {
+    results->cacheImageIndex = kNoCacheImageIndex;
     if ( loadInfo.loadAddress == nullptr )
         return false;
 
     if ( (loadInfo.loadAddress->header.formatVersion != dyld3::closure::kFormatVersion)
-      || (loadInfo.loadAddress->header.dylibsImageArrayAddr == 0) ) {
+      || (loadInfo.loadAddress->header.dylibsImageArrayAddr == 0)
+      || loadInfo.loadAddress->isSplitCache() ) {
         // support for older cache with a different Image* format
 #if TARGET_OS_IPHONE
         uint64_t hash = 0;
         for (const char* s=dylibPathToFind; *s != '\0'; ++s)
                 hash += hash*4 + *s;
 #endif
-        const dyld_cache_image_info* const start = (dyld_cache_image_info*)((uint8_t*)loadInfo.loadAddress + loadInfo.loadAddress->header.imagesOffset);
-        const dyld_cache_image_info* const end = &start[loadInfo.loadAddress->header.imagesCount];
+        uint32_t imagesCount;
+        const dyld_cache_image_info* const start = loadInfo.loadAddress->imageTable(imagesCount);
+        const dyld_cache_image_info* const end = &start[imagesCount];
         // The path trie can outlive the dyld3 ImageArray format. Use recorded
         // aliases (including framework Current paths), not guessed versions.
         uint32_t aliasIndex = 0;
@@ -1194,12 +1833,13 @@ bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dyl
           && loadInfo.loadAddress->header.dylibsTrieAddr != 0
           && loadInfo.loadAddress->header.dylibsTrieSize != 0
           && loadInfo.loadAddress->hasImagePath(dylibPathToFind, aliasIndex)
-          && aliasIndex < loadInfo.loadAddress->header.imagesCount ) {
+          && aliasIndex < imagesCount ) {
             const dyld_cache_image_info* p = &start[aliasIndex];
             results->mhInCache = (const mach_header*)(p->address + loadInfo.slide);
             results->pathInCache = (const char*)loadInfo.loadAddress + p->pathFileOffset;
             results->slideInCache = loadInfo.slide;
             results->image = nullptr;
+            results->cacheImageIndex = aliasIndex;
             return true;
         }
         for (const dyld_cache_image_info* p = start; p != end; ++p) {
@@ -1214,6 +1854,7 @@ bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dyl
                 results->pathInCache  = aPath;
                 results->slideInCache = loadInfo.slide;
                 results->image        = nullptr;
+                results->cacheImageIndex = (uint32_t)(p - start);
                 return true;
             }
         }
@@ -1233,6 +1874,7 @@ bool findInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* dyl
     results->mhInCache    = (const mach_header*)((uintptr_t)loadInfo.loadAddress + results->image->cacheOffset());
     results->pathInCache  = results->image->path();
     results->slideInCache = loadInfo.slide;
+    results->cacheImageIndex = imageIndex;
     return true;
 }
 
@@ -1245,6 +1887,154 @@ bool pathIsInSharedCacheImage(const SharedCacheLoadInfo& loadInfo, const char* d
     uint32_t imageIndex;
     return loadInfo.loadAddress->hasImagePath(dylibPathToFind, imageIndex);
 }
+
+// Leaf libraries that come from the cache while Darling's libSystem family stays on disk. libz was first;
+// libexpat follows as a leaf whose data holds hundreds of PAC-signed pointers (Darling ships its own copy).
+static const char* const kSharedCacheServedOverDisk[] = {
+    "/usr/lib/libz.1.dylib",
+    "/usr/lib/libexpat.1.dylib",
+};
+// The list in force when DYLD_SHARED_CACHE_SPLIT_POLICY is unset: the two entries above, whatever a policy file says
+// elsewhere. A policy file REPLACES it exactly (once, at start up): to serve libz and libexpat under a policy, list them.
+static SharedCacheAllowList sSharedCacheAllowList = { kSharedCacheServedOverDisk,
+                                                      sizeof(kSharedCacheServedOverDisk)/sizeof(kSharedCacheServedOverDisk[0]) };
+
+const SharedCacheAllowList& sharedCacheAllowList()
+{
+    return sSharedCacheAllowList;
+}
+
+bool sharedCachePathIsAllowListed(const char* canonicalPath, const SharedCacheAllowList& allowList)
+{
+    if ( canonicalPath == nullptr )
+        return false;
+    for (size_t i = 0; i < allowList.count; ++i) {
+        if ( strcmp(canonicalPath, allowList.paths[i]) == 0 )
+            return true;
+    }
+    return false;
+}
+
+SharedCacheLoadSource chooseSharedCacheLoadSource(bool isSplitCache, bool inCache, bool existsOnDisk,
+                                                  const char* canonicalPath, const SharedCacheAllowList& allowList)
+{
+    if ( !isSplitCache )
+        return ( inCache && !existsOnDisk ) ? kSharedCacheLoadFromCache : kSharedCacheLoadFromDisk;
+    if ( !inCache )
+        return kSharedCacheLoadFromDisk;
+    if ( sharedCachePathIsAllowListed(canonicalPath, allowList) )
+        return kSharedCacheLoadFromCache;
+    return existsOnDisk ? kSharedCacheLoadFromDisk : kSharedCacheLoadFromCache;
+}
+
+bool pathIsPinnedToSharedCache(const SharedCacheLoadInfo& loadInfo, const char* path)
+{
+    if ( (loadInfo.loadAddress == nullptr) || !loadInfo.loadAddress->isSplitCache() )
+        return false;
+    SharedCacheFindDylibResults results;
+    return findInSharedCacheImage(loadInfo, path, &results)
+        && sharedCachePathIsAllowListed(results.pathInCache, sharedCacheAllowList());
+}
+
+#if defined(DARLING) && !TARGET_OS_SIMULATOR
+// ---- the cache policy file (DYLD_SHARED_CACHE_SPLIT_POLICY) ----
+// Text, one line per record, each ended by a line feed. Line 1 is the header, every other line one canonical install
+// name, matched exactly. Zero names is valid and serves nothing over a disk copy. Anything else is an error: the
+// caller halts, because a half-read policy must never turn into a broader one.
+static const size_t kSplitPolicyMaxFileSize = 256 * 1024;
+static const size_t kSplitPolicyMaxLine     = 1024;
+static const size_t kSplitPolicyMaxEntries  = 4096;
+static const char   kSplitPolicyHeader[]    = "darling-dyld-cache-policy 1";
+
+// Ends every line of text with a NUL and stores the install names (pointers into text) in entries.
+// On an error, *errorLine is the 1-based line it is on.
+static const char* parseSplitCachePolicy(char* text, size_t length, const char** entries, size_t* count, size_t* errorLine)
+{
+    *count = 0;
+    *errorLine = 0;
+    if ( length == 0 )
+        return "the file is empty";
+    size_t position = 0;
+    while ( position < length ) {
+        ++*errorLine;
+        char* line = text + position;
+        size_t lineLength = 0;
+        while ( (position + lineLength < length) && (line[lineLength] != '\n') ) {
+            const unsigned char c = (unsigned char)line[lineLength];
+            if ( (c < 0x20) || (c == 0x7f) )
+                return "the line contains a control character";
+            if ( ++lineLength > kSplitPolicyMaxLine )
+                return "the line is too long";
+        }
+        if ( position + lineLength == length )
+            return "the last line has no line feed";
+        line[lineLength] = '\0';
+        position += lineLength + 1;
+        if ( *errorLine == 1 ) {
+            if ( strcmp(line, kSplitPolicyHeader) != 0 )
+                return "the first line is not the policy header";
+            continue;
+        }
+        if ( line[0] != '/' )   // an empty line is caught here too
+            return "the install name is not an absolute path";
+        for (size_t i = 0; i != *count; ++i) {
+            if ( strcmp(entries[i], line) == 0 )
+                return "the install name is listed twice";
+        }
+        if ( *count == kSplitPolicyMaxEntries )
+            return "the policy lists too many install names";
+        entries[(*count)++] = line;
+    }
+    *errorLine = 0;
+    return nullptr;
+}
+
+const char* loadSplitCachePolicy(const char* path, size_t* errorLine)
+{
+    *errorLine = 0;
+    if ( path[0] != '/' )
+        return "the policy path is not an absolute path";
+    const int fd = dyld3::open(path, O_RDONLY, 0);
+    if ( fd == -1 ) {
+        // static texts, so that a missing file and a refused one read differently
+        if ( errno == ENOENT )
+            return "the policy file does not exist";
+        if ( (errno == EACCES) || (errno == EPERM) )
+            return "the policy file is not readable (permission denied)";
+        return "the policy file cannot be opened";
+    }
+    const char* error = nullptr;
+    char* text = nullptr;
+    const char** entries = nullptr;
+    size_t count = 0;
+    struct stat statBuf;
+    if ( ::fstat(fd, &statBuf) != 0 )
+        error = "the policy file cannot be inspected";
+    else if ( (uint64_t)statBuf.st_size > kSplitPolicyMaxFileSize )
+        error = "the policy file is too large";
+    else {
+        const size_t length = (size_t)statBuf.st_size;
+        text = (char*)::malloc(length + 1);
+        entries = (const char**)::malloc(kSplitPolicyMaxEntries * sizeof(char*));
+        if ( (text == nullptr) || (entries == nullptr) )
+            error = "out of memory reading the policy file";
+        else if ( !preadAll(fd, 0, text, length) )
+            error = "the policy file cannot be read";
+        else
+            error = parseSplitCachePolicy(text, length, entries, &count, errorLine);
+    }
+    ::close(fd);
+    if ( error != nullptr ) {
+        ::free(text);
+        ::free(entries);
+        return error;
+    }
+    // kept for the life of the process: the allow-list points into them
+    sSharedCacheAllowList.paths = entries;
+    sSharedCacheAllowList.count = count;
+    return nullptr;
+}
+#endif // DARLING && !TARGET_OS_SIMULATOR
 
 void deallocateExistingSharedCache()
 {

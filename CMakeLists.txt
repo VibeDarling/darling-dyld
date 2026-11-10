@@ -119,6 +119,7 @@ add_executable(system_loader
 	dyld3/MachOLoaded.cpp
 	dyld3/PathOverrides.cpp
 	dyld3/SharedCacheRuntime.cpp
+	dyld3/DarlingTSDIslands.cpp
 	dyld3/RootsChecker.cpp
 	darling/src/hell.c
 	darling/src/sandbox-dummy.c

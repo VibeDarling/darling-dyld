@@ -1,0 +1,59 @@
+{
+  "load_dylibs": [
+    {
+      "path": "/usr/lib/libexpat.1.dylib",
+      "compat": "7.0.0"
+    },
+    {
+      "path": "/usr/lib/libSystem.B.dylib",
+      "compat": "1.0.0"
+    }
+  ],
+  "imports": [
+    {
+      "name": "_XML_ExpatVersion",
+      "lib": "/usr/lib/libexpat.1.dylib"
+    },
+    {
+      "name": "_XML_ParserCreate",
+      "lib": "/usr/lib/libexpat.1.dylib"
+    },
+    {
+      "name": "_XML_SetUserData",
+      "lib": "/usr/lib/libexpat.1.dylib"
+    },
+    {
+      "name": "_XML_SetElementHandler",
+      "lib": "/usr/lib/libexpat.1.dylib"
+    },
+    {
+      "name": "_XML_SetCharacterDataHandler",
+      "lib": "/usr/lib/libexpat.1.dylib"
+    },
+    {
+      "name": "_XML_Parse",
+      "lib": "/usr/lib/libexpat.1.dylib"
+    },
+    {
+      "name": "_XML_GetErrorCode",
+      "lib": "/usr/lib/libexpat.1.dylib"
+    },
+    {
+      "name": "_XML_ParserFree",
+      "lib": "/usr/lib/libexpat.1.dylib"
+    },
+    {
+      "name": "_write",
+      "lib": "/usr/lib/libSystem.B.dylib"
+    }
+  ],
+  "build_version": {
+    "minos": "13.0.0",
+    "sdk": "13.0.0"
+  },
+  "auth_bind": {
+    "key": "IA",
+    "addr_div": true,
+    "diversity": 0
+  }
+}

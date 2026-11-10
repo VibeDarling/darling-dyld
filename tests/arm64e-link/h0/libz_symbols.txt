@@ -1,0 +1,13 @@
+# Public libz symbols the H0 executable imports: exactly the link-only stub's exports.
+# All are in Darling's src/external/zlib/libz.exp (one name per line, # comments).
+zlibVersion
+compress
+uncompress
+crc32
+adler32
+deflateInit_
+deflate
+deflateEnd
+inflateInit_
+inflate
+inflateEnd
