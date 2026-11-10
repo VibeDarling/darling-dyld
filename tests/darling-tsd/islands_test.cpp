@@ -102,10 +102,13 @@ static void testEncoders() {
     CHECK(!isValidSlotOffset(8) && !isValidSlotOffset(0x171) && !isValidSlotOffset(32768) && !isValidSlotOffset(~0UL));
 }
 
+void testPatcher();
+
 int main() {
     testParse();
     testRefusals();
     testEncoders();
+    testPatcher();
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

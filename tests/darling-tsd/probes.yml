@@ -4,7 +4,7 @@
 - {name: gap with a site accepted, file: DarlingTSDIslands.cpp, from: "(g[gapIndex].start <= address)", to: "false"}
 - {name: site at the end of the last word of a gap accepted, file: DarlingTSDIslands.cpp, from: "<= address) )\n                ++gapIndex", to: "< address) )\n                ++gapIndex"}
 - {name: site ranges not tiled, file: DarlingTSDIslands.cpp, from: "r.firstSite != nextSite", to: "false"}
-- {name: sites may reach the next image, file: DarlingTSDIslands.cpp, from: "(address >= limit) ||", to: "false ||"}
+- {name: sites may reach the next image, file: DarlingTSDIslands.cpp, from: "(address >= limit) ||", to: "(address >= limit + (1ULL << 40)) ||"}
 - {name: sites not ascending, file: DarlingTSDIslands.cpp, from: "siteOffset(s) <= previous", to: "siteOffset(s) < previous"}
 - {name: images may repeat, file: DarlingTSDIslands.cpp, from: "images[i-1].imageOffset >= r.imageOffset", to: "images[i-1].imageOffset > r.imageOffset"}
 - {name: length not compared, file: DarlingTSDIslands.cpp, from: "expected != length", to: "expected > length"}
@@ -18,3 +18,28 @@
 - {name: veneer clobbers the flags, file: DarlingTSDIslands.cpp, from: "0xB5000040U | reg;", to: "0xF1000000U | (reg << 5) | reg;"}
 - {name: slot lower bound lost, file: DarlingTSDIslands.cpp, from: "slotOffset >= 16", to: "slotOffset >= 0"}
 - {name: slot alignment lost, file: DarlingTSDIslands.cpp, from: "(slotOffset & 7) == 0", to: "true"}
+- {name: patcher skips the verification pass, file: DarlingTSDIslands.cpp, from: "if ( word[0] != (kMRSTPIDRRO | siteRegister(sites[k])) )", to: "if ( false )"}
+- {name: lsr check dropped, file: DarlingTSDIslands.cpp, from: "(word[1] != (0xD34CFC00U | (reg << 5) | reg))", to: "false"}
+- {name: gap zero check dropped, file: DarlingTSDIslands.cpp, from: "else if ( !isAllZero(current, sizeof(current)) )", to: "else if ( !isAllZero(current, 0) )"}
+- {name: gap zero check covers only the first word, file: DarlingTSDIslands.cpp, from: "isAllZero(current, sizeof(current))", to: "isAllZero(current, 4)"}
+- {name: second call translates again, file: DarlingTSDIslands.cpp, from: "    done[index] = 1;\n", to: ""}
+- {name: unknown image not refused, file: DarlingTSDIslands.cpp, from: "    if ( image == nullptr )\n        return", to: "    if ( false )\n        return"}
+- {name: capacity off by one veneer, file: DarlingTSDIslands.cpp, from: "g.size - used[*index] >= kVeneerBytes", to: "g.size - used[*index] > kVeneerBytes"}
+- {name: capacity ignores use, file: DarlingTSDIslands.cpp, from: "g.size - used[*index] >= kVeneerBytes", to: "g.size >= kVeneerBytes"}
+- {name: veneers not accounted, file: DarlingTSDIslands.cpp, from: "        used[gap] += kVeneerBytes;\n", to: ""}
+- {name: farther gap preferred, file: DarlingTSDIslands.cpp, from: "site - leftAddress <= rightAddress - site", to: "site - leftAddress > rightAddress - site"}
+- {name: tie goes up, file: DarlingTSDIslands.cpp, from: "site - leftAddress <= rightAddress - site", to: "site - leftAddress < rightAddress - site"}
+- {name: reach not checked, file: DarlingTSDIslands.cpp, from: "return veneerReaches(site, leftAddress) ? (int)left : -1;", to: "return (int)left;"}
+- {name: return branch not part of the reach, file: DarlingTSDIslands.cpp, from: "    encodeBranch(veneer + 16, site + 4, &ok);\n    return ok;", to: "    return ok;"}
+- {name: outward branch not part of the reach, file: DarlingTSDIslands.cpp, from: "    encodeBranch(site, veneer, &ok);\n    encodeBranch(veneer", to: "    encodeBranch(veneer"}
+- {name: left scan walks the wrong way, file: DarlingTSDIslands.cpp, from: "nextWithRoom(&left, -1, &leftAddress)", to: "nextWithRoom(&left, +1, &leftAddress)"}
+- {name: register 31 not a nop, file: DarlingTSDIslands.cpp, from: "        if ( reg == 31 ) {\n            word = 0xD503201FU;", to: "        if ( false ) {\n            word = 0xD503201FU;"}
+- {name: CPU-index read branches to a veneer, file: DarlingTSDIslands.cpp, from: "else if ( siteKind(sites[k]) == kCPUIndexRead ) {\n            word = 0xAA1F03E0U | reg;", to: "else if ( false ) {\n            word = 0xAA1F03E0U | reg;"}
+- {name: CPU-index read keeps the register, file: DarlingTSDIslands.cpp, from: "word = 0xAA1F03E0U | reg;", to: "word = 0xAA1F03E0U;"}
+- {name: trap word loses the register, file: DarlingTSDIslands.cpp, from: "word = 0x0000DA00U | reg;", to: "word = 0x0000DA00U;"}
+- {name: veneer write failure ignored, file: DarlingTSDIslands.cpp, from: "else if ( !memory.write(memory.context, veneerAt[k], words, sizeof(words)) )", to: "else if ( false )"}
+- {name: site write failure ignored, file: DarlingTSDIslands.cpp, from: "else if ( !memory.write(memory.context, site, &word, sizeof(word)) )", to: "else if ( false )"}
+- {name: instruction cache not synced for sites, file: DarlingTSDIslands.cpp, from: "memory.sync(memory.context, site, sizeof(word));", to: "(void)0;"}
+- {name: instruction cache not synced for veneers, file: DarlingTSDIslands.cpp, from: "memory.sync(memory.context, veneerAt[k], sizeof(words));", to: "(void)0;"}
+- {name: veneer placed in a trapped site, file: DarlingTSDIslands.cpp, from: "        if ( gap < 0 )\n            continue;", to: "        if ( gap < 0 )\n            break;"}
+- {name: invalid slot accepted by init, file: DarlingTSDIslands.cpp, from: "if ( !isValidSlotOffset(slot) )", to: "if ( false )"}
