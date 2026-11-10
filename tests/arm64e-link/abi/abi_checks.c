@@ -248,8 +248,9 @@ static int x_stop(int v, int a, unsigned long long c, struct uex *e, void *ctx, 
     (void)v; (void)a; (void)c; (void)e; (void)ctx; g_ran = 1; *(int *)p = 1; return 2; }
 
 /* Flip the lowest set bit of p's signature. STRIP clears exactly the signature bits, so the flip
-   lies in the PAC field; a pointer with no signature is returned unchanged. */
-static void *corrupt(void *p) {
+   lies in the PAC field; a pointer with no signature is returned unchanged. The selftest row
+   selftest_corrupt_changes_signed_values proves this behaviourally in the guest. */
+void *corrupt(void *p) {
     uintptr_t v = (uintptr_t)p, sig = v ^ (uintptr_t)STRIP(p);
     return (void *)(v ^ (sig & (0 - sig)));
 }
@@ -374,7 +375,14 @@ static int dwf_walk(void) {
     }
     put("frames="); putdec(frames); put(" after="); putdec(after); put(" bad="); putdec(bad); nl();
     if (!found) return fail("dwarf_frame_call frame not seen");
-    return (bad || after < 2) ? fail("walk through the DWARF frame failed") : 0;
+    if (bad) return fail("a frame has a signed ip, no unwind info, or is not in DWARF mode");
+    if (after < 2) return fail("the walk ended too soon after the DWARF frame");
+    return 0;
+}
+// 31/32 corrupt the frame, so a fault after that is only the authentication if the unwinder can see
+// the frame at all: walk to it first, or a frame it never found would be reported as a refusal.
+static int dwf_preflight(void) {
+    return dwarf_frame_call(dwf_walk, 0) ? fail("the DWARF frame was not found before the corruption test") : 0;
 }
 static int c_dwf_walk(void) {
     int r = dwarf_frame_call(dwf_walk, 0);
@@ -390,10 +398,12 @@ static int c_dwf_throw(void) {
     ok_mark(30); return 0;
 }
 static int c_dwf_flip(void) {
+    if (dwf_preflight()) return 1;
     int r = cxx_dwarf_frame(1);
     return neg_finished(31, r != 0, "the corrupted DWARF return address was accepted");
 }
 static int c_dwf_unsigned(void) {
+    if (dwf_preflight()) return 1;
     int r = cxx_dwarf_frame(2);
     return neg_finished(32, r != 0, "the corrupted DWARF return address was accepted");
 }

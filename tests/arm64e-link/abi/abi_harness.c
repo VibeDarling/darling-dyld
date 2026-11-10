@@ -8,7 +8,8 @@
 //   abi_probe run N [0|1] [SET]  one check of SET (checks or selftest) in this process (the driver
 //                             execs this); 1 = mutate
 //   abi_probe selftest [mutate]  harness self-test: children with a known verdict, compared in code
-//                             (EXPECT-MISMATCH, expect_mismatches=); also run with mutate
+//                             (EXPECT-MISMATCH, expect_mismatches=, PAC-COLLISION-MISMATCH); also
+//                             run with mutate
 //   abi_probe list
 //
 // Output lines: "FAULT ..." (from the child's fault handler), "OKMARK nn" (the callback ran),
@@ -193,6 +194,26 @@ static int st_strip(void) {
     ok_mark(g_check);
     return 0;
 }
+// corrupt() must change a signed value inside its PAC field and leave the stripped address alone.
+// Proven on the two value kinds the checks corrupt: a compiler-signed function pointer and the return
+// address of this frame. A value with no signature (plain build, mutation, zero PAC field) must come
+// back unchanged.
+static int st_corrupt(void) {
+    void *vals[2] = {hand("selftest.corrupt.fn", (void *)st_ok),
+                     hand("selftest.corrupt.ra", __builtin_return_address(0))};
+    for (int i = 0; i < 2; i++) {
+        void *p = vals[i], *c = corrupt(p);
+        if (p == STRIP(p)) {
+            if (c != p) return fail("corrupt() changed a value with no signature");
+        } else if (c == p) {
+            return fail("corrupt() did not change a signed value");
+        } else if (STRIP(c) != STRIP(p)) {
+            return fail("corrupt() changed more than the signature");
+        }
+    }
+    ok_mark(g_check);
+    return 0;
+}
 
 static const struct check selftests[] = {
     {"selftest_ok", st_ok, "ok"},
@@ -204,6 +225,7 @@ static const struct check selftests[] = {
     {"selftest_exit0_without_okmark_is_failed", st_exit0_without_okmark, "failed"},
     {"selftest_hand_returns_the_right_pointer", st_hand, "ok"},
     {"selftest_strip_and_sign_round_trip", st_strip, "ok"},
+    {"selftest_corrupt_changes_signed_values", st_corrupt, "ok"},
 };
 struct set { const char *name; const struct check *t; int n; };
 static struct set sets[] = {
@@ -280,7 +302,7 @@ static void print_prefixed(const char *buf) {
 static int driver(const char *self, const struct set *set, int mutate) {
     static char out[8192];
     int counts[4] = {0, 0, 0, 0};   // ok faulted hung failed
-    int mismatches = 0;
+    int mismatches = 0, collisions = 0;
     put("ABI-PROBE arch="); put(ARCH); put(" set="); put(set->name); put(" mutate="); putdec(mutate);
     put(" variant="); put(ABI_VARIANT);
     put(" checks="); putdec(set->n); put(" fault_handler_signature_stripped_by_harness=1"); nl();
@@ -317,20 +339,27 @@ static int driver(const char *self, const struct set *set, int mutate) {
         // Expectations are compared for the selftest and for the real checks in the reference arm64e
         // build. The control and the signing variants have no signature to corrupt, so their
         // negative checks report ok and a faulted expectation would not apply there. A collision
-        // leaves a reference check with nothing to authenticate: flag it, do not count it either way.
+        // leaves a reference check with nothing to authenticate: it is not an EXPECT-MISMATCH, but
+        // it must not pass either, so it fails the run and asks for a fresh process.
         int reference = streq(set->name, "checks") && streq(ABI_VARIANT, "arm64e") && !mutate;
+        int pac_collision = reference && collision;
         if (set->t[n - 1].expect && (streq(set->name, "selftest") || reference) &&
-            !(reference && collision) && !streq(set->t[n - 1].expect, verdict)) {
+            !pac_collision && !streq(set->t[n - 1].expect, verdict)) {
             put(" EXPECT-MISMATCH expected="); put(set->t[n - 1].expect); mismatches++;
         }
         nl();
+        if (pac_collision) {
+            put("PAC-COLLISION-MISMATCH check="); putnum2(n); put(" "); put(set->t[n - 1].name);
+            put(" expected="); put(set->t[n - 1].expect); collisions++; nl();
+        }
     }
     put("SUMMARY arch="); put(ARCH); put(" set="); put(set->name); put(" mutate="); putdec(mutate);
     put(" ok="); putdec(counts[0]); put(" faulted="); putdec(counts[1]);
     put(" hung="); putdec(counts[2]); put(" failed="); putdec(counts[3]);
-    put(" expect_mismatches="); putdec(mismatches); nl();
+    put(" expect_mismatches="); putdec(mismatches);
+    put(" pac_collisions="); putdec(collisions); nl();
     if (streq(set->name, "selftest")) return mismatches ? 1 : 0;
-    if (streq(ABI_VARIANT, "arm64e") && !mutate) return mismatches ? 1 : 0;
+    if (streq(ABI_VARIANT, "arm64e") && !mutate) return (mismatches || collisions) ? 1 : 0;
     return counts[0] == set->n ? 0 : 1;
 }
 

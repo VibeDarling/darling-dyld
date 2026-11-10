@@ -42,6 +42,7 @@ extern int g_mutate;                    // 1: strip every pointer before handing
 extern int g_check;                     // number of the check running in this process
 void *hand(const char *what, void *p);  // record (and under mutation strip) a pointer handed over
 void note(const char *what, void *p);   // record a pointer a plain lib produced (not signed by the compiler)
+void *corrupt(void *p);                 // flip the lowest set bit of p's signature (abi_checks.c)
 void ok_mark(int n);                    // the check's callback or body ran
 int fail(const char *why);              // print a reason, return 1
 

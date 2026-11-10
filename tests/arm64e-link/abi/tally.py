@@ -13,7 +13,7 @@ import sys
 
 def main(paths):
     tab = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
-    names, zero_pac, mismatches, boots = {}, collections.Counter(), 0, 0
+    names, zero_pac, mismatches, collisions, boots = {}, collections.Counter(), 0, 0, 0
     for path in paths:
         text = open(path, errors="replace").read()
         heads = re.findall(r"^ABI-PROBE .*set=(\w+) mutate=(\d) variant=(\S+)", text, re.M)
@@ -34,7 +34,10 @@ def main(paths):
                 tab[col][n][m.group(3)] += 1
                 zero_pac[col] += "pac_field_was_zero=yes" in m.group(4)
                 mismatches += "EXPECT-MISMATCH" in m.group(4)
-    print("complete boots: %d of %d, EXPECT-MISMATCH lines: %d" % (boots, len(paths), mismatches))
+            if line.startswith("PAC-COLLISION-MISMATCH"):
+                collisions += 1
+    print("complete boots: %d of %d, EXPECT-MISMATCH lines: %d, PAC-COLLISION-MISMATCH lines: %d"
+          % (boots, len(paths), mismatches, collisions))
     for sset in ("checks", "selftest"):
         cols = sorted(c for c in tab if c[1] == sset)
         print("\n[%s]" % sset)
@@ -46,8 +49,10 @@ def main(paths):
                 row += "%-26s" % ", ".join("%d %s" % (cnt[k], k) for k in ("ok", "faulted", "hung", "failed") if cnt[k])
             print(row)
     print("\npac_field_was_zero=yes lines per column:", {c[0]: v for c, v in zero_pac.items() if v})
-    # an EXPECT-MISMATCH is a check whose verdict differs from what the reference build must get
-    return 1 if mismatches else 0
+    # an EXPECT-MISMATCH is a check whose verdict differs from what the reference build must get; a
+    # PAC-COLLISION-MISMATCH is a reference check with no signature to authenticate, so it is
+    # inconclusive: the run must be repeated with a fresh process, and until then this tally fails.
+    return 1 if (mismatches or collisions) else 0
 
 
 if __name__ == "__main__":

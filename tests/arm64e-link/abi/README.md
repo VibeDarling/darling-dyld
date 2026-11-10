@@ -36,11 +36,12 @@ child printed `OKMARK N`), `faulted` (fault handler exit 70, or killed by a sign
 `failed` (ran, wrong result). The child's handler prints signal, `si_code`, `si_addr`, `pc`, `lr`,
 the pointer handed over (`orig`, `handed`, `orig_signed`, `handed_signed`) and whether `si_addr`
 and `pc` carry PAC bits, and names the image that `pc` and `lr` lie in. The handler itself is
-installed with its signature stripped (the harness is not the subject). `selftest` runs six
+installed with its signature stripped (the harness is not the subject). `selftest` runs
 deliberate children, each with an expected verdict that the driver compares in code
 (`EXPECT-MISMATCH`, `expect_mismatches=`, exit status 1): ok, fault in the main thread, in a thread,
 in a TSD destructor at thread exit, hang, failed, exit 0 without `OKMARK` (must be `failed`),
-`hand()` returns the right pointer and the strip/sign round trip. It runs plain and under `mutate`.
+`hand()` returns the right pointer, the strip/sign round trip, and `corrupt()` changing a signed
+value only inside its signature. It runs plain and under `mutate`.
 One limit: a fault in a TSD destructor at thread exit is a SIGSEGV kill with no handler output
 (check 03 is judged by its `HAND` line and the signal). Exit status above 128 (Darling's
 signal-trampoline death, check 18: 137) counts as `faulted`. A child that writes more than the
@@ -55,11 +56,16 @@ their negative checks report `ok` and the expectations do not apply there.
 
 PAC collision: a signed pointer whose PAC field is all zero is a valid plain pointer. An `ok` on a
 pointer the compiler signed (`HAND ... expect_signed=yes orig_signed=no`) is flagged
-`pac_field_was_zero=yes`; it is neither a pass nor a failure of the unwinder (there was no
-signature to authenticate), and the driver does not count it as an `EXPECT-MISMATCH`. Checks
-21-23 hand their pointers through `hand()`, and 24-27 and 29-32 record the original signed pointer,
-so the flag covers them; the personality slot (28) cannot be inspected, so a collision there is
-invisible and a rare `ok` of a C++ check in a signed build may be one too; the tables count runs.
+`pac_field_was_zero=yes`; there was no signature to authenticate, so it is neither a pass nor a
+failure of the unwinder, and it is not an `EXPECT-MISMATCH`. It is not a silent pass either: in the
+reference arm64e build the driver prints a separate `PAC-COLLISION-MISMATCH check=N ...` line,
+counts it in `pac_collisions=` and exits 1, and `tally.py` counts the lines and exits 1. **A run
+whose log carries a `PAC-COLLISION-MISMATCH` line must be repeated with a fresh process**: the PAC
+field is drawn at run time, so the next process seeds another one and the check may carry a
+signature. Checks 21-23 hand their pointers through `hand()`, and 24-27 and 29-32 record the original
+signed pointer, so the flag covers them; the personality slot (28) cannot be inspected, so a
+collision there is invisible and a rare `ok` of a C++ check in a signed build may be one too; the
+tables count runs.
 
 ## Variants (the mutation probes)
 
@@ -87,7 +93,8 @@ agrees. `.cfi_b_key_frame` and `.cfi_negate_ra_state` emit exactly those two fac
 mode itself is not forced by CFI but by the frame being inline asm, so the linker emits the DWARF-mode
 compact encoding for it. `build_abi.py` asserts all three structurally on the reference build: the
 function's compact encoding is `UNWIND_ARM64_MODE_DWARF`, the CIE augmentation contains `B`, and the
-FDE's first opcode is `0x2d`.
+FDE's first opcode is `0x2d`. Checks 31 and 32 first walk to the frame (as 29 does) and fail when it
+is not found, so a frame the unwinder never sees cannot turn a fault into an apparent refusal.
 
 | # | check | what it does | arm64e expectation |
 |---|---|---|---|
@@ -116,7 +123,9 @@ Checks 21-32 have no guest run in this build; the host test checks their source 
 driver's bookkeeping only. Predicted against the unmodified Darling libunwind, which strips: 21-23 `ok`
 (a stripping unwinder calls the callbacks); 24-28 `failed` (the corrupted pointer or return address is
 used); 29 `failed` (its walk does not see the DWARF frame as DWARF); 31-32 `failed` if the corrupted
-frame resumes at the catch, `faulted` if the throw cannot pass the frame. None of these is a pass.
+frame resumes at the catch, `faulted` if the throw cannot pass the frame. None of the predicted guest
+runs passes the suite as a whole: an `ok` on a positive check (21-23, 29-30) is a pass of that check,
+not of the suite, whose discriminating checks are the negatives 24-28 and 31-32, predicted to fail.
 
 ## Results
 

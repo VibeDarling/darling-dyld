@@ -55,8 +55,13 @@ check 'checks 24-28 and 31-32 expect faulted', (expects[23, 5] + expects[30, 2])
 nf = src[/static int neg_finished\(int number.*?\n\}\n/m].to_s
 check 'neg_finished marks ok only when the check had no signature to authenticate',
       nf.include?('if (!applied)') && nf.include?('ok_mark(number)') && nf.include?('fail(why)')
-check 'the corruption is derived from the signature, not a fixed bit',
-      !src.include?('PACBIT') && src.match?(/sig = v \^ \(uintptr_t\)STRIP\(p\)/)
+# Source hints only: the behavioural proof of corrupt() is the guest selftest row below (the host
+# cannot execute Mach-O). Scoped to the function body, this rejects a no-op corrupt() that keeps the
+# signature assignment.
+corrupt_body = src[/\bvoid \*corrupt\(void \*p\) \{(.*?)\n\}\n/m, 1].to_s
+check 'HINT (source): corrupt() flips a bit derived from the signature, not a fixed bit',
+      !src.include?('PACBIT') && corrupt_body.include?('sig = v ^ (uintptr_t)STRIP(p)') &&
+      corrupt_body.match?(/v \^ \(sig & \(0 - sig\)\)/)
 check 'checks 21-23 hand their pointer through hand()',
       (20..22).all? { |i| src[/static int #{rows[i][1]}\(void\).*?\n\}/m].to_s.include?('hand(') }
 neg = (23..27).to_a + [30, 31]
@@ -78,7 +83,7 @@ cxx = File.read(File.join(HERE, 'abi_cxx.cpp'))
 check 'the DWARF fixture states the B key and the RA sign state in its CFI',
       cxx.include?('.cfi_b_key_frame') && cxx.include?('.cfi_negate_ra_state')
 check 'the DWARF fixture does not rely on .cfi_escape to select DWARF mode', !cxx.include?('.cfi_escape')
-check 'the DWARF corruption is derived from the saved signature, not a fixed bit',
+check 'HINT (source): the DWARF corruption is derived from the saved signature, not a fixed bit',
       !cxx.include?('1ULL << 50') && !cxx.include?('PACBIT') && cxx.match?(/xpaci/)
 
 harness = File.read(File.join(HERE, 'abi_harness.c'))
@@ -87,7 +92,22 @@ check 'the driver compares expectations in the unmutated arm64e checks build onl
                        'streq(ABI_VARIANT, "arm64e") && !mutate;')
 check 'a reference mismatch sets the exit status',
       harness.include?('EXPECT-MISMATCH expected=') &&
-      harness.include?('if (streq(ABI_VARIANT, "arm64e") && !mutate) return mismatches ? 1 : 0;')
+      harness.include?('if (streq(ABI_VARIANT, "arm64e") && !mutate) return (mismatches || collisions) ? 1 : 0;')
+check 'a reference PAC collision prints PAC-COLLISION-MISMATCH and fails the run',
+      harness.include?('put("PAC-COLLISION-MISMATCH check=");') && harness.include?('collisions++;')
+# The behavioural proof of corrupt(): a selftest row in the self-test set that calls it (and STRIP) on
+# values handed through hand(). The source hints above are not evidence on their own.
+sel_table = harness[/static const struct check selftests\[\] = \{(.*?)\n\};/m, 1].to_s
+sel_rows = sel_table.scan(/\{"([a-z0-9_]+)", (\w+), "ok"\}/)
+corrupt_rows = sel_rows.select { |name, _fn| name.include?('corrupt') }
+check 'the selftest set has a corrupt() row with an ok expectation', corrupt_rows.size == 1,
+      sel_rows.map(&:first).inspect
+if corrupt_rows.size == 1
+  row_body = harness[/static int #{corrupt_rows[0][1]}\(void\).*?\n\}\n/m].to_s
+  check 'the corrupt() selftest row exercises corrupt() and STRIP on handed values',
+        row_body.include?('hand(') && row_body.include?('corrupt(') && row_body.include?('STRIP('),
+        corrupt_rows[0][1]
+end
 
 # ---------------------------------------------------------------- compile-only, both archs
 %w[arm64e arm64].each do |arch|
