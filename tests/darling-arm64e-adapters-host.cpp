@@ -214,6 +214,7 @@ static void checkTable()
 	bad({ "_a", 1, 0, 0, ReturnFix::None, 0, AdapterStatus::Probed, "e" }, "no argument count");
 	bad({ "_a", 0, 3, 0, ReturnFix::None, 2, AdapterStatus::Probed, "e" }, "block argument beyond argCount");
 	bad({ "_a", 0, 1, 1, ReturnFix::None, 2, AdapterStatus::Probed, "e" }, "block and struct together");
+	bad({ "_a", 0, 0, 2, ReturnFix::None, 2, AdapterStatus::Probed, "e" }, "a struct argument with no old action after it");
 	bad({ "_a", 1, 1, 0, ReturnFix::None, 2, AdapterStatus::Probed, "e" }, "block argument also stripped");
 	bad({ "_a", 1, 0, 0, ReturnFix::None, 1, AdapterStatus::Unsupported, "e" }, "unsupported row with an action");
 	bad({ "_a", 1, 0, 0, ReturnFix::None, 1, AdapterStatus::HandledElsewhere, "e" }, "handled-elsewhere row with an action");
@@ -386,6 +387,11 @@ static void checkSignal()
 		gFakeResult = special;
 		CHECK(t(30, handlerA, 0, 0, 0, 0, 0, 0) == special, "signal: special value 0x%llx", (unsigned long long)special);
 	}
+	// SIG_IGN installed by arm64e code is remembered like a handler, and still comes back as 1
+	gFakeResult = 0;
+	t(30, 1, 0, 0, 0, 0, 0, 0);
+	gFakeResult = 1;
+	CHECK(t(30, handlerA, 0, 0, 0, 0, 0, 0) == 1, "signal: SIG_IGN that arm64e code installed came back signed");
 	// SIG_ERR means nothing was installed: the next call must not sign the handler of the failed one
 	gFakeResult = ~0ULL;
 	t(31, handlerB, 0, 0, 0, 0, 0, 0);
@@ -408,6 +414,123 @@ static void checkSignal()
 	// SIG_IGN as the argument survives
 	t(30, 1, 0, 0, 0, 0, 0, 0);
 	CHECK(gSeen[1] == 1, "signal: SIG_IGN changed");
+}
+
+// a code address after `after` whose signature for the modifier is not zero: unsigned, it cannot authenticate by luck
+static uint64_t codeWithSignatureAfter(uint64_t after, uint64_t modifier)
+{
+	for (uint64_t p = after;; p += 0x40)
+		if ( oracleSign(p, modifier) != p )
+			return p;
+}
+
+// A handler that plain code installed is handed to arm64e code unsigned; arm64e code that saves it and restores it passes
+// it back as it got it. That works for exactly the values handed out, and a forged unsigned pointer still does not.
+static void checkHandlerRoundTrip()
+{
+	Fn8 sig = thunkFor("_signal");
+	Fn8 act = thunkFor("_sigaction");
+	const uint64_t signedNew = oracleSign(codeWithSignature(0), 0);
+	const uint64_t plainOld = codeWithSignatureAfter(0x0000000100008000ULL, 0);
+	const uint64_t forged = codeWithSignatureAfter(0x0000000100009000ULL, 0);
+
+	// signal(): plain code had installed plainOld, arm64e code gets it back unsigned and restores it
+	gFakeResult = plainOld;
+	CHECK(sig(20, signedNew, 0, 0, 0, 0, 0, 0) == plainOld, "round trip: a handler plain code installed came back changed");
+	gFakeResult = 0;
+	sig(20, plainOld, 0, 0, 0, 0, 0, 0);
+	CHECK(gSeen[1] == plainOld, "round trip: the saved handler did not come back to signal() unchanged (0x%llx)", (unsigned long long)gSeen[1]);
+	// a pointer that was never handed out and is not signed stays unusable
+	if ( !gFpac ) {
+		sig(20, forged, 0, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] != forged && gSeen[1] == oracleAuth(forged, 0), "round trip: a forged unsigned pointer was accepted (0x%llx)", (unsigned long long)gSeen[1]);
+	}
+
+	// sigaction(): the old action that plain code left is written into oact; restored as act it still works
+	struct Act { uint64_t handler; uint32_t mask; int32_t flags; };
+	static Act old;
+	static Act saved;
+	old = { 0, 0, 0 };
+	const uint64_t oldHandler = codeWithSignatureAfter(0x0000000100008000ULL + 0x40 * 7, 0);
+	static uint64_t oldHandlerValue;
+	oldHandlerValue = oldHandler;
+	gHook = [](const uint64_t* a) { if (a[2]) { Act* o = (Act*)a[2]; *o = { oldHandlerValue, 0x11, 0x22 }; } if (a[1]) memcpy(&saved, (const void*)a[1], sizeof(saved)); };
+	gFakeResult = 0;
+	Act fresh = { signedNew, 0, 0 };
+	act(21, (uint64_t)&fresh, (uint64_t)&old, 0, 0, 0, 0, 0);
+	CHECK(old.handler == oldHandler, "round trip: the old action was changed on its way out");
+	act(21, (uint64_t)&old, 0, 0, 0, 0, 0, 0);
+	CHECK(saved.handler == oldHandler && saved.mask == 0x11 && saved.flags == 0x22, "round trip: the saved old action did not come back to sigaction() unchanged (0x%llx)", (unsigned long long)saved.handler);
+	if ( !gFpac ) {
+		Act forgedAct = { forged, 0, 0 };
+		act(21, (uint64_t)&forgedAct, 0, 0, 0, 0, 0, 0);
+		CHECK(saved.handler != forged && saved.handler == oracleAuth(forged, 0), "round trip: a forged unsigned handler in a struct was accepted");
+	}
+	gHook = nullptr;
+
+	// the ring holds the last 64: older ones are refused again, the newest still work
+	if ( !gFpac ) {
+		const uint64_t first = codeWithSignatureAfter(0x000000010000a000ULL, 0);
+		std::vector<uint64_t> handedOut;
+		for (int i = 0; i != 70; ++i) {
+			handedOut.push_back((i == 0) ? first : codeWithSignatureAfter(first + 0x40 * (i + 1) * 4, 0));
+			gFakeResult = handedOut.back();
+			sig(19, signedNew, 0, 0, 0, 0, 0, 0);
+		}
+		gFakeResult = 0;
+		for (size_t i = handedOut.size() - 10; i != handedOut.size(); ++i) {
+			sig(19, handedOut[i], 0, 0, 0, 0, 0, 0);
+			CHECK(gSeen[1] == handedOut[i], "round trip: one of the newest handed out handlers was refused");
+		}
+		sig(19, first, 0, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] != first, "round trip: a handler that fell out of the ring was still accepted");
+	}
+}
+
+// the signal number is an int: dirty upper bits are not part of it, and numbers outside 1..31 are never remembered
+static void checkSignalNumbers()
+{
+	Fn8 sig = thunkFor("_signal");
+	Fn8 act = thunkFor("_sigaction");
+	const uint64_t handlerA = oracleSign(codeWithSignature(0), 0), plainA = oracleStrip(handlerA);
+	const uint64_t dirty = 0xdead00000000ULL;
+	gFakeResult = 0;
+	sig(dirty | 17, handlerA, 0, 0, 0, 0, 0, 0);
+	gFakeResult = plainA;
+	uint64_t r = sig(17, handlerA, 0, 0, 0, 0, 0, 0);
+	CHECK(oracleAuth(r, 0) == plainA && r != plainA, "signal numbers: a number with dirty upper bits was not remembered as itself");
+	gFakeResult = 0;
+	sig(17, handlerA, 0, 0, 0, 0, 0, 0);
+	gFakeResult = plainA;
+	r = sig(dirty | 17, handlerA, 0, 0, 0, 0, 0, 0);
+	CHECK(oracleAuth(r, 0) == plainA && r != plainA, "signal numbers: a lookup with dirty upper bits did not find the handler");
+	struct Act { uint64_t handler; uint32_t mask; int32_t flags; };
+	Act actA = { handlerA, 0, 0 };
+	gFakeResult = 0;
+	act(dirty | 16, (uint64_t)&actA, 0, 0, 0, 0, 0, 0);
+	gFakeResult = plainA;
+	r = sig(16, handlerA, 0, 0, 0, 0, 0, 0);
+	CHECK(oracleAuth(r, 0) == plainA && r != plainA, "signal numbers: sigaction with dirty upper bits did not remember the handler");
+
+	// outside 1..31 nothing is remembered, so nothing comes back signed, and nothing is written outside the table
+	const uint64_t outside[] = { 0, 32, 33, 0xffffffffULL, ~0ULL, 0x80000000ULL, dirty | 32, dirty | 0xffffffffULL };
+	for (uint64_t n : outside) {
+		gFakeResult = 0;
+		sig(n, handlerA, 0, 0, 0, 0, 0, 0);
+		gFakeResult = plainA;
+		const uint64_t back = sig(n, handlerA, 0, 0, 0, 0, 0, 0);
+		CHECK(back == plainA, "signal numbers: 0x%llx was remembered", (unsigned long long)n);
+	}
+	gFakeResult = 0;
+	sig(31, handlerA, 0, 0, 0, 0, 0, 0);
+	gFakeResult = plainA;
+	CHECK(oracleAuth(sig(31, handlerA, 0, 0, 0, 0, 0, 0), 0) == plainA, "signal numbers: 31 is the last valid one");
+
+	// SIG_HOLD (5) is only for sigset, which has no adapter: here it is a pointer like any other and does not authenticate
+	if ( !gFpac ) {
+		sig(14, 5, 0, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] == oracleAuth(5, 0) && gSeen[1] != 5, "signal numbers: SIG_HOLD reached the callee as a valid pointer");
+	}
 }
 
 static Block gHeapResult;
@@ -652,6 +775,8 @@ int main(int argc, char** argv)
 	checkDispatch();
 	checkRefusedBlocks();
 	checkSigaction();
+	checkHandlerRoundTrip();
+	checkSignalNumbers();
 	checkBind();
 	checkSeal();
 	checkThunkPages();

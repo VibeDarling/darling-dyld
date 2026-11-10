@@ -64,12 +64,6 @@ static inline bool isSpecialHandler(uint64_t value)
 	return (value == 0) || (value == 1) || (value == ~0ULL);
 }
 
-// a function pointer: key IA, discriminator 0 (what paciza makes, and the compiler for a C function pointer)
-static inline uint64_t authenticateFunction(uint64_t pointer)
-{
-	return isSpecialHandler(pointer) ? pointer : authenticateIA(pointer, 0);
-}
-
 static bool sEnabled = true;
 
 void setAdaptersEnabled(bool enabled)
@@ -115,15 +109,15 @@ const char* validateAdapterRows(const AdapterRow* rows, size_t count)
 		if ( (r.argCount == 0) || (r.argCount > 8) )
 			return "a row takes no register argument or more than eight";
 		if ( (r.authMask >> r.argCount) != 0 )
-			return "a strip mask names an argument the row does not have";
-		if ( (r.blockArg > r.argCount) || (r.structArg > r.argCount) )
-			return "a block or struct argument is out of range";
+			return "an auth mask names an argument the row does not have";
+		if ( (r.blockArg > r.argCount) || (r.structArg >= r.argCount) )
+			return "a block argument is out of range, or a struct argument has no old-action argument after it";
 		if ( (r.blockArg != 0) && (r.structArg != 0) )
 			return "a row has both a block and a struct argument";
 		if ( (r.blockArg != 0) && ((r.authMask >> (r.blockArg - 1)) & 1) )
-			return "the block argument is also in the strip mask";
+			return "the block argument is also in the auth mask";
 		if ( (r.structArg != 0) && ((r.authMask >> (r.structArg - 1)) & 1) )
-			return "the struct argument is also in the strip mask";
+			return "the struct argument is also in the auth mask";
 	}
 	return nullptr;
 }
@@ -289,30 +283,72 @@ static BlockLiteral* mirrorOfGlobalBlock(const BlockLiteral* block, uint64_t pla
 	return copy;
 }
 
-// The handler that each signal was last given through a signal or sigaction row (already authenticated, so plain code
-// has it as it is), so that signal() can sign what it hands back only when arm64e code installed it. A signal() that
-// races another one can leave a stale entry; the effect is an unsigned result, which faults when it is called.
-static const unsigned kSignalCount = 32;
-static uint64_t sInstalledHandlers[kSignalCount];
-static volatile int sHandlerLock;
+// The tables below are lock free: sigaction() is async-signal-safe, so a handler that calls signal() or sigaction() on a
+// thread that is inside an adapter must not meet a lock that thread holds. Every slot is one aligned word, read and
+// written with relaxed atomics, and a stale or lost entry only makes a pointer come back unsigned or be refused.
 
-static void recordInstalledHandler(uint64_t signalNumber, uint64_t plainHandler)
+// The handler that each signal was last given through a signal or sigaction row (already authenticated, so plain code
+// has it as it is), so that signal() can sign what it hands back only when arm64e code installed it.
+static const int32_t kSignalCount = 32;
+static uint64_t sInstalledHandlers[kSignalCount];
+
+// A signal number is an int: the upper half of its register is not part of it
+static inline int32_t signalNumber(uint64_t reg)
 {
-	if ( (signalNumber == 0) || (signalNumber >= kSignalCount) || !authenticated(plainHandler) )
-		return;
-	while ( __sync_lock_test_and_set(&sHandlerLock, 1) ) { }
-	sInstalledHandlers[signalNumber] = plainHandler;
-	__sync_lock_release(&sHandlerLock);
+	return (int32_t)reg;
 }
 
-static bool wasInstalledHere(uint64_t signalNumber, uint64_t handler)
+static inline bool validSignal(int32_t sig)
 {
-	if ( (signalNumber == 0) || (signalNumber >= kSignalCount) )
-		return false;
-	while ( __sync_lock_test_and_set(&sHandlerLock, 1) ) { }
-	const bool same = (sInstalledHandlers[signalNumber] == handler);
-	__sync_lock_release(&sHandlerLock);
-	return same;
+	return (sig > 0) && (sig < kSignalCount);
+}
+
+static void recordInstalledHandler(int32_t sig, uint64_t plainHandler)
+{
+	if ( validSignal(sig) && authenticated(plainHandler) )
+		__atomic_store_n(&sInstalledHandlers[sig], plainHandler, __ATOMIC_RELAXED);
+}
+
+static bool wasInstalledHere(int32_t sig, uint64_t handler)
+{
+	return validSignal(sig) && (__atomic_load_n(&sInstalledHandlers[sig], __ATOMIC_RELAXED) == handler);
+}
+
+// The plain handlers this module handed out unsigned (signal() results and sigaction old actions that arm64e code did
+// not install through an adapter). Arm64e code that saves one and restores it passes it back as it got it, which does not
+// authenticate; an exact match is accepted, nothing else that fails is, so this is no way to make a forged pointer pass.
+// A ring: when it is full the oldest entry goes, and that handler can no longer be restored.
+static const unsigned kHandedOutCount = 64;
+static uint64_t sHandedOut[kHandedOutCount];
+static uint32_t sHandedOutNext;
+
+static bool wasHandedOut(uint64_t pointer)
+{
+	for (unsigned i = 0; i != kHandedOutCount; ++i) {
+		if ( __atomic_load_n(&sHandedOut[i], __ATOMIC_RELAXED) == pointer )
+			return true;
+	}
+	return false;
+}
+
+static void recordHandedOut(uint64_t plainHandler)
+{
+	if ( isSpecialHandler(plainHandler) || wasHandedOut(plainHandler) )
+		return;
+	const uint32_t slot = __atomic_fetch_add(&sHandedOutNext, 1, __ATOMIC_RELAXED) % kHandedOutCount;
+	__atomic_store_n(&sHandedOut[slot], plainHandler, __ATOMIC_RELAXED);
+}
+
+// A handler argument: key IA, discriminator 0 (what paciza makes, and the compiler for a C function pointer). What does
+// not authenticate stays unusable unless it is exactly a plain handler handed out above.
+static uint64_t authenticateHandler(uint64_t pointer)
+{
+	if ( isSpecialHandler(pointer) )
+		return pointer;
+	const uint64_t result = authenticateIA(pointer, 0);
+	if ( !authenticated(result) && wasHandedOut(pointer) )
+		return pointer;
+	return result;
 }
 
 // Rewriting a shared block would corrupt it for its other users, and the proxy block that would serve both needs an
@@ -331,7 +367,7 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 	memcpy(a, regs, sizeof(a));
 	for (unsigned i = 0; i != 8; ++i) {
 		if ( (row->authMask >> i) & 1 )
-			a[i] = authenticateFunction(a[i]);
+			a[i] = authenticateHandler(a[i]);
 	}
 
 	// An address-diversified invoke is authenticated with the address of its own field. A stack block is rewritten for the
@@ -361,7 +397,7 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 	uint64_t structCopy[2];
 	if ( (row->structArg != 0) && (a[row->structArg - 1] != 0) ) {
 		memcpy(structCopy, (const void*)a[row->structArg - 1], sizeof(structCopy));
-		structCopy[0] = authenticateFunction(structCopy[0]);
+		structCopy[0] = authenticateHandler(structCopy[0]);
 		a[row->structArg - 1] = (uint64_t)structCopy;
 	}
 
@@ -380,20 +416,30 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 
 	if ( restoreSlot != nullptr )
 		*restoreSlot = restoreValue;
+	const int32_t sig = signalNumber(a[0]);
 	if ( row->structArg != 0 ) {
-		// sigaction returned 0: the handler in act is the one installed
+		// sigaction returned 0: the handler in act is the one installed, and the old action in oact (the argument after
+		// act) holds the handler that plain code has, which arm64e code may pass back
 		if ( ((int)result == 0) && (a[row->structArg - 1] != 0) )
-			recordInstalledHandler(a[0], structCopy[0]);
+			recordInstalledHandler(sig, structCopy[0]);
+		if ( ((int)result == 0) && (a[row->structArg] != 0) )
+			recordHandedOut(*(const uint64_t*)a[row->structArg]);
 	}
 	switch ( row->ret ) {
 		case ReturnFix::None:
 			break;
-		case ReturnFix::SignInstalledHandler:
-			if ( !isSpecialHandler(result) && wasInstalledHere(a[0], result) )
-				result = AdapterSign::signPointer(result, nullptr, false, 0, 0);
-			if ( result != ~0ULL )
-				recordInstalledHandler(a[0], a[1]);
+		case ReturnFix::SignInstalledHandler: {
+			const bool failed = (result == ~0ULL);
+			if ( !isSpecialHandler(result) ) {
+				if ( wasInstalledHere(sig, result) )
+					result = AdapterSign::signPointer(result, nullptr, false, 0, 0);
+				else
+					recordHandedOut(result);
+			}
+			if ( !failed )
+				recordInstalledHandler(sig, a[1]);
 			break;
+		}
 		case ReturnFix::ResignCopiedBlock:
 			// a copy was made when the result is another block than the argument (a global or heap block comes back as it is, and is not written); a failed authentication signs nothing
 			if ( (originalBlock != 0) && (result != 0) && (result != originalBlock) && authenticated(originalInvoke) ) {

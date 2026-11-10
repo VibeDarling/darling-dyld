@@ -106,7 +106,8 @@ def build(root, dir, name, adapters_text: nil, rows_text: nil)
 end
 
 def run(exe, *args)
-  o, e, st = Open3.capture3(exe, *args)
+  # a mutant that hangs counts as caught: the status is then not a success
+  o, e, st = Open3.capture3('timeout', '20', exe, *args)
   [o + e, st]
 end
 
@@ -190,8 +191,8 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     'an auth thunk strips (xpaci) instead of authenticating' => ['0xDAC133E0 | i', '0xDAC143E0 | i'],
     'an auth thunk authenticates 0, 1 and -1 too' => ['0x54000049;', '0xD503201F;'],
     'an auth thunk loses its branch' => ['words[n++] = 0xD61F0200;', 'words[n++] = kNop;'],
-    'the call thunk strips instead of authenticating a code pointer' => ['a[i] = authenticateFunction(a[i]);', 'a[i] = stripCode(a[i]);'],
-    'a code pointer of 0, 1 or -1 is authenticated' => ['return isSpecialHandler(pointer) ? pointer : authenticateIA(pointer, 0);', 'return authenticateIA(pointer, 0);'],
+    'the call thunk strips instead of authenticating a code pointer' => ['a[i] = authenticateHandler(a[i]);', 'a[i] = stripCode(a[i]);'],
+    'a code pointer of 0, 1 or -1 is authenticated' => [/if \( isSpecialHandler\(pointer\) \)\s+return pointer;/, ''],
     'a block invoke is stripped instead of authenticated' => ['const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);', 'const uint64_t plainInvoke = stripCode((uint64_t)block->invoke);'],
     'a block invoke is authenticated with discriminator 0 instead of its address' => ['const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);', 'const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, 0);'],
     'a heap block is rewritten in place instead of refused' => [/if \( block->flags & kBlockNeedsFree \)\s+refuseBlock\(row, "a heap block"\);/, ''],
@@ -205,14 +206,21 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     'Block_copy signs the copy after a failed authentication' => ['&& authenticated(originalInvoke) ) {', ') {'],
     'Block_copy rewrites a block that was only retained' => ['&& (result != originalBlock)', ''],
     'Block_copy re-signs without address diversity' => ['&copy->invoke, true, 0, 0)', 'nullptr, false, 0, 0)'],
-    'signal signs a handler that nobody installed through an adapter' => ['if ( !isSpecialHandler(result) && wasInstalledHere(a[0], result) )', 'if ( !isSpecialHandler(result) )'],
-    'signal signs SIG_IGN and SIG_ERR' => ['if ( !isSpecialHandler(result) && wasInstalledHere(a[0], result) )', 'if ( wasInstalledHere(a[0], result) || (result == 1) || (result == ~0ULL) )'],
-    'signal does not remember the handler it installed' => ['recordInstalledHandler(a[0], a[1]);', ''],
-    'signal remembers a handler whose installation failed' => ['if ( result != ~0ULL )', 'if ( true )'],
-    'a handler that failed authentication is remembered' => ['|| !authenticated(plainHandler) )', ') '],
-    'sigaction does not remember the handler it installed' => ['recordInstalledHandler(a[0], structCopy[0]);', ''],
-    'sigaction judges its int result by the whole register' => ['((int)result == 0)', '(result == 0)'],
-    'sigaction strips the handler instead of authenticating it' => ['structCopy[0] = authenticateFunction(structCopy[0]);', 'structCopy[0] = stripCode(structCopy[0]);'],
+    'signal signs a handler that nobody installed through an adapter' => ['if ( wasInstalledHere(sig, result) )', 'if ( true )'],
+    'signal signs SIG_IGN and SIG_ERR' => [/if \( !isSpecialHandler\(result\) \) \{(\s+if \( wasInstalledHere)/, 'if ( true ) {\1'],
+    'signal does not remember the handler it installed' => ['recordInstalledHandler(sig, a[1]);', ''],
+    'signal remembers a handler whose installation failed' => ['if ( !failed )', 'if ( true )'],
+    'a handler that failed authentication is remembered' => ['if ( validSignal(sig) && authenticated(plainHandler) )', 'if ( validSignal(sig) )'],
+    'sigaction does not remember the handler it installed' => ['recordInstalledHandler(sig, structCopy[0]);', ''],
+    'sigaction judges its int result by the whole register' => ['if ( ((int)result == 0) && (a[row->structArg - 1] != 0) )', 'if ( (result == 0) && (a[row->structArg - 1] != 0) )'],
+    'sigaction strips the handler instead of authenticating it' => ['structCopy[0] = authenticateHandler(structCopy[0]);', 'structCopy[0] = stripCode(structCopy[0]);'],
+    'a pointer that was never handed out is accepted when it fails authentication' => ['if ( !authenticated(result) && wasHandedOut(pointer) )', 'if ( !authenticated(result) )'],
+    'a signal() result that plain code installed is not remembered as handed out' => [/else\s+recordHandedOut\(result\);/, ''],
+    'a sigaction old action is not remembered as handed out' => ['recordHandedOut(*(const uint64_t*)a[row->structArg]);', ''],
+    'the handed out ring keeps one entry' => ['__atomic_fetch_add(&sHandedOutNext, 1, __ATOMIC_RELAXED) % kHandedOutCount', '0'],
+    'the signal number is the whole register' => ['return (int32_t)reg;', 'return (reg >> 32) ? 0 : (int32_t)reg;'],
+    'the last signal number is out of range' => ['(sig < kSignalCount)', '(sig <= kSignalCount)'],
+    'signal number 0 is valid' => ['(sig > 0)', '(sig >= 0)'],
     'sigaction hands the caller\'s struct to the callee' => ['a[row->structArg - 1] = (uint64_t)structCopy;', ''],
     'a thunk page is left read-write-execute by the seal' => ['PROT_READ | PROT_EXEC) == 0', 'PROT_READ | PROT_WRITE | PROT_EXEC) == 0'],
     'a thunk page is mapped writable and executable' => ['mmap(nullptr, kThunkPageSize, PROT_READ | PROT_WRITE,', 'mmap(nullptr, kThunkPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,'],
