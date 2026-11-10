@@ -1,8 +1,8 @@
 # The arm64e adapter table and thunks of dyld3/DarlingArm64eAdapters.cpp, on this host (arm64 Linux with pointer
 # authentication, SKIP otherwise): table validation, the table against the Darwin prototypes (independent spec below),
-# every thunk's bytes against llvm-mc, a native run with real PAC instructions (strip of signed, unsigned, NULL, -1, 1 and
-# a garbage high-bit pointer; re-sign of signal() and Block_copy results; blocks and sigaction), and mutation probes: each
-# mutant of the source must make this test fail.
+# every thunk's bytes against llvm-mc, a native run with real PAC instructions (authentication of signed, unsigned, corrupted, NULL, -1, 1
+# and garbage pointers; signing of signal() and Block_copy results; blocks and sigaction), and mutation probes: each mutant
+# of the source must make this test fail. The hooks in src/ are tested by tests/darling-arm64e-adapters-hooks.rb.
 # Env: REQUIRED_SYMBOLS=<file with one Mach-O symbol per line, e.g. the callback-taking imports of the T0 facts scan>:
 # each must have a row, supported or explicitly unsupported (a missing row is a failure).
 # Usage: ruby tests/darling-arm64e-adapters.rb [checkout]
@@ -88,46 +88,14 @@ SPEC.freeze
 L4_AND_L2 = %w[___cxa_atexit _atexit _pthread_key_create _pthread_create _pthread_once __tlv_atexit _qsort _dispatch_async
                _dispatch_once __dyld_register_func_for_add_image _signal _sigaction __Block_copy].freeze
 
-def extract_sign_pointer(source)
-  text = source[/^#if !__has_feature\(ptrauth_calls\)[^\n]*\n__attribute__\(\(target\("arch=armv8\.3-a"\)\)\)\n#endif\nuint64_t MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer\(uint64_t unsignedAddr.*?^\}\n/m]
-  abort 'signPointer not found in dyld3/MachOLoaded.cpp' unless text
-  text
-end
-
-SHIM_LOADED = <<~H
-  #pragma once
-  #include <stdint.h>
-  namespace dyld3 { struct MachOLoaded { struct ChainedFixupPointerOnDisk { struct Arm64e {
-    static uint64_t signPointer(uint64_t unsignedAddr, void* loc, bool addrDiv, uint16_t diversity, uint8_t key);
-  }; }; }; }
-H
-SHIM_MACHINE = <<~H
-  #pragma once
-  #include <stdint.h>
-  typedef int cpu_subtype_t;
-  #define CPU_SUBTYPE_MASK 0xff000000
-  #define CPU_SUBTYPE_ARM64E ((cpu_subtype_t) 2)
-H
+require_relative 'darling-arm64e-adapters-support'
 
 def build(root, dir, name, adapters_text: nil, rows_text: nil)
-  work = File.join(dir, name)
-  FileUtils.mkdir_p(File.join(work, 'mach'))
-  File.write(File.join(work, 'MachOLoaded.h'), SHIM_LOADED)
-  File.write(File.join(work, 'mach', 'machine.h'), SHIM_MACHINE)
-  FileUtils.cp(File.join(root, 'dyld3/DarlingArm64eAdapters.h'), work)
-  File.write(File.join(work, 'DarlingArm64eAdapterRows.inc'), rows_text || File.read(File.join(root, 'dyld3/DarlingArm64eAdapterRows.inc')))
-  File.write(File.join(work, 'DarlingArm64eAdapters.cpp'), adapters_text || File.read(File.join(root, 'dyld3/DarlingArm64eAdapters.cpp')))
-  File.write(File.join(work, 'sign.cpp'), "#include <stdint.h>\n#include <assert.h>\n#include \"MachOLoaded.h\"\nusing namespace dyld3;\n#{extract_sign_pointer(File.read(File.join(root, 'dyld3/MachOLoaded.cpp')))}")
-  exe = File.join(work, 'host')
-  _o, e, st = Open3.capture3('clang++', '-std=c++17', '-O1', '-g', '-Wall', '-Wno-unused-function', '-I', work, File.join(root, 'tests/darling-arm64e-adapters-host.cpp'),
-                             File.join(work, 'DarlingArm64eAdapters.cpp'), File.join(work, 'sign.cpp'), '-o', exe)
-  [st.success? ? exe : nil, e]
+  AdapterSupport.build(root, dir, name, File.join(root, 'tests/darling-arm64e-adapters-host.cpp'), adapters_text: adapters_text, rows_text: rows_text)
 end
 
 def run(exe, *args)
-  # a mutant that hangs counts as caught: the status is then not a success
-  o, e, st = Open3.capture3('timeout', '20', exe, *args)
-  [o + e, st]
+  AdapterSupport.run(exe, *args)
 end
 
 Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
