@@ -72,6 +72,47 @@ uint32_t encodeBranch(uintptr_t from, uintptr_t to, bool* ok);                  
 void     encodeVeneer(uint32_t reg, unsigned long slotOffset, uintptr_t veneer, uintptr_t site, uint32_t out[5], bool* ok);
 bool     isValidSlotOffset(unsigned long slotOffset);
 
+// How the patcher touches memory. All addresses are in the process; `write` must not change page protections.
+struct Memory {
+    void* context;
+    bool (*read)(void* context, uintptr_t address, void* out, size_t length);
+    bool (*write)(void* context, uintptr_t address, const void* data, size_t length);
+    void (*sync)(void* context, uintptr_t address, size_t length);    // make written code visible to instruction fetch
+};
+
+struct PatchStats {
+    uint32_t sites;         // sites in the image
+    uint32_t veneers;       // sites that now branch to a veneer
+    uint32_t cpuZeroed;     // CPU-index reads replaced by `mov Xd, xzr`
+    uint32_t nops;          // reads into xzr replaced by nop
+    uint32_t trapped;       // no gap in reach: left as `udf #0xDA00|reg`, handled by the kernel trap emulator
+};
+
+class Patcher {
+public:
+    Patcher(const SiteTable& table, uintptr_t cacheBase, unsigned long slotOffset);
+    ~Patcher();
+    Patcher(const Patcher&) = delete;
+    Patcher& operator=(const Patcher&) = delete;
+    // Null when usable, otherwise a static message.
+    const char* init();
+    // Translates every site of the image whose mach header is at `machHeader`. Every site is checked against
+    // the table before anything is written; an image the table does not list, a site that does not hold the
+    // expected instruction and a gap that is not zero are errors. Safe to call twice for one image. An error
+    // after the first write leaves the image half translated: the caller must treat it as fatal.
+    // The caller serialises calls (dyld holds its lock).
+    const char* patchImage(uintptr_t machHeader, const Memory& memory, PatchStats* stats);
+    uint32_t    bytesUsed(uint32_t gapIndex) const { return used[gapIndex]; }
+private:
+    bool        nextWithRoom(int64_t* index, int step, uintptr_t* address) const;
+    int         placeVeneer(uintptr_t site) const;
+    const SiteTable& table;
+    uintptr_t   cacheBase;
+    unsigned long slot;
+    uint32_t*   used = nullptr;
+    uint8_t*    done = nullptr;
+};
+
 }
 }
 
