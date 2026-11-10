@@ -604,7 +604,7 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
       }
       gLinkContext.verboseMapping = true;
       m = attempt("/Volumes/SystemRoot/x", CPU_TYPE_X86_64, 3);
-      CHECK(m.empty() && !lastResult && logs.size() == 1 && logs[0].find("no split dyld cache mapper") != std::string::npos && logs[0].find("SystemRoot") == std::string::npos);
+      CHECK(m.empty() && !lastResult && logs.size() == 1 && logs[0] == "dyld: continuing without a shared cache: no split cache mapper for this architecture\\n" && logs[0].find("SystemRoot") == std::string::npos);
       gLinkContext.verboseMapping = false;
 
       // --- the directory holds only the arm64e cache (what macOS ships) ---
@@ -619,8 +619,7 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
       }
       gLinkContext.verboseMapping = true;
       m = attempt(store.c_str(), CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL);
-      CHECK(m.empty() && !lastResult && logs.size() == 1 && logs[0].find("dyld_shared_cache_arm64,") != std::string::npos
-            && logs[0].find("without a split dyld cache") != std::string::npos);
+      CHECK(m.empty() && !lastResult && logs.size() == 1 && logs[0] == "dyld: continuing without a shared cache: dyld_shared_cache_arm64 not found\\n");
       CHECK(logs[0].find("SystemRoot") == std::string::npos && logs[0].find(store) == std::string::npos);
       gLinkContext.verboseMapping = false;
       // only a missing file in a real directory counts: a missing or non-directory dir, or a dir that is a file, stays fatal

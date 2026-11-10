@@ -4453,7 +4453,7 @@ static bool mapSplitSharedCache(const macho_header* mainExecutableMH)
 {
 	if ( !dyld3::splitCacheArchHasMapper(mainExecutableMH->cputype, mainExecutableMH->cpusubtype) ) {
 		if ( gLinkContext.verboseMapping )
-			dyld::log("dyld: no split dyld cache mapper for this architecture, running without a split dyld cache\n");
+			dyld::log("dyld: continuing without a shared cache: no split cache mapper for this architecture\n");
 		return false;
 	}
 	char path[sizeof(sSharedCacheLoadInfo.path)];
@@ -4461,7 +4461,7 @@ static bool mapSplitSharedCache(const macho_header* mainExecutableMH)
 		halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_DIR: %s\n", error));
 	if ( dyld3::splitCacheMainFileIsMissing(sSharedCacheSplitDir, path) ) {
 		if ( gLinkContext.verboseMapping )
-			dyld::log("dyld: DYLD_SHARED_CACHE_SPLIT_DIR has no %s, running without a split dyld cache\n", basename(path));
+			dyld::log("dyld: continuing without a shared cache: %s not found\n", basename(path));
 		return false;
 	}
 	if ( sSharedCacheSplitPolicy != nullptr ) {
