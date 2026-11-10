@@ -22,6 +22,8 @@
 	{ "_signal", 0x2, 0, 0, ReturnFix::SignInstalledHandler, 2, AdapterStatus::Probed, "L2 check 19" },
 	{ "__Block_copy", 0x0, 0, 0, ReturnFix::ResignCopiedBlock, 1, AdapterStatus::Probed, "L2 check 17; a block with helpers aborts with a message (needs the arm64e shim)" },
 	{ "__tlv_atexit", 0x1, 0, 0, ReturnFix::None, 2, AdapterStatus::ShapeOnly, "the shape of L2 checks 01 and 03; imported by test programs, not in the T0 lists" },
+	{ "___cxa_throw", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::Probed, "L2 check 20 (the destructor pointer __cxa_throw stores; found by the report mode in a guest run)" },
+	{ "___cxa_thread_atexit", 0x1, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "libcxxabi cxxabi.h: dtor is argument 0; the shape of L2 check 02" },
 	{ "_heapsort", 0x8, 0, 0, ReturnFix::None, 4, AdapterStatus::ShapeOnly, "stdlib.h: compar is argument 3; the shape of L2 check 06" },
 	{ "_psort", 0x8, 0, 0, ReturnFix::None, 4, AdapterStatus::ShapeOnly, "stdlib.h: compar is argument 3; the shape of L2 check 06" },
 	{ "_tsearch", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "search.h: compar is argument 2; called during the call only" },

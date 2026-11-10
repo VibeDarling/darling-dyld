@@ -47,7 +47,9 @@ HAND = {
   '_signal' => [0x2, 0, 0, 1, 2, 0],                       # sig_t signal(int, sig_t)
   '__Block_copy' => [0x0, 0, 0, 2, 1, 0],                  # void* _Block_copy(const void*)
   '__tlv_atexit' => [0x1, 0, 0, 0, 2, 1],                  # (void (*termFunc)(void*), void* objAddr); not in the T0 lists
-  # callback-taking exports that the T0 lists lack, prototypes from the SDK headers
+  # callback-taking exports that the T0 lists lack: libcxxabi's cxxabi.h (found by the report mode) and the SDK headers
+  '___cxa_throw' => [0x4, 0, 0, 0, 3, 0],                  # (thrown_exception, tinfo, void (*dest)(void*))
+  '___cxa_thread_atexit' => [0x1, 0, 0, 0, 3, 1],          # (void (*)(void*), void*, void*)
   '_heapsort' => [0x8, 0, 0, 0, 4, 1],                     # stdlib.h (base, nel, width, compar)
   '_psort' => [0x8, 0, 0, 0, 4, 1],
   '_tsearch' => [0x4, 0, 0, 0, 3, 1],                      # search.h (key, rootp, compar)
