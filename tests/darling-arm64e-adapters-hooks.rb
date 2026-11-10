@@ -96,6 +96,16 @@ REPLAY = <<~'CPP'
   static int gFailures, gChecks;
   #define CHECK(cond, ...) do { ++gChecks; if (!(cond)) { ++gFailures; printf("FAIL %d %s: ", __LINE__, #cond); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
+  // A value free of a PAC fixed point (pacia(x, 0) == x, about one process in 140 here): searches [first, last) by
+  // `step`, which keeps it where the test needs it; callers assert that a value was found (0 means none was).
+  static uint64_t notAFixedPoint(uint64_t first, uint64_t last, uint64_t step)
+  {
+    for (uint64_t v = first; v < last; v += step)
+      if ( oracleSign(v, 0) != v )
+        return v;
+    return 0;
+  }
+
   // hook 1: the split cache's GOT override
   static uint64_t hook1(const char* symbol, uintptr_t found, const ImageLoader* foundIn) {
     uint64_t value = 0; uint64_t* address = &value;
@@ -135,10 +145,19 @@ REPLAY = <<~'CPP'
   static void setupRealImages() {
     // each image: 0x4000 bytes, the header at 0, executable segment [0x1000, 0x2000), data [0x2000, 0x3000), LINKEDIT at 0x3000
     // (file offset 0x9000, slide 0x7000). Function starts 0x1000, 0x1040 and 0x2010 (in the data segment).
-    static uint8_t arena[kImages][0x6000] __attribute__((aligned(16384)));
+    static uint8_t arena[kImages][0x8000] __attribute__((aligned(16384)));
+    // P's starts 0x1000 and 0x1040 are the addresses the signing checks use; move the image in its slot until neither is a
+    // PAC fixed point, and assert the choice, so that a signature the hooks add is always visible.
+    uintptr_t shift = 0;
+    for (; shift < 0x1000; shift += 0x40) {
+      const uint64_t b = (uint64_t)arena[kP] + shift;
+      if ( (oracleSign(b + 0x1000, 0) != b + 0x1000) && (oracleSign(b + 0x1040, 0) != b + 0x1040) )
+        break;
+    }
+    CHECK(shift < 0x1000, "every placement of the plain image is a PAC fixed point");
     const uint8_t starts[] = { 0x80, 0x20, 0x40, 0xD0, 0x1F, 0x00 };
     for (int k = 0; k != kImages; ++k) {
-      uint8_t* base = arena[k];
+      uint8_t* base = arena[k] + ((k == kP) ? shift : 0);
       memcpy(base + 0x3010, starts, sizeof(starts));
       ((MachHeader*)base)->cpusubtype = (k == kA) ? 2 : 0;
       ImageLoader& im = gReal[k];
@@ -166,7 +185,17 @@ REPLAY = <<~'CPP'
   }
 
   int main() {
-    const uint64_t raw = 0x3500;
+    // raw and the thunk made for it are both values the dlsym hook signs; a PAC fixed point would let a check that they
+    // came out signed pass with the signing removed, so move the bind target inside the plain image until neither is one.
+    uint64_t raw = 0;
+    for (uint64_t candidate = 0x3500; (candidate < 0x4000) && (raw == 0); candidate += 0x40) {
+      if ( oracleSign(candidate, 0) == candidate )
+        continue;
+      const uint64_t made = hook1("_atexit", candidate, &gPlainTarget);
+      if ( oracleSign(made, 0) != made )
+        raw = candidate;
+    }
+    CHECK((raw != 0) && (oracleSign(raw, 0) != raw), "every bind target in the plain image is a PAC fixed point");
     // hook 1
     CHECK(hook1("_atexit", raw, &gPlainTarget) != raw, "a plain exporter's callback-taking function was not thunked");
     CHECK(hook1("_atexit", raw, &gArm64eTarget) == raw, "an arm64e exporter was thunked");
@@ -178,6 +207,7 @@ REPLAY = <<~'CPP'
     Importer arm64e(2), plain(0);
     uint64_t thunk = arm64e.bind("_atexit", 0, raw, &gPlainTarget);
     CHECK(thunk != raw, "an arm64e importer of a plain export got no thunk");
+    CHECK(oracleSign(thunk, 0) != thunk, "the thunk is a PAC fixed point: the dlsym check could not tell signing from no signing");
     CHECK(thunk == hook1("_atexit", raw, &gPlainTarget), "the fixups and the GOT override made different thunks for one target");
     CHECK(plain.bind("_atexit", 0, raw, &gPlainTarget) == raw, "a plain importer got a thunk");
     CHECK(arm64e.bind("_atexit", 8, raw, &gPlainTarget) == raw + 8, "a bind with an addend was thunked");
@@ -230,13 +260,18 @@ REPLAY = <<~'CPP'
 
     // hook 3
     void* callerArm64e = (void*)0x1500; void* callerPlain = (void*)0x2500;
+    // the two results below are compared against their signatures; move them off their PAC fixed points inside the image
+    // ranges the test needs, and assert the choices
+    const uint64_t arm64eFunction = notAFixedPoint(0x5500, 0x6000, 0x40);
+    const uint64_t outsideImage = notAFixedPoint(0x7500, 0x8000, 0x40);
+    CHECK((arm64eFunction != 0) && (outsideImage != 0), "no value free of PAC fixed points for the dlsym checks");
     uint64_t signedThunk = (uint64_t)darlingDlsymSignForCaller((void*)raw, callerArm64e, "_atexit");
     CHECK(signedThunk == oracleSign(thunk, 0), "dlsym for an arm64e caller did not return the signed thunk");
     CHECK(darlingDlsymSignForCaller((void*)raw, callerPlain, "_atexit") == (void*)raw, "dlsym for a plain caller was changed");
     CHECK(darlingDlsymSignForCaller((void*)raw, (void*)0x7000, "_atexit") == (void*)raw, "dlsym for a caller in no image was changed");
-    CHECK(darlingDlsymSignForCaller((void*)0x5500, callerArm64e, "_atexit") == (void*)oracleSign(0x5500, 0), "dlsym of an arm64e function was thunked or not signed");
+    CHECK(darlingDlsymSignForCaller((void*)arm64eFunction, callerArm64e, "_atexit") == (void*)oracleSign(arm64eFunction, 0), "dlsym of an arm64e function was thunked or not signed");
     CHECK(darlingDlsymSignForCaller((void*)raw, callerArm64e, "_not_a_row") == (void*)oracleSign(raw, 0), "dlsym of a symbol with no row was changed beyond signing");
-    CHECK(darlingDlsymSignForCaller((void*)0x7500, callerArm64e, "_atexit") == (void*)oracleSign(0x7500, 0), "dlsym of an address in no image was thunked");
+    CHECK(darlingDlsymSignForCaller((void*)outsideImage, callerArm64e, "_atexit") == (void*)oracleSign(outsideImage, 0), "dlsym of an address in no image was thunked");
 
     // the switch: honoured when the process may use it, ignored when it is restricted
     environment("DYLD_DARLING_ARM64E_ADAPTERS", "off");
