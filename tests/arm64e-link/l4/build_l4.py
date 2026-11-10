@@ -4,7 +4,7 @@ sources as a plain arm64 control, both linked against link-only stubs of libc++ 
 
   build_l4.py build --out DIR      # needs LD64, SDKROOT (Darling SDK root), LIBCXX_INCLUDE
   build_l4.py check EXE ARCH       # ARCH is arm64e or arm64
-  build_l4.py native --out EXE [--checks FILE] [--cxx g++]   # the same checks on the host (not Mach-O)
+  build_l4.py native --out EXE [--checks FILE] [--harness FILE] [--cxx g++]   # the same checks on the host (not Mach-O)
 
 LIBCXX_INCLUDE is the directory of Darling's libc++ headers (the guest build's
 src/external/libcxx/include, LLVM 15.0.7). The stubs are generated from the undefined names of the
@@ -135,13 +135,14 @@ def build_probe(arch, out_dir):
     return out, stubs
 
 
-def build_native(out, checks=None, cxx="g++"):
+def build_native(out, checks=None, cxx="g++", harness_src=None):
     """The same sources on the host, against the host's C++ library: it validates the checks, which
-    the host cannot run as Mach-O. `checks` replaces l4_checks.cpp (the harness mutation probes)."""
+    the host cannot run as Mach-O. `checks` replaces l4_checks.cpp and `harness_src` replaces
+    abi_harness.c (the mutation probes)."""
     with tempfile.TemporaryDirectory(prefix="l4-native-") as tmp:
         harness = os.path.join(tmp, "harness.o")
         rec.run([os.environ.get("CLANG", "clang"), "-DABI_NATIVE", '-DABI_VARIANT="native"', "-O1",
-                 "-I", os.path.join(ROOT, "abi"), "-c", SOURCES[0], "-o", harness], False)
+                 "-I", os.path.join(ROOT, "abi"), "-c", harness_src or SOURCES[0], "-o", harness], False)
         obj = os.path.join(tmp, "checks.o")
         rec.run([cxx, "-std=c++17", "-O1", "-I", HERE, "-c", checks or SOURCES[1], "-o", obj], False)
         rec.run([cxx, harness, obj, "-pthread", "-o", out], False)
@@ -226,11 +227,12 @@ def main(argv):
     n = sub.add_parser("native")
     n.add_argument("--out", required=True)
     n.add_argument("--checks")
+    n.add_argument("--harness")
     n.add_argument("--cxx", default="g++")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "native":
-            print("OK %s" % build_native(a.out, a.checks, a.cxx))
+            print("OK %s" % build_native(a.out, a.checks, a.cxx, a.harness))
         elif a.cmd == "build":
             os.makedirs(a.out, exist_ok=True)
             for arch in ARCHS:

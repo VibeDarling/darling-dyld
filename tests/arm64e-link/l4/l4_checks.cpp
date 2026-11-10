@@ -589,6 +589,7 @@ int z5_round_trip() {
 int z6_corrupted_return_stops() {
     z_plain p; if (z_load(&p)) return 1;
     *p.slot = 0x0000000100001234UL;   // a handler that does not authenticate
+    put("Z6-BEFORE-GET\n");           // the driver needs it to credit the fault below (a crash earlier is a failure)
     p.get();                          // must stop the process, not hand plain code a stripped pointer
     return fail("plain code was handed a handler that failed authentication");
 }
@@ -616,8 +617,9 @@ int z8_throw_after_plain_set() {
 #define EXP_DIAG "c1=any,c2=any,c3=any,native=any"
 // the reverse-adapter checks need the cache and the dyld that has them; elsewhere they are recorded only
 #define EXP_REVERSE "c1=any,c2=any,c3=ok,native=any"
-// plain code is handed a handler that fails authentication: the process stops, which the driver reports as faulted
-#define EXP_REVERSE_STOP "c1=any,c2=any,c3=faulted,native=any"
+// plain code is handed a handler that fails authentication: the process stops, which the driver reports as
+// faulted, provided the child reached the corrupting call (the marker) and did not die earlier
+#define EXP_REVERSE_STOP "c1=any,c2=any,c3=faulted,native=any;need=Z6-BEFORE-GET"
 
 }  // namespace
 

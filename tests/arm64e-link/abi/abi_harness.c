@@ -179,14 +179,16 @@ static void install_handlers(void) {
 }
 
 // Harness self-test (abi_probe selftest): one child per verdict class and per fault location, so a
-// verdict in the real table can be trusted. Expected: ok, faulted x3 (main thread, thread, TSD
-// destructor at thread exit), hung, failed.
+// verdict in the real table can be trusted. Expected: ok x4, faulted x4 (main thread, thread, TSD
+// destructor at thread exit, the 137 exit Darling gives a fault it cannot deliver), hung, failed x2
+// (a plain failure, a zero exit without OKMARK).
 static pthread_key_t st_key;
 static void st_dtor(void *v) { (void)v; *(volatile int *)8 = 1; }
 static void *st_thread_fault(void *a) { (void)a; *(volatile int *)8 = 1; return 0; }
 static void *st_thread_setkey(void *a) { (void)a; pthread_setspecific(st_key, (void *)1); return 0; }
 static int st_ok(void) { ok_mark(1); return 0; }
 static int st_fault_main(void) { *(volatile int *)8 = 1; return 0; }
+static int st_exit_137(void) { _exit(137); return 0; }
 static int st_fault_thread(void) {
     pthread_t t;
     pthread_create(&t, 0, (void *(*)(void *))harness_code((void *)st_thread_fault), 0);
@@ -203,6 +205,12 @@ static int st_fault_tsd_dtor(void) {
 static int st_hang(void) { for (;;) { } }
 static int st_fail(void) { return fail("deliberate failure, no OKMARK"); }
 static int st_exit0_without_okmark(void) { return 0; }
+// a child that prints a line shaped like dyld's adapter warning: the driver must drop and count it
+static int st_adapter_warning_dropped(void) {
+    put("dyld: warning, arm64e adapters: selftest is imported by an arm64e image and has no adapter (selftest)\n");
+    ok_mark(g_check);
+    return 0;
+}
 // hand() must return its argument unchanged, or stripped under mutation
 static int st_hand(void) {
     void *f = (void *)st_ok;
@@ -236,13 +244,24 @@ static const struct check selftests[] = {
     {"selftest_hang", st_hang, "hung"},
     {"selftest_failed_without_okmark", st_fail, "failed"},
     {"selftest_exit0_without_okmark_is_failed", st_exit0_without_okmark, "failed"},
+    {"selftest_exit_137_is_faulted", st_exit_137, "faulted"},
+    {"selftest_adapter_warning_dropped", st_adapter_warning_dropped, "ok"},
     {"selftest_hand_returns_the_right_pointer", st_hand, "ok"},
     {"selftest_strip_and_sign_round_trip", st_strip, "ok"},
+};
+// The rule a "faulted" expectation with ";need=" adds: the first child dies before printing the text, so
+// its verdict must fall to failed, and the second hangs, which must stay a hang rather than becoming
+// failed. Run as `needstop`, which is therefore expected to exit 1 with two mismatches; the other sets
+// expect none.
+static const struct check needstops[] = {
+    {"selftest_fault_before_its_required_text_is_failed", st_fault_main, "faulted;need=SELFTEST-REACHED-GET"},
+    {"selftest_hang_is_not_failed_by_a_faulted_need", st_hang, "faulted;need=NEVER-PRINTED"},
 };
 struct set { const char *name; const struct check *t; int n; };
 static struct set sets[] = {
     {"checks", 0, 0},
     {"selftest", selftests, (int)(sizeof selftests / sizeof selftests[0])},
+    {"needstop", needstops, (int)(sizeof needstops / sizeof needstops[0])},
 };
 static const struct set *find_set(const char *name);
 
@@ -287,6 +306,15 @@ static const char *spec_alts(const char *spec, const char *config, int *len) {
         if (*end != ',') return 0;
         p = end + 1;
     }
+}
+// whether the applicable alternatives name "faulted" itself (not "any")
+static int names_faulted(const char *alts, int len) {
+    for (int i = 0; i <= len;) {
+        int j = i; while (j < len && alts[j] != '|') j++;
+        if (j - i == 7) { int k = 0; while (k < 7 && alts[i + k] == "faulted"[k]) k++; if (k == 7) return 1; }
+        i = j + 1;
+    }
+    return 0;
 }
 static int alt_has(const char *alts, int len, const char *verdict) {
     int vl = 0; while (verdict[vl]) vl++;
@@ -402,19 +430,27 @@ static int driver(const char *self, const struct set *set, int mutate) {
         int mi = 7;
         if (n >= 10) mark[mi++] = '0' + n / 10;
         mark[mi++] = '0' + n % 10; mark[mi++] = '\n'; mark[mi] = 0;
-        if (hung) { verdict = "hung"; counts[2]++; }
-        else if (sig && sig != 0x7f) { verdict = "faulted"; counts[1]++; }
-        else if (code == 70) { verdict = "faulted"; counts[1]++; }
+        int alen = 0;
+        const char *alts = set->t[n - 1].expect ? spec_alts(set->t[n - 1].expect, g_config, &alen) : 0;
+        char need[64]; need[0] = 0;
+        if (set->t[n - 1].expect) spec_need(set->t[n - 1].expect, need, sizeof need);
+        int v = 3;   // ok, faulted, hung, failed
+        if (hung) { verdict = "hung"; v = 2; }
+        else if (sig && sig != 0x7f) { verdict = "faulted"; v = 1; }
+        else if (code == 70) { verdict = "faulted"; v = 1; }
         // Darling ends a process whose fault cannot be delivered (a fault inside its signal
         // trampoline, check 18) with exit status 137: a death, not a result
-        else if (code > 128) { verdict = "faulted"; counts[1]++; }
+        else if (code > 128) { verdict = "faulted"; v = 1; }
         else if (code == 0 && contains(out, mark)) {
-            char need[64];
-            if (set->t[n - 1].expect) spec_need(set->t[n - 1].expect, need, sizeof need); else need[0] = 0;
-            if (need[0] && !contains(out, need)) counts[3]++;
-            else { verdict = "ok"; counts[0]++; }
+            if (need[0] && !contains(out, need)) { verdict = "failed"; v = 3; }
+            else { verdict = "ok"; v = 0; }
         }
-        else counts[3]++;
+        // A "faulted" expectation is only credited when the child reached the text the check needs
+        // (z6's marker before the corrupting call): a death before that point is not that check's
+        // fault. A hang stays a hang. Expectations that permit any verdict keep recording what the
+        // build does.
+        if (alts && names_faulted(alts, alen) && v == 1 && need[0] && !contains(out, need)) { verdict = "failed"; v = 3; }
+        counts[v]++;
         put("RESULT "); putnum2(n); put(" "); put(set->t[n - 1].name); put(" "); put(verdict);
         if (hung) put(" (no exit within the watchdog, killed)");
         else if (sig && sig != 0x7f) { put(" killed_by_signal="); putdec(sig); }
@@ -426,8 +462,6 @@ static int driver(const char *self, const struct set *set, int mutate) {
             put(" pac_field_was_zero=yes");
         if (truncated) put(" output_truncated=yes");
         if (set->t[n - 1].expect) {
-            int alen = 0;
-            const char *alts = spec_alts(set->t[n - 1].expect, g_config, &alen);
             expecting = 1;
             if (!alts || !alt_has(alts, alen, verdict)) {
                 put(" EXPECT-MISMATCH expected="); put(alts ? "" : "(no entry for the configuration) ");
@@ -468,7 +502,8 @@ int main(int argc, char **argv) {
         return set->t[n - 1].fn();
     }
     int selftest = argc >= 2 && streq(argv[1], "selftest");
+    int needstop = argc >= 2 && streq(argv[1], "needstop");
     int mutate = argc >= 2 && (streq(argv[1], "mutate") || (selftest && argc >= 3 && streq(argv[2], "mutate")));
-    set = find_set(selftest ? "selftest" : "checks");
+    set = find_set(needstop ? "needstop" : selftest ? "selftest" : "checks");
     return driver(argv[0], set, mutate);
 }

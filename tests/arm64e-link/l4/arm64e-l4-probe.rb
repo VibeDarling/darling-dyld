@@ -79,8 +79,12 @@ end
 macros = src.scan(/^#define (EXP_\w+) "([^"]*)"/).to_h
 check 'the diagnostics x and y are recorded only: every configuration says any',
       rows.select { |r| r[0].start_with?('x') || r[0].start_with?('y') }.all? { |r| macros[r[2]] == 'c1=any,c2=any,c3=any,native=any' }
-check 'the reverse-adapter checks z expect ok in c3 (z6 faulted: plain code is stopped, not handed a stripped pointer) and are recorded only elsewhere',
-      rows.select { |r| r[0].start_with?('z') }.all? { |r| macros[r[2]] == (r[0].start_with?('z6_') ? 'c1=any,c2=any,c3=faulted,native=any' : 'c1=any,c2=any,c3=ok,native=any') }
+check 'the reverse-adapter checks z expect ok in c3 (z6 faulted, once its child reached the corrupting call) and are recorded only elsewhere',
+      rows.select { |r| r[0].start_with?('z') }.all? { |r| macros[r[2]] == (r[0].start_with?('z6_') ? 'c1=any,c2=any,c3=faulted,native=any;need=Z6-BEFORE-GET' : 'c1=any,c2=any,c3=ok,native=any') }
+z6_body = src[/^int z6_corrupted_return_stops\(\).*?^\}/m].to_s
+marker, corrupting = z6_body.index('put("Z6-BEFORE-GET'), z6_body.index('p.get()')
+check 'z6 prints its marker immediately before the corrupting get, so a crash before that point cannot satisfy its faulted expectation',
+      marker && corrupting && marker < corrupting, z6_body[0, 200]
 check 'every expectation macro names c1, c2, c3 and native', macros.size >= 3 &&
       macros.values.all? { |v| %w[c1 c2 c3 native].all? { |c| v.include?("#{c}=") } }, macros.inspect
 user_class = names.select { |n| n.include?('known_ld64_addend') }
@@ -196,7 +200,8 @@ Dir.mktmpdir('l4-filter-') do |dir|
     ['the warnings are not dropped', 'if (match) dropped++;', 'if (0) dropped++;'],
     ['the dropped lines are not counted', 'if (match) dropped++;', 'if (match) {}'],
     ['a line is matched anywhere, not at its start', 'if (r + i >= e || r[i] != tag[i])', 'if (r + i >= e)'],
-    ['the tag is only a prefix of itself', 'dyld: warning, arm64e adapters:', 'dyld: warning, arm64e'],
+    ['the tag is only a prefix of itself', 'static const char tag[] = "dyld: warning, arm64e adapters:";',
+     'static const char tag[] = "dyld: warning, arm64e";'],
     ['the last line without a newline is lost', 'if (*e == \'\\n\') *w++ = \'\\n\';', '*w++ = \'\\n\';'],
     ['the text after the dropped lines is lost', 'r = *e ? e + 1 : e;', 'r = *e ? e + 1 : e; if (match) break;']
   ]
@@ -239,9 +244,32 @@ def matrix_policy_ok(script, root)
     c3_part.include?(policy) && !both[/PROBE_CONFIG=c2[^;]*/].to_s.include?('POLICY')
 end
 
+# the assignment itself: c1 is the plain control, c2 and c3 the arm64e probe, the cache directory on
+# c3 only, and the self-test runs both builds
+def matrix_assignments_ok(script, root)
+  FileUtils.mkdir_p(root)
+  log = matrix_commands(script, root, {})
+  probe = "/Volumes/SystemRoot#{File.realpath(File.join(root, 'probe'))}"
+  cache = "/Volumes/SystemRoot#{File.realpath(File.join(root, 'cache'))}"
+  # the script itself must assign each variable once (an `export VAR=` outside the command would reach
+  # every guest run through the launcher's environment)
+  code = script.lines.reject { |l| l.lstrip.start_with?('#') }.join
+  code.scan('DYLD_SHARED_CACHE_SPLIT_DIR=').size == 1 &&
+    code.scan(/(?:\A|[; "\n])E=/).size == 1 && code.scan(/(?:\A|[; "\n])C=/).size == 1 &&
+    log.include?("E=#{probe}/l4_probe_arm64e; C=#{probe}/l4_probe_arm64") &&
+    log.scan('DYLD_SHARED_CACHE_SPLIT_DIR=').size == 1 &&
+    log.scan(/(?:\A|[; ])E=/).size == 1 && log.scan(/(?:\A|[; ])C=/).size == 1 &&
+    log[/PROBE_CONFIG=c1[^;]*/].to_s == 'PROBE_CONFIG=c1 $C' &&
+    log[/PROBE_CONFIG=c2[^;]*/].to_s == 'PROBE_CONFIG=c2 $E' &&
+    log[/PROBE_CONFIG=c3[^;]*/].to_s == "PROBE_CONFIG=c3 DYLD_SHARED_CACHE_SPLIT_DIR=#{cache} $E" &&
+    log.include?('$E selftest; $C selftest')
+end
+
 Dir.mktmpdir('l4-matrix-') do |dir|
   check 'run_matrix.sh puts DYLD_SHARED_CACHE_SPLIT_POLICY, as the guest path of L4_POLICY, on the c3 command only and only when set',
         matrix_policy_ok(MATRIX, dir)
+  check 'run_matrix.sh runs c1 on the plain control, c2 and c3 on the arm64e probe, gives only c3 the cache directory and self-tests both builds',
+        matrix_assignments_ok(MATRIX, File.join(dir, 'assign'))
   matrix_probes = [
     ['the policy is never set', '$policy \\$E', ' \\$E'],
     ['the policy is set on every command', 'PROBE_CONFIG=c2 \\$E', 'PROBE_CONFIG=c2 DYLD_SHARED_CACHE_SPLIT_POLICY=/x \\$E'],
@@ -256,6 +284,29 @@ Dir.mktmpdir('l4-matrix-') do |dir|
     ok
   end
   check "run_matrix probes killed: #{matrix_killed} of #{matrix_probes.size}", matrix_killed == matrix_probes.size
+  assignment_probes = [
+    ['c1 runs the arm64e probe', 'PROBE_CONFIG=c1 \\$C', 'PROBE_CONFIG=c1 \\$E'],
+    ['c2 runs the plain control', 'PROBE_CONFIG=c2 \\$E', 'PROBE_CONFIG=c2 \\$C'],
+    ['c3 runs the plain control', 'pwd)$policy \\$E', 'pwd)$policy \\$C'],
+    ['c2 is given the cache directory', 'PROBE_CONFIG=c2 \\$E', 'PROBE_CONFIG=c2 DYLD_SHARED_CACHE_SPLIT_DIR=/x \\$E'],
+    ['c3 loses the cache directory', 'DYLD_SHARED_CACHE_SPLIT_DIR=${GUEST_ROOT:-/Volumes/SystemRoot}$(cd "$CACHE_DIR" && pwd)', ''],
+    ['the self-test runs one build only', '\\$E selftest; \\$C selftest', '\\$E selftest'],
+    ['the executable variables are swapped', 'E=$g/l4_probe_arm64e; C=$g/l4_probe_arm64',
+     'E=$g/l4_probe_arm64; C=$g/l4_probe_arm64e'],
+    ['the cache directory is exported for every command', 'cmd="E=$g/l4_probe_arm64e; C=$g/l4_probe_arm64"',
+     'cmd="export DYLD_SHARED_CACHE_SPLIT_DIR=/x; E=$g/l4_probe_arm64e; C=$g/l4_probe_arm64"'],
+    ['the control variable is reassigned before c1', 'PROBE_CONFIG=c1 \\$C',
+     'C=$g/l4_probe_arm64e; PROBE_CONFIG=c1 \\$C'],
+    ['the cache directory is exported on the host side', "set -u\n",
+     "set -u\nexport DYLD_SHARED_CACHE_SPLIT_DIR=/x\n"]
+  ]
+  assignment_killed = assignment_probes.each_with_index.count do |(desc, old, new), i|
+    ok = MATRIX.scan(old).size == 1 && !matrix_assignments_ok(MATRIX.sub(old) { new }, File.join(dir, "a#{i}"))
+    check "run_matrix assignment probe #{i + 1} killed: #{desc}", ok
+    ok
+  end
+  check "run_matrix assignment probes killed: #{assignment_killed} of #{assignment_probes.size}",
+        assignment_killed == assignment_probes.size
 end
 
 # ---------------------------------------------------------------- native build and run
@@ -290,7 +341,17 @@ Dir.mktmpdir('l4-probe-') do |tmp|
   check 'native: output the child cannot see itself is required (cout line, static dtor, exit flush)',
         %w[L4-COUT-LINE L4-STATIC-DTOR L4-FLUSHED-BY-EXIT].all? { |t| out.include?(t) }
   st_out, st_rc = run_native(native, 'none', 'selftest')
-  check 'native: the harness self-test passes', st_rc.zero? && st_out.include?('expect_mismatches=0') && st_out.include?('ok=3 faulted=3 hung=1 failed=2'), st_out[-300..]
+  check 'native: the harness self-test passes', st_rc.zero? && st_out.include?('expect_mismatches=0') && st_out.include?('ok=4 faulted=4 hung=1 failed=2'), st_out[-300..]
+  check 'native: the self-test reports the 137 exit as faulted', st_out.match?(/^RESULT \d+ selftest_exit_137_is_faulted faulted( |$)/),
+        st_out.lines.grep(/selftest_exit_137/).join
+  ns_out, ns_rc = run_native(native, 'none', 'needstop')
+  check 'native: a death before the text a faulted expectation needs falls to failed, a hang stays hung, and both mismatch',
+        ns_rc == 1 && ns_out.match?(/^RESULT \d+ selftest_fault_before_its_required_text_is_failed failed( |$)/) &&
+        ns_out.match?(/^RESULT \d+ selftest_hang_is_not_failed_by_a_faulted_need hung( |$)/) &&
+        ns_out.include?('expect_mismatches=2'), ns_out[-300..]
+  check 'native: the driver drops and counts a child line shaped like dyld\'s adapter warning',
+        st_out.include?('ADAPTER-WARNINGS-DROPPED 1') && !st_out.include?('dyld: warning, arm64e adapters:'),
+        st_out.lines.grep(/ADAPTER-WARNINGS|arm64e adapters/).join
   c1_out, c1_rc = run_native(native, 'c1')
   check 'native under config c1: the table expects the same verdicts', c1_rc.zero? && c1_out.include?('expect_mismatches=0')
   c3_out, c3_rc = run_native(native, 'c3')
@@ -300,6 +361,54 @@ Dir.mktmpdir('l4-probe-') do |tmp|
   zz_out, zz_rc = run_native(native, 'zz')
   check 'a configuration without a table entry is a mismatch for every check, not a pass',
         zz_rc == 1 && zz_out.scan(/EXPECT-MISMATCH expected=\(no entry for the configuration\)/).size == EXPECTED_COUNT
+  %w[c1x c2x].each do |near|
+    near_out, near_rc = run_native(native, near)
+    check "a configuration that extends #{near[0, 2]} (#{near}) is not matched by the keyed table: every check mismatches",
+          near_rc == 1 && near_out.scan(/EXPECT-MISMATCH expected=\(no entry for the configuration\)/).size == EXPECTED_COUNT,
+          near_rc
+  end
+
+  # the driver and the configuration matcher are exercised natively by rebuilding the probe from a
+  # mutated abi_harness.c: each mutation must change a line the checks above read
+  harness_probes = [
+    { desc: 'the 137 exit is not a fault', config: 'none', args: ['selftest'],
+      old: 'else if (code > 128) {', new: 'else if (code == 129) {',
+      killed: ->(out, _rc) { out.match?(/^RESULT \d+ selftest_exit_137_is_faulted failed( |$)/) } },
+    { desc: 'the driver does not drop the adapter warnings', config: 'none', args: ['selftest'],
+      old: 'int dropped = drop_adapter_warnings(out);', new: 'int dropped = 0;',
+      killed: ->(out, _rc) { !out.include?('ADAPTER-WARNINGS-DROPPED 1') && out.include?('dyld: warning, arm64e adapters:') } },
+    { desc: 'a death before the text a faulted expectation needs is still credited', config: 'none', args: ['needstop'],
+      old: 'if (alts && names_faulted(alts, alen) && v == 1 && need[0] && !contains(out, need)) { verdict = "failed"; v = 3; }', new: '',
+      killed: ->(out, _rc) { out.match?(/^RESULT \d+ selftest_fault_before_its_required_text_is_failed faulted( |$)/) } },
+    { desc: 'a configuration key matches by prefix', config: 'c1x', args: [],
+      old: 'match = i == klen && !config[i];', new: 'match = i == klen;',
+      killed: ->(out, _rc) { out.scan(/EXPECT-MISMATCH/).size != EXPECTED_COUNT } },
+    { desc: 'a hang is demoted by the need rule', config: 'none', args: ['needstop'],
+      old: 'names_faulted(alts, alen) && v == 1 && need[0]', new: 'names_faulted(alts, alen) && need[0]',
+      killed: ->(out, _rc) { out.match?(/^RESULT \d+ selftest_hang_is_not_failed_by_a_faulted_need failed( |$)/) } }
+  ]
+  harness_killed = 0
+  harness_probes.each_with_index do |p, i|
+    mutant = HARNESS.sub(p[:old]) { p[:new] }
+    unless HARNESS.scan(p[:old]).size == 1 && mutant != HARNESS
+      check "harness driver probe #{i + 1} applies: #{p[:desc]}", false, 'the old text does not occur exactly once in abi_harness.c'
+      next
+    end
+    hpath = File.join(tmp, "abi_harness#{i}.c")
+    File.write(hpath, mutant)
+    hexe = File.join(tmp, "harness_mutant#{i}")
+    _o, e, st = py(BUILD, 'native', '--out', hexe, '--harness', hpath)
+    unless st.success?
+      check "harness driver probe #{i + 1} compiles: #{p[:desc]}", false, e[0, 300]
+      next
+    end
+    hout, hrc = run_native(hexe, p[:config], *p[:args])
+    ok = p[:killed].call(hout, hrc)
+    check "harness driver probe #{i + 1} killed: #{p[:desc]}", ok, hout.lines.grep(/selftest_exit_137|ADAPTER-WARNINGS|selftest_fault_before|EXPECT-MISMATCH/).first(3).join
+    harness_killed += 1 if ok
+  end
+  check "harness driver probes killed: #{harness_killed} of #{harness_probes.size}",
+        harness_killed == harness_probes.size
 
   # ------------------------------------------------------------ mutation probes
   # each probe edits one thing in a copy of l4_checks.cpp, rebuilds the native probe, and must change
@@ -467,7 +576,12 @@ Dir.mktmpdir('l4-probe-') do |tmp|
     check 'every libc++ stub name is exported by Darling libc++.1.dylib', (cxx - exp.call('libc++.1.dylib')).empty?, (cxx - exp.call('libc++.1.dylib')).first(5).inspect
     check 'every libc++abi stub name is exported by Darling libc++abi.dylib', (abi - exp.call('libc++abi.dylib')).empty?
     listed = File.readlines(File.join(HERE, 'libcxxabi_exports.txt')).reject { |l| l.start_with?('#') }.map { |l| "_#{l.strip}" }.sort
-    check 'libcxxabi_exports.txt is the export list of that libc++abi.dylib', listed == exp.call('libc++abi.dylib').sort
+    built = exp.call('libc++abi.dylib').sort
+    # the file is a snapshot of the build that made the stub names, not of every later libc++abi: it
+    # must cover every name the stubs route to libc++abi, and may differ elsewhere (recorded)
+    drift = (listed - built) | (built - listed)
+    check "libcxxabi_exports.txt (a build snapshot) supplies every name the stubs route to libc++abi; #{drift.size} names differ from this build and none is used",
+          (abi - listed).empty? && (abi - built).empty? && (drift & abi).empty?, drift.first(10).inspect
   else
     puts 'SKIP the checks against Darling\'s built libc++ and libc++abi: set DARLING_USR_LIB'
   end

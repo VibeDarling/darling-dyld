@@ -29,7 +29,10 @@ python3 -I tests/arm64e-link/abi/tally.py <build>/logs/run-PREFIX*.out  # per (a
   `../abi/tally.py` gained a config column.
 - `build_l4.py`: build, stub generation, structural checks. `../h0/gen_stub.py` (extended:
   `undefined_names`, `exported_names`, `write_symbols`) and `../h0/build_h0.py` (a `libc++` stub entry,
-  `check_stub` for plain arm64) are reused. `libcxxabi_exports.txt`: the 369 names of Darling's libc++abi.
+  `check_stub` for plain arm64) are reused. `libcxxabi_exports.txt`: a snapshot of the 369 names of
+  Darling's libc++abi (the LLVM 15.0.7 build that made the stub list); a later build of the same sources
+  exports a slightly different set, so the host test requires the file to cover every name the stubs use
+  and records names the local build dropped or added.
 - `run_matrix.sh`: guest boots (calls `../abi/run_guest.sh`: shared lock, memory cap, `darling shutdown`);
   `L4_POLICY=<host file>` sets `DYLD_SHARED_CACHE_SPLIT_POLICY` on the c3 command.
 - `arm64e-l4-probe.rb`: the host test.
@@ -42,7 +45,8 @@ python3 -I tests/arm64e-link/abi/tally.py <build>/logs/run-PREFIX*.out  # per (a
 - Stubs: the objects are compiled once to read their undefined names. A name is routed to the libSystem
   family when the Darling SDK exports it, to the libc++abi stub when `libcxxabi_exports.txt` lists it, to
   the libc++ stub when it is a C++ mangled name, and anything else stops the build. The stubs
-  (`stubs-<arch>/*.linkonly.dylib`, 77 libc++ and 37 libc++abi names for the current sources) have the system
+  (`stubs-<arch>/*.linkonly.dylib`, 78 libc++ and 39 libc++abi names with the documented headers and
+  clang 23.1.4; the counts follow the compiler and header set, and no check pins them) have the system
   install names, trap bodies, and are never installed or referenced by build path. Dependencies of the
   executable: libc++.1, libc++abi, libSystem.B (ordinals 1, 2, 3).
 - Differences from a consumer built on macOS: such a binary lists libc++.1 and libSystem and binds
@@ -51,8 +55,9 @@ python3 -I tests/arm64e-link/abi/tally.py <build>/logs/run-PREFIX*.out  # per (a
 - arm64e link: `-init_offsets`. Without it the main program's static initialisers are an arm64e
   `__mod_init_func` of signed pointers, and Darling's dyld calls those raw (`ImageLoaderMachO.cpp:2318`; the
   `S_INIT_FUNC_OFFSETS` branch is at 2352). The host test refuses an executable without `__init_offsets`.
-  The control keeps the default `__mod_init_func`. Whether the guest dyld runs the offsets section of
-  the main program is unverified (T5).
+  The control keeps the default `__mod_init_func`. In the guest the c3 run's `q5_atexit_and_static_destructor`
+  passes (the executable's static initialiser ran before `main`), so its dyld does run the offsets section of
+  the main program (see "Measured in the guest").
 - The control is the plain arm64 build with the same flags; `pacibsp` and friends must be absent.
 
 ## Configurations and how the verdict is judged
@@ -94,7 +99,7 @@ recorded fact, never a fault. In c3 it also requires the image to be `/usr/lib/l
 | x1-x8 | x1_get_terminate, x2_set_get_terminate, x3_allocate_free_exception, x4-x7_init_primary_*, x8_get_unexpected_via_dlsym | diagnostics, not in the plan: public runtime API calls that bisect a throw failure; `__cxa_init_primary_exception` is found by `dlsym` with a null, a signed and a stripped destructor and a class typeinfo. Recorded only (`any` everywhere), so they never turn a run into a mismatch |
 
 | y1-y2 | y1_handler_slots, y2_set_signed_terminate_then_init | diagnostics on the cache's `__cxa_terminate_handler` slot, the value that made every c3 throw trap (Darling's libobjc calls `std::set_terminate(&_objc_terminate)` with a plain pointer): y1 prints which key and discriminator the slot authenticates under and the image its target lies in; y2 hands the runtime a compiler-signed handler, then runs `__cxa_init_primary_exception` and a throw. Recorded only |
-| z1-z8 | z1_plain_entry_is_signed ... z8_throw_after_plain_set | plain code (`l4_plain.dylib`) calls the cache's `set_terminate`/`get_terminate` through the dyld reverse adapters. z1: a plain function entry is signed IA/0 and the old handler comes back raw. z2-z4: entry + 4, an arm64e address and a data address are stored as they are. z5: a handler that arm64e code installed comes back raw and is signed again when handed back; an arm64e address never handed out is not signed. z6: a corrupted slot stops the process (expected `faulted`) instead of handing plain code a stripped pointer. z7: a null handler becomes the default. z8: a throw works after plain code installed its handler. `ok` in c3 (z6 `faulted`), recorded only elsewhere |
+| z1-z8 | z1_plain_entry_is_signed ... z8_throw_after_plain_set | plain code (`l4_plain.dylib`) calls the cache's `set_terminate`/`get_terminate` through the dyld reverse adapters. z1: a plain function entry is signed IA/0 and the old handler comes back raw. z2-z4: entry + 4, an arm64e address and a data address are stored as they are. z5: a handler that arm64e code installed comes back raw and is signed again when handed back; an arm64e address never handed out is not signed. z6: a corrupted slot stops the process (expected `faulted`, credited only if the child printed its marker before the corrupting call, so an earlier crash is `failed`) instead of handing plain code a stripped pointer. z7: a null handler becomes the default. z8: a throw works after plain code installed its handler. `ok` in c3 (z6 `faulted`), recorded only elsewhere |
 
 The sources avoid `std::sort` of arithmetic ranges (T0: the `extern template` `__insertion_sort_incomplete`
 set is exported by Darling's libc++ but not by the cache's; a binary calling it would not bind against the
@@ -113,14 +118,18 @@ defect on the built binary (authenticated vtable binds with addend 0). When the 
 
 ## Host validation (this branch)
 
-Host test: 135 checks, `ALL PASS`, with LD64, SDKROOT, LIBCXX_INCLUDE, DARLING_USR_LIB and CACHE_EXPORTS_DIR
-(the T0 export lists) set. The native part needs only clang and g++; the plain dylib is built and checked in the Mach-O part (plain arm64,
+Host test: 159 checks, `ALL PASS`, with LD64, SDKROOT, LIBCXX_INCLUDE, DARLING_USR_LIB and CACHE_EXPORTS_DIR
+(the T0 export lists) set (153 without the two library environments, whose six checks SKIP). The native part needs only clang and g++; the plain dylib is built and checked in the Mach-O part (plain arm64,
 no PAC instruction, the two libc++ imports, system install names; a copy with one PAC instruction and the arm64e executable are refused). The native part alone needs only clang and g++.
 Native run (libstdc++, aarch64 Linux, no PAC): 36 `ok` (the 26 plan checks, x1..x8, y1 and y2), the two q1 checks and z1..z8 `failed` (the plain Mach-O
-dylib cannot be loaded), `expect_mismatches=0`; with `PROBE_CONFIG=c3` exactly checks 1, 2 and z1..z8 mismatch, with an unknown config all 46.
-The harness's own changes are tested natively on code extracted from `../abi/abi_harness.c` and `run_matrix.sh`, with 17 probes:
-the handler policy (signed under c2 and c3, stripped everywhere else; 6 probes), the filter for dyld's adapter warnings (6) and
-the policy variable of the matrix runner (5). Mutation probes on the checks: 20, each rebuilt natively and each changing the verdict of exactly the named check:
+dylib cannot be loaded), `expect_mismatches=0`; with `PROBE_CONFIG=c3` exactly checks 1, 2 and z1..z8 mismatch, and a
+configuration that only extends a key (`c1x`, `c2x`) or is unknown mismatches on all 46.
+The harness's own changes are tested natively on code extracted from or rebuilt out of `../abi/abi_harness.c` and
+`run_matrix.sh`, with 32 probes: the handler policy (signed under c2 and c3, stripped everywhere else; 6), the filter for
+dyld's adapter warnings (6), the matrix runner's policy variable (5) and its config-to-probe assignment (10: c1 on the plain
+control, c2/c3 on the arm64e probe, the cache directory on c3 only and assigned once in the script and once in the generated
+command, the executable variables assigned once, both builds in the self-test), and the driver's exit-137, adapter-warning,
+required-text, exact-key and hang branches (5). Mutation probes on the checks: 20, each rebuilt natively and each changing the verdict of exactly the named check:
 dropped rethrow (05), a changed value through the frames (04), the cleanup destructor order (07), a
 non-caught exception type (08, faulted), a lambda that does not throw (09), `catch(...)` replaced (06,
 faulted), a lost capture (20), `call_once` bypassed (23), a thread-local destructor that does not count (24),

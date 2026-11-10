@@ -37,8 +37,10 @@
 //   "ok"                               one verdict (ok, faulted, hung, failed) or "a|b", or "any" (recorded only)
 //   "c1=ok,c2=any,c3=failed|faulted"   per configuration; the configuration is $PROBE_CONFIG ("none" if unset),
 //                                      and a configuration without an entry is a mismatch
-//   "<either form>;need=TEXT"          an ok verdict also needs TEXT in the child's output (what the child
-//                                      cannot see itself, such as output flushed by exit)
+//   "<either form>;need=TEXT"          an "ok" verdict needs TEXT in the child's output (what the child
+//                                      cannot see itself, such as output flushed by exit); a "faulted" one
+//                                      needs it to show the child reached the fault judged, so a crash in
+//                                      the wrong place is failed, not that check's fault
 struct check { const char *name; int (*fn)(void); const char *expect; };
 extern const struct check checks[];     // the numbered checks, defined in abi_checks.c
 extern const int nchecks;
