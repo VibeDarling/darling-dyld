@@ -303,6 +303,11 @@ static void tlv_normalize_descriptor(TLVDescriptor* descriptor, unsigned long st
 // Any other image calls the slot with a plain branch. libdyld itself is plain arm64, hence the hint-space pacia1716.
 static void* tlv_thunk_for_image(const struct mach_header* mh)
 {
+#if defined(__aarch64__) && !defined(__arm64__)
+	// Apple's clang spells the arm64 target macro __arm64__, so a plain Linux aarch64 build defines only __aarch64__
+	// and the signing below would be skipped, leaving an unsigned thunk for arm64e images: fail loudly instead.
+#error "an arm64 build must define __arm64__; without it the arm64e TLV thunk would be stored unsigned"
+#endif
 #if __arm64__
 	if ( dyld_header_is_arm64e(mh) ) {
 		register uint64_t value __asm__("x17") = (uint64_t)tlv_get_addr;

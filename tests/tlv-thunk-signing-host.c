@@ -27,6 +27,8 @@
 #define S_THREAD_LOCAL_VARIABLES 0x13
 #define S_THREAD_LOCAL_REGULAR 0x11
 #define S_THREAD_LOCAL_ZEROFILL 0x12
+// test-only flag bit the image kind loop sets on a synthetic image that declares itself a cache-v2 image
+#define TLV_TEST_CACHE_V2 0x80000000
 // the layout of struct mach_header_64, segment_command_64 and section_64
 struct mach_header { uint32_t magic; int32_t cputype; int32_t cpusubtype; uint32_t filetype, ncmds, sizeofcmds, flags, reserved; };
 typedef struct mach_header macho_header;
@@ -41,7 +43,7 @@ static int failures;
 
 __attribute__((noinline)) void* tlv_get_addr(TLVDescriptor* d) { return (char*)d + 0x40; }   // what a plain call can tell apart
 static void tlv_free(void* storage) { (void)storage; }
-static bool tlv_image_uses_cache_v2(const struct mach_header* mh) { (void)mh; return false; }
+static bool tlv_image_uses_cache_v2(const struct mach_header* mh) { return (mh->flags & TLV_TEST_CACHE_V2) != 0; }
 static void tlv_set_key_for_image(const struct mach_header* mh, pthread_key_t key) { (void)mh; (void)key; }
 
 #include "extracted.inc"
@@ -141,28 +143,42 @@ int main(int argc, char** argv)
 	CHECK(thunkFor(0, 0) == raw);
 
 	// A synthetic image with two thread-local descriptors reaches the stores of tlv_initialize_descriptors: each image kind
-	// gets the thunk its own call sequence accepts, in every descriptor.
-	struct { struct mach_header h; macho_segment_command seg; macho_section sect; TLVDescriptor vars[2]; } image;
-	const struct { int32_t cputype, cpusubtype; bool arm64e; } kinds[] = {
-		{ CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E, true },
-		{ CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E | CPU_SUBTYPE_PTRAUTH_ABI, true },
-		{ CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, false },
-		{ CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL, false },
+	// gets the thunk its own call sequence accepts, in every descriptor. Cache-v2 images start from the packed TLV_Thunkv2
+	// words, so the checks also cover the normalization that must survive the key store.
+	struct { struct mach_header h; macho_segment_command seg; macho_section sects[2]; TLVDescriptor vars[2]; } image;
+	const uint64_t legacyOffset = 0x18;
+	const uint32_t v2StaticKey = 0x1234, v2Offset = 0x40, v2Size = 0x80, v2Delta = 0x8;
+	const struct { int32_t cputype, cpusubtype; bool arm64e, cacheV2; } kinds[] = {
+		{ CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E, true, false },
+		{ CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E | CPU_SUBTYPE_PTRAUTH_ABI, true, false },
+		{ CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E, true, true },
+		{ CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, false, false },
+		{ CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, false, true },
+		{ CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL, false, false },
 	};
 	for (unsigned k = 0; k != sizeof kinds / sizeof kinds[0]; ++k) {
 		memset(&image, 0, sizeof image);
-		image.vars[0].key = image.vars[1].key = ~0UL;
+		for (int i = 0; i != 2; ++i) {
+			image.vars[i].key = kinds[k].cacheV2 ? ((uint64_t)v2Offset << 32) | v2StaticKey : 0;
+			image.vars[i].offset = kinds[k].cacheV2 ? ((uint64_t)v2Size << 32) | v2Delta : legacyOffset;
+		}
 		image.h = headerFor(kinds[k].cputype, kinds[k].cpusubtype);
-		image.h.ncmds = 1; image.h.sizeofcmds = sizeof image.seg + sizeof image.sect;
-		image.seg.cmd = LC_SEGMENT_COMMAND; image.seg.cmdsize = sizeof image.seg + sizeof image.sect; image.seg.nsects = 1;
+		if ( kinds[k].cacheV2 ) image.h.flags = TLV_TEST_CACHE_V2;
+		image.h.ncmds = 1; image.h.sizeofcmds = sizeof image.seg + 2 * sizeof image.sects[0];
+		image.seg.cmd = LC_SEGMENT_COMMAND; image.seg.cmdsize = sizeof image.seg + 2 * sizeof image.sects[0]; image.seg.nsects = 2;
 		image.seg.vmaddr = 0; image.seg.filesize = sizeof image;
-		image.sect.flags = S_THREAD_LOCAL_VARIABLES;
-		image.sect.addr = (uint64_t)&image.vars[0] - (uint64_t)&image;			// mh minus vmaddr is the slide
-		image.sect.size = sizeof image.vars;
+		image.sects[0].flags = S_THREAD_LOCAL_VARIABLES;
+		image.sects[0].addr = (uint64_t)&image.vars[0] - (uint64_t)&image;			// mh minus vmaddr is the slide
+		image.sects[0].size = sizeof image.vars;
+		// the template section a cache advertises: tlv_storage_size() returns exactly its size
+		image.sects[1].flags = S_THREAD_LOCAL_REGULAR;
+		image.sects[1].addr = image.sects[0].addr + 0x100;
+		image.sects[1].size = v2Size;
 		tlv_initialize_descriptors(&image.h);
 		for (int i = 0; i != 2; ++i) {
 			CHECK(image.vars[i].key != ~0UL);
 			CHECK((uint64_t)image.vars[i].thunk == (kinds[k].arm64e ? signedForArm64e : raw));
+			CHECK(image.vars[i].offset == (kinds[k].cacheV2 ? v2Offset : legacyOffset));
 			if ( kinds[k].arm64e && signedForArm64e != raw )
 				CHECK(outcome(callLikeArm64e, &image.vars[i]) == 0);
 			else

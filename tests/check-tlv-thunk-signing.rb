@@ -33,6 +33,14 @@ PROBES = [
   ['a different function signed', '(uint64_t)tlv_get_addr;', '(uint64_t)tlv_free;'],
   ['only the first descriptor given the thunk', 'for (TLVDescriptor* d=start; d < end; ++d) {', 'for (TLVDescriptor* d=start; d < start + 1; ++d) {'],
   ['unsigned result returned after signing', 'return (void*)value;', 'return (void*)tlv_get_addr;'],
+  # The cache-v2 image kind in tests/tlv-thunk-signing-host.c makes the normalize-then-store path observable.
+  ['cache-v2 descriptors never normalized', 'if ( cacheV2 )', 'if ( false )'],
+  ['the key store clobbers the packed offset before normalization',
+   "if ( cacheV2 )\n\t\t\t\t\t\t\t\ttlv_normalize_descriptor(d, storageSize);\n\t\t\t\t\t\t\td->thunk = (void* (*)(TLVDescriptor*))thunk;\n\t\t\t\t\t\t\td->key = key;",
+   "d->key = key;\n\t\t\t\t\t\t\td->thunk = (void* (*)(TLVDescriptor*))thunk;\n\t\t\t\t\t\t\tif ( cacheV2 )\n\t\t\t\t\t\t\t\ttlv_normalize_descriptor(d, storageSize);"],
+  ['the cache-v2 storage template never measured', 'cacheV2 ? tlv_storage_size(mh) : 0', '0'],
+  ['normalization given the wrong storage size', 'tlv_normalize_descriptor(d, storageSize)', 'tlv_normalize_descriptor(d, 0)'],
+  ['the packed size stored as the offset', 'descriptor->offset = packedOffset;', 'descriptor->offset = packedSize;'],
 ].freeze
 
 def build_and_run(root, dir, name, extracted, defines)
@@ -50,8 +58,10 @@ end
 
 Dir.mktmpdir('tlv-thunk-signing-') do |dir|
   extracted = FUNCTIONS.map { |f| extract(f == 'dyld_header_is_arm64e' ? priv_header : source, f) }.join("\n\n")
-  # libdyld is built for arm64 (__arm64__ is Apple's spelling); the second build is what any other architecture compiles.
-  variants = { 'arm64-O0' => ['-O0', '-D__arm64__=1'], 'arm64-O2' => ['-O2', '-D__arm64__=1'], 'other-arch' => ['-O1'] }
+  # libdyld is built for arm64 with Apple's __arm64__ spelling. A build that has the architecture but lost the macro
+  # must stop at compile time: otherwise it silently stores an unsigned thunk for arm64e images. -U__aarch64__ below
+  # makes the other-arch build what an x86_64 compile sees, not an aarch64 host with the signing compiled out.
+  variants = { 'arm64-O0' => ['-O0', '-D__arm64__=1'], 'arm64-O2' => ['-O2', '-D__arm64__=1'], 'other-arch' => ['-O1', '-U__aarch64__'] }
   variants.each do |name, defines|
     verdict, out = build_and_run(root, dir, name, extracted, defines)
     abort 'needs a host with pointer authentication' if verdict == :skipped
@@ -59,6 +69,11 @@ Dir.mktmpdir('tlv-thunk-signing-') do |dir|
     abort "#{name}: #{verdict}" unless verdict == :pass
     puts "ok   #{name}: #{out[/RESULT \w+/]}"
   end
+  verdict, out = build_and_run(root, dir, 'arm64-without-__arm64__', extracted, ['-O1'])
+  unless verdict == :build_failed && out.include?('must define __arm64__')
+    abort "the missing __arm64__ guard did not fire (#{verdict})\n#{out}"
+  end
+  puts 'ok   guard: an aarch64 build without __arm64__ is a compile error'
   next if ARGV.include?('--no-probes')
 
   killed = 0
@@ -78,5 +93,5 @@ Dir.mktmpdir('tlv-thunk-signing-') do |dir|
     end
   end
   abort "probes: #{killed}/#{PROBES.size} killed" unless killed == PROBES.size
-  puts "PASS TLV thunk signing: 3 builds, #{killed}/#{PROBES.size} probes killed"
+  puts "PASS TLV thunk signing: 3 builds, missing-__arm64__ guard, #{killed}/#{PROBES.size} probes killed"
 end
