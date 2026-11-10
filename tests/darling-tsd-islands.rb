@@ -10,8 +10,8 @@ run_probes = ARGV.include?('--probes')
 
 def build_and_run(dir, root, sources)
   exe = "#{dir}/islands_test"
-  cmd = ['clang++', '-std=c++17', '-O1', '-Wall', '-Werror', '-I', "#{dir}/dyld3", '-o', exe,
-         "#{root}/tests/darling-tsd/islands_test.cpp", "#{root}/tests/darling-tsd/oracle.S", *sources, '-lpthread']
+  cmd = ['clang++', '-std=c++17', '-O1', '-Wall', '-Werror', '-I', "#{dir}/dyld3", '-I', "#{root}/tests/darling-tsd", '-o', exe,
+         *Dir["#{root}/tests/darling-tsd/*_test.cpp"], "#{root}/tests/darling-tsd/oracle.S", *sources, '-lpthread']
   out, status = Open3.capture2e(*cmd)
   return [false, "build failed:\n#{out}"] unless status.success?
   out, status = Open3.capture2e(exe)
@@ -37,7 +37,9 @@ Dir.mktmpdir('darling-tsd-islands-') do |dir|
     File.write(path, original.sub(probe['from'], probe.fetch('to')))
     ok, out = build_and_run(dir, root, ["#{dir}/dyld3/DarlingTSDIslands.cpp"])
     File.write(path, original)
-    if ok
+    if out.start_with?('build failed')
+      abort "probe does not compile: #{probe['name']}\n#{out}"
+    elsif ok
       puts "SURVIVED #{probe['name']}"
     else
       killed += 1
