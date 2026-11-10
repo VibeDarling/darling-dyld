@@ -338,5 +338,28 @@ Memory ProcSelfMemory::memory()
     return { &fd, procRead, procWrite, procSync };
 }
 
+bool rewriteDiskTSDReads(uint32_t* instructions, size_t count, unsigned long slotOffset, size_t* rewritten)
+{
+    bool complete = true;
+    *rewritten = 0;
+    for (size_t k = 0; k != count; ++k) {
+        if ( (instructions[k] & 0xFFFFFFE0U) != kMRSTPIDRRO )
+            continue;
+        const uint32_t reg = instructions[k] & 0x1FU;
+        instructions[k] = 0xD53BD040U | reg;                                    // mrs Xt, TPIDR_EL0
+        ++*rewritten;
+        const bool andImmediate = (k + 1 != count) && ((instructions[k+1] & 0xFFC00000U) == 0x92400000U)
+                               && ((instructions[k+1] & 0x1FU) == reg) && (((instructions[k+1] >> 5) & 0x1FU) == reg);
+        if ( !andImmediate )
+            continue;
+        if ( !isValidSlotOffset(slotOffset) ) {
+            complete = false;
+            continue;
+        }
+        instructions[++k] = 0xF9400000U | ((uint32_t)(slotOffset / 8) << 10) | (reg << 5) | reg;   // ldr Xt, [Xt, #slot]
+    }
+    return complete;
+}
+
 }
 }

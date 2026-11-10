@@ -129,6 +129,11 @@ private:
     int fd;
 };
 
+// Disk images (plain arm64, text mapped writable): `mrs Xt, TPIDRRO_EL0; and Xt, Xt, #imm` (the pthread_self shape)
+// becomes `mrs Xt, TPIDR_EL0; ldr Xt, [Xt, #slotOffset]`. A lone mrs becomes `mrs Xt, TPIDR_EL0` as before.
+// Returns false, after rewriting everything else, when a read needs the slot and `slotOffset` is not usable.
+bool rewriteDiskTSDReads(uint32_t* instructions, size_t count, unsigned long slotOffset, size_t* rewritten);
+
 }
 }
 
