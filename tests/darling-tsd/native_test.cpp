@@ -30,6 +30,7 @@ static thread_local unsigned long value;
 static thread_local unsigned traps;
 static std::atomic<unsigned> veneerHits;
 static std::atomic<unsigned> storms;
+static std::atomic<bool> stopWorkers;
 
 static void onSignal(int sig, siginfo_t*, void* opaque) {
     ucontext_t* context = (ucontext_t*)opaque;
@@ -96,7 +97,7 @@ static void* worker(void* argument) {
     // an empty slot takes the kernel trap once and still yields a usable pointer
     CHECK(((void*(*)())(kBase + kCodeOffset))() == &value && traps == 1);
     slot = &value;
-    for (volatile unsigned i = 0; i < 20000; ++i) {
+    for (volatile unsigned i = 0; i < 20000 || !stopWorkers; ++i) {
         for (uint32_t offset : kRegionOffsets) {
             void* (*read)() = (void*(*)())(kBase + offset + kCodeOffset);
             int flags[2] = { 0, 0 };
@@ -162,10 +163,14 @@ static void testNative() {
     pthread_t threads[4];
     for (uintptr_t i = 0; i != 4; ++i) CHECK(pthread_create(&threads[i], nullptr, worker, (void*)(i + 1)) == 0);
     // signals arrive while the threads run through veneers; each handler returns with the registers intact
+    // the workers keep running until the last signal, so that where the scheduler stops one is what decides whether it
+    // is inside a veneer; with a fixed number of loops they could be done before the signals start (pinned to one cpu
+    // they always were)
     for (unsigned round = 0; round != 4000; ++round) {
         for (pthread_t t : threads) pthread_kill(t, SIGUSR1);
         if ( round % 8 == 0 ) usleep(50);
     }
+    stopWorkers = true;
     for (pthread_t t : threads) pthread_join(t, nullptr);
     CHECK(storms > 0 && veneerHits > 0);
     printf("native: %u signals, %u of them inside a veneer\n", storms.load(), veneerHits.load());
@@ -185,8 +190,10 @@ static void testNative() {
         }, &spin2);
         while ( !started2 ) usleep(100);
         uint32_t word = 0xD503201FU;
-        for (int i = 0; i != 1000; ++i) mprotectWrite(nullptr, kBase + 0x40, &word, 4);
-        _exit(0);
+        // the thread crashes only if it runs while the page is writable, which on a loaded host can take many rewrites;
+        // the alarm ends the child with another signal when it never does
+        alarm(20);
+        for (;;) mprotectWrite(nullptr, kBase + 0x40, &word, 4);
     }
     int status = 0;
     waitpid(child, &status, 0);
