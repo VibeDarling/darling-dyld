@@ -256,6 +256,165 @@ int cout_and_cerr() {
     PASS();
 }
 
+// ------------------------------------------------------------------------------ 4: threads
+int thread_capturing_lambda() {
+    std::vector<int> data{1, 2, 3, 4};
+    std::string label = "sum";
+    long result = 0;
+    std::thread t([data, label, &result] {   // data and label are captured by copy
+        for (int x : data) result += x;
+        result += static_cast<long>(label.size());
+    });
+    t.join();
+    REQUIRE(result == 13 && !t.joinable());
+    std::thread u([&result] { result = 99; });
+    u.join();
+    REQUIRE(result == 99);
+    PASS();
+}
+
+int mutex_counter() {
+    std::mutex mu;
+    long counter = 0;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 4; i++)
+        threads.emplace_back([&] {
+            for (int j = 0; j < 20000; j++) { std::lock_guard<std::mutex> g(mu); counter++; }
+        });
+    for (auto &t : threads) t.join();
+    REQUIRE(counter == 80000);
+    PASS();
+}
+
+int condition_variable_handoff() {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<int> queue;
+    bool done = false;
+    long consumed = 0;
+    std::thread consumer([&] {
+        std::unique_lock<std::mutex> lk(mu);
+        for (;;) {
+            cv.wait(lk, [&] { return !queue.empty() || done; });
+            while (!queue.empty()) { consumed += queue.back(); queue.pop_back(); }
+            if (done) return;
+        }
+    });
+    for (int i = 1; i <= 100; i++) {
+        { std::lock_guard<std::mutex> g(mu); queue.push_back(i); }
+        cv.notify_one();
+    }
+    { std::lock_guard<std::mutex> g(mu); done = true; }
+    cv.notify_all();
+    consumer.join();
+    REQUIRE(consumed == 5050);
+    std::unique_lock<std::mutex> lk(mu);
+    REQUIRE(cv.wait_for(lk, std::chrono::milliseconds(20)) == std::cv_status::timeout);   // times out, not hangs
+    PASS();
+}
+
+int call_once_across_threads() {
+    std::once_flag flag;
+    std::atomic<int> runs{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 6; i++)
+        threads.emplace_back([&] { std::call_once(flag, [&] { runs++; }); });
+    for (auto &t : threads) t.join();
+    REQUIRE(runs == 1);
+    std::once_flag again;
+    int tries = 0;
+    try { std::call_once(again, [&] { tries++; throw std::runtime_error("first call fails"); }); } catch (const std::exception &) {}
+    std::call_once(again, [&] { tries++; });   // an exception leaves the flag unset
+    REQUIRE(tries == 2);
+    PASS();
+}
+
+std::atomic<int> g_tl_dtors{0};
+struct TlProbe { int v = 0; ~TlProbe() { g_tl_dtors++; } };
+thread_local TlProbe tl_probe;
+int thread_local_destructor() {
+    g_tl_dtors = 0;
+    std::atomic<int> seen{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 3; i++)
+        threads.emplace_back([i, &seen] { tl_probe.v = i + 1; seen += tl_probe.v; });   // first use registers the destructor
+    for (auto &t : threads) t.join();
+    REQUIRE(seen == 6);
+    REQUIRE(g_tl_dtors == 3);   // each thread's object died with its thread, before join returned
+    PASS();
+}
+
+// ------------------------------------------------------------------------------ 5: the exit path
+int g_static_ctor_ran = 0;
+int g_arm_static_dtor = 0;
+struct StaticProbe {
+    StaticProbe() { g_static_ctor_ran = 1; }
+    ~StaticProbe() { if (g_arm_static_dtor) std::cout << "L4-STATIC-DTOR"; }   // no newline, no flush: exit must flush
+} g_static_probe;
+
+int g_exit_order = 0;
+void exit_first_registered() {   // registered first, so it runs last of the handlers registered by main
+    if (g_exit_order == 21 && g_static_ctor_ran) ok_mark(g_check);
+}
+void exit_second() { g_exit_order = g_exit_order * 10 + 1; }
+void exit_third() { g_exit_order = g_exit_order * 10 + 2; }
+int atexit_and_static_destructor() {
+    REQUIRE(g_static_ctor_ran == 1);   // the static initializer of this executable ran before main
+    g_arm_static_dtor = 1;
+    REQUIRE(std::atexit(exit_first_registered) == 0);
+    REQUIRE(std::atexit(exit_second) == 0);
+    REQUIRE(std::atexit(exit_third) == 0);
+    std::exit(0);   // handlers run in reverse order, then the static destructor, then the cout flush
+}
+
+int exit_flushes_cout() {
+    std::cout << "L4-FLUSHED-BY-EXIT";   // buffered: stdout is a pipe
+    ok_mark(g_check);
+    std::exit(0);
+}
+
+// ------------------------------------------------------------------------------ 6: static locals
+constexpr int kLocals = 16;
+std::atomic<int> g_local_inits[kLocals];
+std::atomic<int> g_go{0};
+template <int I> struct Lazy {
+    int v;
+    Lazy() : v(0) {
+        g_local_inits[I]++;
+        for (int k = 0; k < 5; k++) std::this_thread::yield();   // keep the initialisation open for the other threads
+        v = 100 + I;
+    }
+};
+template <int I> int lazy() { static Lazy<I> x; return x.v; }   // one guard variable each
+template <int... Is> void run_locals(std::atomic<int> *bad, std::integer_sequence<int, Is...>) {
+    while (!g_go) std::this_thread::yield();
+    int values[] = {lazy<Is>()...};
+    for (int i = 0; i < kLocals; i++) if (values[i] != 100 + i) (*bad)++;   // saw a half-initialised object
+}
+int static_local_contention() {
+    std::atomic<int> bad{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; i++)
+        threads.emplace_back([&bad] { run_locals(&bad, std::make_integer_sequence<int, kLocals>()); });
+    g_go = 1;
+    for (auto &t : threads) t.join();
+    REQUIRE(bad == 0);
+    for (int i = 0; i < kLocals; i++) REQUIRE(g_local_inits[i] == 1);   // each ran exactly once
+    PASS();
+}
+
+std::atomic<int> g_flaky_attempts{0};
+int flaky() {
+    static int v = [] { if (g_flaky_attempts++ == 0) throw std::runtime_error("first initialisation fails"); return 5; }();
+    return v;
+}
+int static_local_init_throws() {
+    try { flaky(); return fail("the first initialisation did not throw"); } catch (const std::runtime_error &) {}
+    REQUIRE(flaky() == 5);   // the guard was aborted, so the next call initialises
+    REQUIRE(flaky() == 5 && g_flaky_attempts == 2);
+    PASS();
+}
+
 #define EXP_STD "c1=ok,c2=any,c3=ok,native=ok"
 // not from the cache is a recorded fact (failed), never a fault
 #define EXP_CACHE "c1=failed,c2=failed,c3=ok,native=failed"
@@ -285,6 +444,15 @@ const struct check checks[] = {
     {"q3_shared_ptr_control_block", shared_ptr_control_block, EXP_STD},
     {"q3_ostringstream_and_locale", ostringstream_and_locale, EXP_STD},
     {"q3_cout_and_cerr", cout_and_cerr, EXP_STD ";need=L4-COUT-LINE 42 1.25"},
+    {"q4_thread_capturing_lambda", thread_capturing_lambda, EXP_STD},
+    {"q4_mutex_counter", mutex_counter, EXP_STD},
+    {"q4_condition_variable_handoff", condition_variable_handoff, EXP_STD},
+    {"q4_call_once_across_threads", call_once_across_threads, EXP_STD},
+    {"q4_thread_local_destructor", thread_local_destructor, EXP_STD},
+    {"q5_atexit_and_static_destructor", atexit_and_static_destructor, EXP_STD ";need=L4-STATIC-DTOR"},
+    {"q5_exit_flushes_cout", exit_flushes_cout, EXP_STD ";need=L4-FLUSHED-BY-EXIT"},
+    {"q6_static_local_contention", static_local_contention, EXP_STD},
+    {"q6_static_local_init_throws", static_local_init_throws, EXP_STD},
 };
 const int nchecks = sizeof checks / sizeof checks[0];
 }
