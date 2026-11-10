@@ -2260,9 +2260,7 @@ const void* _dyld_get_shared_cache_range(size_t* length)
 {
     const DyldSharedCache* cache = (DyldSharedCache*)dyld::imMemorySharedCacheHeader();
     if ( cache != nullptr ) {
-        const dyld_cache_mapping_info* const mappings = (dyld_cache_mapping_info*)((char*)cache + cache->header.mappingOffset);
-		const dyld_cache_mapping_info* lastMapping = &mappings[cache->header.mappingCount - 1];
-        *length = (size_t)((lastMapping->address + lastMapping->size) - cache->unslidLoadAddress());
+        *length = (size_t)cache->mappedSize();
         return cache;
     }
 	return nullptr;
