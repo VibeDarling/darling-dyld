@@ -58,6 +58,10 @@ extern dispatch_time_t dispatch_time(dispatch_time_t, long long);
 
 extern void _dyld_register_func_for_add_image(void (*)(const void *, intptr_t));
 extern void *dlsym(void *, const char *);
+extern void *_Block_copy(const void *);
+typedef void (*sig_t)(int);
+extern sig_t signal(int, sig_t);
+#define SIGUSR1 30
 #define RTLD_DEFAULT ((void *)-2)
 extern int unw_getcontext(void *);
 extern int unw_init_local(void *, void *);

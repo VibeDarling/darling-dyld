@@ -45,4 +45,28 @@ int cxx_cleanup(void) {
     return 2;
 }
 
+
+// 20: check 13's throw spelled out, so the destructor pointer that __cxa_throw stores (and
+// libc++abi calls when the exception dies) can be stripped by itself: strip_dtor != 0 passes it
+// unsigned. The thrown object is still a polymorphic class with a typeinfo and a signed vptr.
+void *__cxa_allocate_exception(unsigned long);
+void __cxa_throw(void *, void *, void (*)(void *));
+extern char derived_typeinfo[] __asm__("__ZTI7Derived");
+__attribute__((noinline)) static void derived_dtor(void *p) { static_cast<Derived *>(p)->~Derived(); }
+inline void *operator new(unsigned long, void *p) noexcept { return p; }
+int cxx_class_manual_throw(int strip_dtor) {
+    g_dtor_runs = 0;
+    (void)strip_dtor;
+    void (*dtor)(void *) = derived_dtor;
+#if __has_feature(ptrauth_intrinsics)
+    if (strip_dtor) dtor = (void (*)(void *))__builtin_ptrauth_strip((void *)dtor, 0);
+#endif
+    try {
+        void *ex = __cxa_allocate_exception(sizeof(Derived));
+        new (ex) Derived(9);
+        __cxa_throw(ex, derived_typeinfo, dtor);
+    } catch (Base &b) { if (b.id() != 2) return 1; }
+    return g_dtor_runs >= 1 ? 0 : 3;
+}
+
 }

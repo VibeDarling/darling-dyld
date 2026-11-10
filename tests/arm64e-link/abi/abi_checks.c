@@ -132,6 +132,8 @@ extern int cxx_same_frame(void), cxx_callee_frame(void), cxx_class_base(void), c
 static int c_cxx_same(void) { int r = cxx_same_frame(); if (!r) ok_mark(11); return r; }
 static int c_cxx_callee(void) { int r = cxx_callee_frame(); if (!r) ok_mark(12); return r; }
 static int c_cxx_class(void) { int r = cxx_class_base(); if (!r) ok_mark(13); return r; }
+extern int cxx_class_manual_throw(int strip_dtor);
+static int c_cxx_class_dtor(void) { int r = cxx_class_manual_throw(g_mutate); if (!r) ok_mark(20); return r; }
 static int c_cxx_cleanup(void) { int r = cxx_cleanup(); if (!r) ok_mark(14); return r; }
 
 // 15 Darling's libunwind walking signed frames: diagnostic for 11-14. Walks four nested frames of
@@ -168,35 +170,86 @@ static int c_unwind_walk(void) { int r = walk(WALK_DEPTH); if (!r) ok_mark(15); 
 
 
 // 16 The reverse direction: a function pointer that a plain lib returns (dlsym) and this arm64e code
-// calls. The compiler authenticates the pointer before the call and the plain lib returns it
-// unsigned. Under mutation the harness signs it the way the compiler would (IA, discriminator 0).
+// calls. The compiler authenticates the pointer before the call. Darling's dyld already returns it
+// signed to an arm64e caller (HAND orig_signed=yes), so the unmutated run is the dyld side's own
+// behaviour. Mutation strips it before the call: the call must then fault.
 static int c_dlsym_result(void) {
     void *p = dlsym(RTLD_DEFAULT, "getpid");
     if (!p) return fail("dlsym returned NULL");
-    p = hand("dlsym.result", p);
-    if (g_mutate) p = SIGN_IA0(p);
+    p = hand("dlsym.result", p);     /* compiler-signed pointers are what mutation strips; here the lib signed it */
     pid_t (*fn)(void) = (pid_t (*)(void))p;
     if (fn() != getpid()) return fail("wrong result");
     ok_mark(16);
     return 0;
 }
 
+// 17 A block that plain libclosure copied and arm64e code then calls. The literal's invoke pointer is
+// signed with the address of its own field; Block_copy moves the literal, so the signature no longer
+// matches. Mutation re-signs the copy the way an arm64e Block_copy would.
+static int c_block_copy_then_call(void) {
+    int salt = 5;
+    dispatch_block_t b = ^{ g_async_val = salt + 100; };
+    struct blk *heap = (struct blk *)_Block_copy((void *)b);
+    note("Block_copy.copy.invoke", heap->invoke);
+    if (g_mutate) heap->invoke = SIGN_FIELD(STRIP(heap->invoke), &heap->invoke);
+    g_async_val = 0;
+    ((dispatch_block_t)(void *)heap)();
+    if (g_async_val != 105) return fail("block ran with wrong captures");
+    ok_mark(17);
+    return 0;
+}
+
+// 18 A function pointer inside a struct handed to the plain lib (sigaction.sa_handler), called later
+// by the lib's signal trampoline when the signal arrives.
+static void h_usr1(int sig) { (void)sig; ok_mark(18); }
+static int c_sigaction_handler(void) {
+    struct sigaction sa;
+    sa.handler = hand("sigaction.sa_handler", (void *)h_usr1);
+    sa.mask = 0;
+    sa.flags = 0;
+    if (sigaction(SIGUSR1, &sa, 0)) return fail("sigaction failed");
+    kill(getpid(), SIGUSR1);
+    poll(0, 0, 300);
+    return 0;
+}
+
+// 19 A pointer the plain lib stores and returns later (signal's previous handler), then called by
+// arm64e code. The lib returns the raw value it was given; the first handler is installed with a
+// stripped pointer (harness) so the check isolates the returned value. Mutation signs it.
+static volatile int g_sig_ran;
+static void sig_a(int sig) { (void)sig; g_sig_ran = 1; }
+static void sig_b(int sig) { (void)sig; g_sig_ran = 2; }
+static int c_signal_return(void) {
+    signal(SIGUSR1, (sig_t)STRIP((void *)sig_a));
+    sig_t old = signal(SIGUSR1, (sig_t)STRIP((void *)sig_b));
+    note("signal.return", (void *)old);
+    if (g_mutate) old = (sig_t)SIGN_IA0(old);
+    old(SIGUSR1);
+    if (g_sig_ran != 1) return fail("previous handler did not run");
+    ok_mark(19);
+    return 0;
+}
+
 const struct check checks[] = {
-    {"atexit", c_atexit},
-    {"cxa_atexit", c_cxa_atexit},
-    {"pthread_key_destructor", c_key_dtor},
-    {"pthread_create_start", c_pthread_start},
-    {"pthread_once", c_once},
-    {"qsort_comparator", c_qsort},
-    {"dispatch_async_stack_block", c_async_stack},
-    {"dispatch_async_global_block", c_async_global},
-    {"dispatch_once_block", c_dispatch_once},
-    {"dyld_add_image_callback", c_dyld_add_image},
-    {"cxx_throw_catch_same_frame", c_cxx_same},
-    {"cxx_throw_through_callee_frame", c_cxx_callee},
-    {"cxx_throw_class_base_catch", c_cxx_class},
-    {"cxx_cleanup_landing_pad", c_cxx_cleanup},
-    {"libunwind_walk_signed_frames", c_unwind_walk},
-    {"dlsym_result_called_by_arm64e", c_dlsym_result},
+    {"atexit", c_atexit, 0},
+    {"cxa_atexit", c_cxa_atexit, 0},
+    {"pthread_key_destructor", c_key_dtor, 0},
+    {"pthread_create_start", c_pthread_start, 0},
+    {"pthread_once", c_once, 0},
+    {"qsort_comparator", c_qsort, 0},
+    {"dispatch_async_stack_block", c_async_stack, 0},
+    {"dispatch_async_global_block", c_async_global, 0},
+    {"dispatch_once_block", c_dispatch_once, 0},
+    {"dyld_add_image_callback", c_dyld_add_image, 0},
+    {"cxx_throw_catch_same_frame", c_cxx_same, 0},
+    {"cxx_throw_through_callee_frame", c_cxx_callee, 0},
+    {"cxx_throw_class_base_catch", c_cxx_class, 0},
+    {"cxx_cleanup_landing_pad", c_cxx_cleanup, 0},
+    {"libunwind_walk_signed_frames", c_unwind_walk, 0},
+    {"dlsym_result_called_by_arm64e", c_dlsym_result, 0},
+    {"block_copy_then_called_by_arm64e", c_block_copy_then_call, 0},
+    {"sigaction_handler_in_struct", c_sigaction_handler, 0},
+    {"signal_return_value_called_by_arm64e", c_signal_return, 0},
+    {"cxx_class_throw_manual_dtor_pointer", c_cxx_class_dtor, 0},
 };
 const int nchecks = (int)(sizeof checks / sizeof checks[0]);

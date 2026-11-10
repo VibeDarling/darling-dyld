@@ -7,12 +7,17 @@
 //                             of its signature (xpaci): the mutation probe
 //   abi_probe run N [0|1] [SET]  one check of SET (checks or selftest) in this process (the driver
 //                             execs this); 1 = mutate
-//   abi_probe selftest        harness self-test: deliberate ok/fault/hang/fail children (st_* below)
+//   abi_probe selftest [mutate]  harness self-test: children with a known verdict, compared in code
+//                             (EXPECT-MISMATCH, expect_mismatches=); also run with mutate
 //   abi_probe list
 //
 // Output lines: "FAULT ..." (from the child's fault handler), "OKMARK nn" (the callback ran),
 // "RESULT nn name verdict ...", "SUMMARY ...". Verdicts: ok, faulted, hung, failed.
 #include "abi_harness.h"
+
+#ifndef ABI_VARIANT
+#define ABI_VARIANT "unset"
+#endif
 
 // ----------------------------------------------------------------------------- output
 void put(const char *s) { size_t n = 0; while (s[n]) n++; write(1, s, n); }
@@ -37,17 +42,26 @@ int g_check;
 static const char *g_what = "";
 static volatile uintptr_t g_orig, g_handed;   // the pointer as the compiler made it / as handed over
 
-// Record the pointer a check hands to a subject API; under mutation return it stripped.
-void *hand(const char *what, void *p) {
+static void record(const char *what, void *orig, void *handed, int expect_signed) {
     g_what = what;
-    g_orig = (uintptr_t)p;
-    if (g_mutate) p = STRIP(p);
-    g_handed = (uintptr_t)p;
+    g_orig = (uintptr_t)orig;
+    g_handed = (uintptr_t)handed;
     put("HAND "); put(what); put(" orig="); puthex(g_orig); put(" handed="); puthex(g_handed);
+    put(" expect_signed="); putyn(expect_signed);
     put(" orig_signed="); putyn(g_orig != (uintptr_t)STRIP((void *)g_orig));
     put(" handed_signed="); putyn(g_handed != (uintptr_t)STRIP((void *)g_handed)); nl();
-    return p;
 }
+
+// Record a pointer the compiler made (signed in an arm64e build) and hand it over; under mutation
+// it is returned stripped.
+void *hand(const char *what, void *p) {
+    void *out = g_mutate ? STRIP(p) : p;
+    record(what, p, out, HAS_PAC_CALLS);
+    return out;
+}
+
+// Record a pointer that a plain lib produced: nothing signed it, so it is never mutated here.
+void note(const char *what, void *p) { record(what, p, p, 0); }
 void ok_mark(int n) { put("OKMARK "); putdec(n); nl(); }
 int fail(const char *why) { put("CHECKFAIL "); put(why); nl(); return 1; }
 
@@ -154,15 +168,42 @@ static int st_fault_tsd_dtor(void) {
 }
 static int st_hang(void) { for (;;) { } }
 static int st_fail(void) { return fail("deliberate failure, no OKMARK"); }
-
+static int st_exit0_without_okmark(void) { return 0; }
+// hand() must return its argument unchanged, or stripped under mutation
+static int st_hand(void) {
+    void *f = (void *)st_ok;
+    void *h = hand("selftest.hand", f);
+    if (g_mutate ? h != STRIP(f) : h != f) return fail("hand() returned the wrong pointer");
+    ok_mark(g_check);
+    return 0;
+}
+// STRIP removes what SIGN_IA0 adds, and the compiler signs function pointers (any of four: a zero
+// PAC field is a 1 in 128 chance each)
+static int st_strip(void) {
+    void *fns[4] = {(void *)st_ok, (void *)st_hand, (void *)st_fail, (void *)st_hang};
+    int signed_by_compiler = 0, signed_by_us = 0;
+    for (int i = 0; i < 4; i++) {
+        void *s = SIGN_IA0(STRIP(fns[i]));
+        if (STRIP(s) != STRIP(fns[i])) return fail("STRIP(SIGN_IA0(f)) is not f");
+        signed_by_us += s != STRIP(fns[i]);
+        signed_by_compiler += fns[i] != STRIP(fns[i]);
+    }
+    if (HAS_PAC_CALLS && !(signed_by_us && signed_by_compiler)) return fail("nothing was signed");
+    if (!HAS_PAC_CALLS && (signed_by_us || signed_by_compiler)) return fail("a plain build signed a pointer");
+    ok_mark(g_check);
+    return 0;
+}
 
 static const struct check selftests[] = {
-    {"selftest_ok", st_ok},
-    {"selftest_fault_main_thread", st_fault_main},
-    {"selftest_fault_in_thread", st_fault_thread},
-    {"selftest_fault_in_tsd_destructor_at_thread_exit", st_fault_tsd_dtor},
-    {"selftest_hang", st_hang},
-    {"selftest_failed_without_okmark", st_fail},
+    {"selftest_ok", st_ok, "ok"},
+    {"selftest_fault_main_thread", st_fault_main, "faulted"},
+    {"selftest_fault_in_thread", st_fault_thread, "faulted"},
+    {"selftest_fault_in_tsd_destructor_at_thread_exit", st_fault_tsd_dtor, "faulted"},
+    {"selftest_hang", st_hang, "hung"},
+    {"selftest_failed_without_okmark", st_fail, "failed"},
+    {"selftest_exit0_without_okmark_is_failed", st_exit0_without_okmark, "failed"},
+    {"selftest_hand_returns_the_right_pointer", st_hand, "ok"},
+    {"selftest_strip_and_sign_round_trip", st_strip, "ok"},
 };
 struct set { const char *name; const struct check *t; int n; };
 static struct set sets[] = {
@@ -185,8 +226,10 @@ static const struct set *find_set(const char *name) {
 static void putnum2(int n) { if (n < 10) put("0"); putdec(n); }
 
 #define WATCHDOG_TICKS 12   /* seconds */
-static int run_one(const char *self, const char *set, int n, int mutate, char *out, int outsz, int *status, int *hung) {
-    int fd[2], len = 0; *hung = 0; *status = 0;
+static int run_one(const char *self, const char *set, int n, int mutate, char *out, int outsz, int *status, int *hung,
+                   int *truncated) {
+    static char sink[256];
+    int fd[2], len = 0; *hung = 0; *status = 0; *truncated = 0;
     if (pipe(fd)) return -1;
     pid_t pid = fork();
     if (pid < 0) return -1;
@@ -206,10 +249,12 @@ static int run_one(const char *self, const char *set, int n, int mutate, char *o
         int r = poll(&p, 1, 1000);
         if (r == 0) { if (++ticks >= WATCHDOG_TICKS) { *hung = 1; break; } continue; }
         if (r < 0) break;
-        ssize_t got = read(fd[0], out + len, outsz - 1 - len);
+        // keep draining once the buffer is full: a child blocked on (or killed by) a closed pipe
+        // would otherwise be reported as faulted
+        int room = outsz - 1 - len;
+        ssize_t got = read(fd[0], room > 0 ? out + len : sink, room > 0 ? (size_t)room : sizeof sink);
         if (got <= 0) break;
-        len += (int)got;
-        if (len >= outsz - 1) break;
+        if (room > 0) len += (int)got; else *truncated = 1;
     }
     out[len] = 0;
     if (*hung) kill(pid, SIGKILL);
@@ -235,12 +280,16 @@ static void print_prefixed(const char *buf) {
 static int driver(const char *self, const struct set *set, int mutate) {
     static char out[8192];
     int counts[4] = {0, 0, 0, 0};   // ok faulted hung failed
+    int mismatches = 0;
     put("ABI-PROBE arch="); put(ARCH); put(" set="); put(set->name); put(" mutate="); putdec(mutate);
+    put(" variant="); put(ABI_VARIANT);
     put(" checks="); putdec(set->n); put(" fault_handler_signature_stripped_by_harness=1"); nl();
     for (int n = 1; n <= set->n; n++) {
-        int status, hung;
+        int status, hung, truncated;
         const char *verdict = "failed";
-        if (run_one(self, set->name, n, mutate, out, sizeof out, &status, &hung)) { out[0] = 0; status = 0; hung = 0; }
+        if (run_one(self, set->name, n, mutate, out, sizeof out, &status, &hung, &truncated)) {
+            out[0] = 0; status = 0; hung = 0; truncated = 0;
+        }
         print_prefixed(out);
         int sig = status & 0x7f, code = (status >> 8) & 0xff;
         char mark[16] = "OKMARK ";
@@ -250,6 +299,9 @@ static int driver(const char *self, const struct set *set, int mutate) {
         if (hung) { verdict = "hung"; counts[2]++; }
         else if (sig && sig != 0x7f) { verdict = "faulted"; counts[1]++; }
         else if (code == 70) { verdict = "faulted"; counts[1]++; }
+        // Darling ends a process whose fault cannot be delivered (a fault inside its signal
+        // trampoline, check 18) with exit status 137: a death, not a result
+        else if (code > 128) { verdict = "faulted"; counts[1]++; }
         else if (code == 0 && contains(out, mark)) { verdict = "ok"; counts[0]++; }
         else counts[3]++;
         put("RESULT "); putnum2(n); put(" "); put(set->t[n - 1].name); put(" "); put(verdict);
@@ -258,14 +310,20 @@ static int driver(const char *self, const struct set *set, int mutate) {
         else { put(" exit="); putdec(code); }
         // A signed pointer whose PAC field is all zero (about 1 in 128 with 7 PAC bits) is a valid
         // plain pointer, so a plain callee can use it: report it, it is not a pass of the ABI.
-        if (!hung && code == 0 && !sig && !mutate && contains(out, mark) && contains(out, "orig_signed=no") &&
-            HAS_PAC)
+        if (!hung && code == 0 && !sig && !mutate && contains(out, mark) &&
+            contains(out, "expect_signed=yes orig_signed=no"))
             put(" pac_field_was_zero=yes");
+        if (truncated) put(" output_truncated=yes");
+        if (set->t[n - 1].expect && !streq(set->t[n - 1].expect, verdict)) {
+            put(" EXPECT-MISMATCH expected="); put(set->t[n - 1].expect); mismatches++;
+        }
         nl();
     }
     put("SUMMARY arch="); put(ARCH); put(" set="); put(set->name); put(" mutate="); putdec(mutate);
     put(" ok="); putdec(counts[0]); put(" faulted="); putdec(counts[1]);
-    put(" hung="); putdec(counts[2]); put(" failed="); putdec(counts[3]); nl();
+    put(" hung="); putdec(counts[2]); put(" failed="); putdec(counts[3]);
+    put(" expect_mismatches="); putdec(mismatches); nl();
+    if (streq(set->name, "selftest")) return mismatches ? 1 : 0;
     return counts[0] == set->n ? 0 : 1;
 }
 
@@ -286,7 +344,8 @@ int main(int argc, char **argv) {
         capture_images();
         return set->t[n - 1].fn();
     }
-    int mutate = argc >= 2 && streq(argv[1], "mutate");
-    set = find_set(argc >= 2 && streq(argv[1], "selftest") ? "selftest" : "checks");
+    int selftest = argc >= 2 && streq(argv[1], "selftest");
+    int mutate = argc >= 2 && (streq(argv[1], "mutate") || (selftest && argc >= 3 && streq(argv[2], "mutate")));
+    set = find_set(selftest ? "selftest" : "checks");
     return driver(argv[0], set, mutate);
 }
