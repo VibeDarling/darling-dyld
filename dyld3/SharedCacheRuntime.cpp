@@ -1732,7 +1732,23 @@ static const char* openSplitTSDTranslation(const SharedCacheLoadInfo& cache)
     if ( memcmp(sSplitTSD.table.uuid(), cache.loadAddress->header.uuid, sizeof(cache.loadAddress->header.uuid)) != 0 )
         return "the TSD site table was made from another cache (UUID differs)";
     sSplitTSD.patcher = new darling_tsd::Patcher(sSplitTSD.table, (uintptr_t)cache.loadAddress, sys_thread_get_native_tsd_slot_offset());
-    if ( const char* error = sSplitTSD.patcher->init() )
+    // the cache's executable mappings: the only memory the translation may write
+    static const uint32_t kMaxRanges = 64;
+    darling_tsd::ExecutableRange ranges[kMaxRanges];
+    darling_tsd::ExecutableRange* const rangesOut = ranges;
+    __block uint32_t rangeCount = 0;
+    __block bool tooMany = false;
+    cache.loadAddress->forEachRegion(^(const void*, uint64_t vmAddr, uint64_t size, uint32_t initProt, uint32_t, uint64_t) {
+        if ( (initProt & VM_PROT_EXECUTE) == 0 )
+            return;
+        if ( rangeCount == kMaxRanges )
+            tooMany = true;
+        else
+            rangesOut[rangeCount++] = { (uintptr_t)vmAddr, (uintptr_t)size };
+    });
+    if ( tooMany )
+        return "the cache has more executable mappings than the TSD translation tracks";
+    if ( const char* error = sSplitTSD.patcher->init(ranges, rangeCount) )
         return error;
     sSplitTSD.memory = new darling_tsd::ProcSelfMemory();
     if ( !sSplitTSD.memory->ok() )

@@ -126,16 +126,36 @@ Patcher::~Patcher()
 {
     free(used);
     free(done);
+    free(executable);
 }
 
-const char* Patcher::init()
+bool Patcher::inExecutable(uintptr_t address, size_t length) const
+{
+    for (uint32_t i = 0; i != executableCount; ++i) {
+        if ( (address >= executable[i].start) && (address - executable[i].start <= executable[i].size)
+          && (length <= executable[i].size - (address - executable[i].start)) )
+            return true;
+    }
+    return false;
+}
+
+const char* Patcher::init(const ExecutableRange* ranges, uint32_t rangeCount)
 {
     if ( !isValidSlotOffset(slot) )
-        return "the native TSD slot offset is not usable";
+        return "the native loader names no usable TSD slot (it must publish darling_tsd_slot_offset)";
+    if ( (ranges == nullptr) || (rangeCount == 0) )
+        return "no executable cache mapping to translate";
     used = (uint32_t*)calloc(table.gapCount() + 1, sizeof(uint32_t));
     done = (uint8_t*)calloc(table.imageCount() + 1, 1);
-    if ( (used == nullptr) || (done == nullptr) )
+    executable = (ExecutableRange*)malloc(rangeCount * sizeof(ExecutableRange));
+    if ( (used == nullptr) || (done == nullptr) || (executable == nullptr) )
         return "out of memory for the TSD translation state";
+    memcpy(executable, ranges, rangeCount * sizeof(ExecutableRange));
+    executableCount = rangeCount;
+    for (uint32_t i = 0; i != table.gapCount(); ++i) {
+        if ( !inExecutable(cacheBase + table.gap(i).start, table.gap(i).size) )
+            return "TSD site table has a gap outside the cache's executable mappings";
+    }
     return nullptr;
 }
 
@@ -200,8 +220,8 @@ const char* Patcher::patchImage(uintptr_t machHeader, const Memory& memory, Patc
     PatchStats stats = {};
     if ( statsOut != nullptr )
         *statsOut = stats;
-    if ( machHeader < cacheBase )
-        return "TSD translation: image lies outside the cache";
+    if ( (machHeader < cacheBase) || !inExecutable(machHeader, 1) )
+        return "TSD translation: image lies outside the cache's executable mappings";
     uint32_t index = 0;
     const ImageRecord* image = table.findImage(machHeader - cacheBase, &index);
     if ( image == nullptr )
@@ -216,6 +236,8 @@ const char* Patcher::patchImage(uintptr_t machHeader, const Memory& memory, Patc
     for (uint32_t k = 0; k != count; ++k) {
         const uintptr_t address = machHeader + siteOffset(sites[k]);
         uint32_t word[2] = { 0, 0 };
+        if ( !inExecutable(address, (siteKind(sites[k]) == kCPUIndexRead) ? 8 : 4) )
+            return "TSD site table has a site outside the cache's executable mappings";
         if ( !memory.read(memory.context, address, word, (siteKind(sites[k]) == kCPUIndexRead) ? 8 : 4) )
             return "TSD translation: could not read a site";
         if ( word[0] != (kMRSTPIDRRO | siteRegister(sites[k])) )

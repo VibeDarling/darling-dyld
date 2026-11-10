@@ -83,6 +83,12 @@ struct Scenario {
     }
 };
 
+static std::vector<ExecutableRange> rangesOf(const ModelMemory& m) {
+    std::vector<ExecutableRange> r;
+    for (const ModelMemory::Region& region : m.regions) r.push_back({ region.start, region.bytes.size() });
+    return r;
+}
+
 struct Run {
     SiteTable table;
     Patcher* patcher = nullptr;
@@ -93,7 +99,8 @@ struct Run {
         const char* parseError = s.builder.parse(table);
         if ( parseError ) { fprintf(stderr, "scenario table refused: %s\n", parseError); ++failures; }
         patcher = new Patcher(table, kBase, kSlot);
-        const char* initError = patcher->init();
+        std::vector<ExecutableRange> ranges = rangesOf(s.memory);
+        const char* initError = patcher->init(ranges.data(), (uint32_t)ranges.size());
         if ( initError ) { fprintf(stderr, "init: %s\n", initError); ++failures; }
         error = patcher->patchImage(image, s.memory.memory(), &stats);
     }
@@ -160,7 +167,7 @@ static void testRefusals() {
     {   Scenario s; s.addSite(0x100, kTSDRead, 9);                  // no gap at all: the trap stays
         Run r; r.run(s); CHECK(r.error == nullptr && r.stats.trapped == 1 && s.memory.word(kBase + 0x100) == 0xDA09U); }
     {   Scenario s; s.addGap(0x800, 0x100);
-        SiteTable table; s.builder.parse(table); Patcher bad(table, kBase, 0x171); CHECK(bad.init() != nullptr); }
+        SiteTable table; s.builder.parse(table); Patcher bad(table, kBase, 0x171); ExecutableRange any = { kBase, 0x1000 }; CHECK(bad.init(&any, 1) != nullptr); }
 }
 
 static void testPlacement() {
@@ -224,7 +231,7 @@ static void testReach() {
         m.setWord(kBase + imageB + siteB, kMRSTPIDRRO | 9);
         m.addRegion(kBase + below[i], 0x40, 0);
         SiteTable table; CHECK(b.parse(table) == nullptr);
-        Patcher p(table, kBase, kSlot); CHECK(p.init() == nullptr);
+        Patcher p(table, kBase, kSlot); std::vector<ExecutableRange> ranges = rangesOf(m); CHECK(p.init(ranges.data(), (uint32_t)ranges.size()) == nullptr);
         PatchStats st;
         CHECK(p.patchImage(kBase + imageB, m.memory(), &st) == nullptr && (st.veneers == 1) == reaches[i]);
     }
@@ -261,7 +268,8 @@ static void testMany() {
     SiteTable table;
     CHECK(b.parse(table) == nullptr);
     Patcher patcher(table, kBase, kSlot);
-    CHECK(patcher.init() == nullptr);
+    std::vector<ExecutableRange> ranges = rangesOf(m);
+    CHECK(patcher.init(ranges.data(), (uint32_t)ranges.size()) == nullptr);
     uint32_t veneers = 0, trapped = 0;
     for (uint32_t i = 0; i != images; ++i) {
         PatchStats st;
@@ -295,10 +303,58 @@ static void testMany() {
     CHECK(disjoint && checked == veneers);
 }
 
+// Writes go through /proc/self/mem, which ignores protections: a table must not name memory outside the executable
+// mappings of the cache.
+static void testExecutableRanges() {
+    {   Scenario s; s.addSite(0x100, kTSDRead, 9); s.addGap(0x800, 0x100);
+        SiteTable table; CHECK(s.builder.parse(table) == nullptr);
+        Patcher p(table, kBase, kSlot);
+        ExecutableRange gapMissing = { kBase, 0x800 };
+        const char* e = p.init(&gapMissing, 1); CHECK(e && strstr(e, "gap")); }
+    {   Scenario s; s.addSite(0x100, kTSDRead, 9); s.addGap(0x800, 0x100);
+        SiteTable table; CHECK(s.builder.parse(table) == nullptr);
+        Patcher p(table, kBase, kSlot);
+        ExecutableRange gapPartly = { kBase + 0x800, 0xFC };                    // one word short
+        const char* e = p.init(&gapPartly, 1); CHECK(e && strstr(e, "gap")); }
+    {   Scenario s; s.addSite(0x100, kTSDRead, 9); s.addGap(0x800, 0x100);
+        SiteTable table; CHECK(s.builder.parse(table) == nullptr);
+        Patcher p(table, kBase, kSlot);
+        const char* e = p.init(nullptr, 0); CHECK(e && strstr(e, "no executable")); }
+    {   Scenario s; s.addSite(0x100, kTSDRead, 9); s.addGap(0x800, 0x100);     // the site is outside: nothing is written
+        SiteTable table; CHECK(s.builder.parse(table) == nullptr);
+        Patcher p(table, kBase, kSlot);
+        ExecutableRange ranges[2] = { { kBase, 0x100 }, { kBase + 0x800, 0x100 } };   // ends one word before the site's end
+        CHECK(p.init(ranges, 2) == nullptr);
+        PatchStats st;
+        const char* e = p.patchImage(kBase, s.memory.memory(), &st); CHECK(e && strstr(e, "site outside") && s.memory.writes.empty()); }
+    {   Scenario s; s.addSite(0x100, kTSDRead, 9); s.addGap(0x800, 0x100);     // the site's last word is the range's last word
+        SiteTable table; CHECK(s.builder.parse(table) == nullptr);
+        Patcher p(table, kBase, kSlot);
+        ExecutableRange ranges[2] = { { kBase, 0x104 }, { kBase + 0x800, 0x100 } };
+        CHECK(p.init(ranges, 2) == nullptr);
+        PatchStats st;
+        CHECK(p.patchImage(kBase, s.memory.memory(), &st) == nullptr && st.veneers == 1); }
+    {   Scenario s; s.addSite(0x100, kTSDRead, 9); s.addGap(0x800, 0x100);     // the image header is outside
+        SiteTable table; CHECK(s.builder.parse(table) == nullptr);
+        Patcher p(table, kBase, kSlot);
+        ExecutableRange ranges[2] = { { kBase + 0x100, 0x100 }, { kBase + 0x800, 0x100 } };
+        CHECK(p.init(ranges, 2) == nullptr);
+        PatchStats st;
+        const char* e = p.patchImage(kBase, s.memory.memory(), &st); CHECK(e && strstr(e, "outside") && s.memory.writes.empty()); }
+    {   Scenario s; s.addSite(0x100, kCPUIndexRead, 9); s.addGap(0x800, 0x100);   // a CPU-index read needs its second word inside too
+        SiteTable table; CHECK(s.builder.parse(table) == nullptr);
+        Patcher p(table, kBase, kSlot);
+        ExecutableRange ranges[2] = { { kBase, 0x104 }, { kBase + 0x800, 0x100 } };
+        CHECK(p.init(ranges, 2) == nullptr);
+        PatchStats st;
+        const char* e = p.patchImage(kBase, s.memory.memory(), &st); CHECK(e && strstr(e, "site outside") && s.memory.writes.empty()); }
+}
+
 void testPatcher() {
     testBasic();
     testRefusals();
     testPlacement();
     testReach();
     testMany();
+    testExecutableRanges();
 }

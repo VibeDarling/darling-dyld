@@ -93,7 +93,8 @@ int main(int argc, char** argv) {
     for (auto& w : words) { model.siteAddress.push_back(w.first); model.siteWord.push_back(w.second); }
 
     Patcher patcher(table, base, 0x170);
-    if ( const char* error = patcher.init() ) { printf("init: %s\n", error); return 1; }
+    const ExecutableRange everything = { base, (uintptr_t)1 << 40 };     // the model has no mappings to bound it
+    if ( const char* error = patcher.init(&everything, 1) ) { printf("init: %s\n", error); return 1; }
     Memory memory = { &model, Model::read, Model::write, Model::sync };
     PatchStats sum = {};
     for (uint64_t offset : imageOffsets) {

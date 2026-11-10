@@ -90,14 +90,19 @@ struct PatchStats {
     uint32_t trapped;       // no gap in reach: left as `udf #0xDA00|reg`, handled by the kernel trap emulator
 };
 
+// An address range of the cache that is mapped executable. The patcher writes only inside these.
+struct ExecutableRange { uintptr_t start; uintptr_t size; };
+
 class Patcher {
 public:
     Patcher(const SiteTable& table, uintptr_t cacheBase, unsigned long slotOffset);
     ~Patcher();
     Patcher(const Patcher&) = delete;
     Patcher& operator=(const Patcher&) = delete;
-    // Null when usable, otherwise a static message.
-    const char* init();
+    // Null when usable, otherwise a static message. `ranges` are the cache's executable mappings: every gap of the
+    // table must lie inside one, and so must every image and site later, because writes through /proc/self/mem
+    // ignore page protections and a stale table must not be able to write anywhere else.
+    const char* init(const ExecutableRange* ranges, uint32_t rangeCount);
     // Translates every site of the image whose mach header is at `machHeader`. Every site is checked against
     // the table before anything is written; an image the table does not list, a site that does not hold the
     // expected instruction and a gap that is not zero are errors. Safe to call twice for one image. An error
@@ -106,6 +111,7 @@ public:
     const char* patchImage(uintptr_t machHeader, const Memory& memory, PatchStats* stats);
     uint32_t    bytesUsed(uint32_t gapIndex) const { return used[gapIndex]; }
 private:
+    bool        inExecutable(uintptr_t address, size_t length) const;
     bool        nextWithRoom(int64_t* index, int step, uintptr_t* address) const;
     int         placeVeneer(uintptr_t site) const;
     const SiteTable& table;
@@ -113,6 +119,8 @@ private:
     unsigned long slot;
     uint32_t*   used = nullptr;
     uint8_t*    done = nullptr;
+    ExecutableRange* executable = nullptr;
+    uint32_t    executableCount = 0;
 };
 
 // Memory that reads in place and writes through /proc/self/mem, so a page that holds a neighbour's running code is
@@ -130,7 +138,8 @@ private:
 };
 
 // Disk images (plain arm64, text mapped writable): `mrs Xt, TPIDRRO_EL0; and Xt, Xt, #imm` (the pthread_self shape)
-// becomes `mrs Xt, TPIDR_EL0; ldr Xt, [Xt, #slotOffset]`. A lone mrs becomes `mrs Xt, TPIDR_EL0` as before.
+// becomes `mrs Xt, TPIDR_EL0; ldr Xt, [Xt, #slotOffset]`. A lone mrs becomes `mrs Xt, TPIDR_EL0` as before, which
+// reads the Linux thread pointer, not the TSD base, and reports nothing (known issue, not changed here).
 // Returns false, after rewriting everything else, when a read needs the slot and `slotOffset` is not usable.
 bool rewriteDiskTSDReads(uint32_t* instructions, size_t count, unsigned long slotOffset, size_t* rewritten);
 

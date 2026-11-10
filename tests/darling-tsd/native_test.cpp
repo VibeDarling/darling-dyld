@@ -125,7 +125,9 @@ static void testNative() {
 
     Fixture f;
     Patcher patcher(f.table, kBase, slotOffset);
-    CHECK(patcher.init() == nullptr);
+    ExecutableRange ranges[3];
+    for (int i = 0; i != 3; ++i) ranges[i] = { kBase + kRegionOffsets[i], (size_t)sysconf(_SC_PAGESIZE) };
+    CHECK(patcher.init(ranges, 3) == nullptr);
 
     // a thread runs code in the page that is being patched, so protections must never change
     volatile unsigned char started = 0;

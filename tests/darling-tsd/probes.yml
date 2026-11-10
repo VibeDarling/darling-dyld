@@ -29,7 +29,6 @@
 - {name: veneers not accounted, file: DarlingTSDIslands.cpp, from: "        used[gap] += kVeneerBytes;\n", to: ""}
 - {name: farther gap preferred, file: DarlingTSDIslands.cpp, from: "site - leftAddress <= rightAddress - site", to: "site - leftAddress > rightAddress - site"}
 - {name: tie goes up, file: DarlingTSDIslands.cpp, from: "site - leftAddress <= rightAddress - site", to: "site - leftAddress < rightAddress - site"}
-- {name: reach not checked, file: DarlingTSDIslands.cpp, from: "return veneerReaches(site, leftAddress) ? (int)left : -1;", to: "return (int)left;"}
 - {name: return branch not part of the reach, file: DarlingTSDIslands.cpp, from: "    encodeBranch(veneer + 16, site + 4, &ok);\n    return ok;", to: "    return ok;"}
 - {name: outward branch not part of the reach, file: DarlingTSDIslands.cpp, from: "    encodeBranch(site, veneer, &ok);\n    encodeBranch(veneer", to: "    encodeBranch(veneer"}
 - {name: left scan walks the wrong way, file: DarlingTSDIslands.cpp, from: "nextWithRoom(&left, -1, &leftAddress)", to: "nextWithRoom(&left, +1, &leftAddress)"}
@@ -48,8 +47,6 @@
 - {name: veneer returns to the site itself, file: DarlingTSDIslands.cpp, from: "encodeBranch(veneer + 16, site + 4, ok)", to: "encodeBranch(veneer + 16, site, ok)"}
 - {name: veneer skips the trap word wrongly, file: DarlingTSDIslands.cpp, from: "0xB5000040U | reg", to: "0xB5000060U | reg"}
 - {name: writer opens the file read only, file: DarlingTSDIslands.cpp, from: "O_RDWR | O_CLOEXEC", to: "O_RDONLY | O_CLOEXEC"}
-# Not killable on the host, by design: a short pwrite on /proc/self/mem cannot be provoked, and this CPU runs the
-# translated code correctly without the `ic ivau` of procSync (its instruction fetch is coherent with the kernel's copy).
 - {name: gap larger than 4 GiB accepted, file: DarlingTSDIslands.cpp, from: "(g[i].size > UINT32_MAX) || (g[i].start + g[i].size < g[i].start)", to: "(g[i].start + g[i].size < g[i].start)"}
 - {name: wrapping gap accepted, file: DarlingTSDIslands.cpp, from: "(g[i].size > UINT32_MAX) || (g[i].start + g[i].size < g[i].start)", to: "(g[i].size > UINT32_MAX)"}
 - {name: wrapping site accepted, file: DarlingTSDIslands.cpp, from: "            if ( address < r.imageOffset )\n                return \"TSD site table site wraps\";", to: ""}
@@ -61,3 +58,12 @@
 - {name: disk rewrite uses a bad slot, file: DarlingTSDIslands.cpp, from: "        if ( !isValidSlotOffset(slotOffset) ) {\n            complete = false;", to: "        if ( false ) {\n            complete = false;"}
 - {name: disk rewrite leaves the mrs, file: DarlingTSDIslands.cpp, from: "        instructions[k] = 0xD53BD040U | reg;                                    // mrs Xt, TPIDR_EL0", to: ""}
 - {name: disk rewrite counts nothing, file: DarlingTSDIslands.cpp, from: "        ++*rewritten;\n", to: ""}
+- {name: gaps not checked against the executable mappings, file: DarlingTSDIslands.cpp, from: "        if ( !inExecutable(cacheBase + table.gap(i).start, table.gap(i).size) )", to: "        if ( false )"}
+- {name: sites not checked against the executable mappings, file: DarlingTSDIslands.cpp, from: "        if ( !inExecutable(address, (siteKind(sites[k]) == kCPUIndexRead) ? 8 : 4) )", to: "        if ( false )"}
+- {name: image not checked against the executable mappings, file: DarlingTSDIslands.cpp, from: "(machHeader < cacheBase) || !inExecutable(machHeader, 1)", to: "(machHeader < cacheBase)"}
+- {name: a CPU-index read checked as one word, file: DarlingTSDIslands.cpp, from: "inExecutable(address, (siteKind(sites[k]) == kCPUIndexRead) ? 8 : 4)", to: "inExecutable(address, 4)"}
+- {name: range end off by one word, file: DarlingTSDIslands.cpp, from: "(length <= executable[i].size - (address - executable[i].start))", to: "(length < executable[i].size - (address - executable[i].start))"}
+- {name: no range accepted, file: DarlingTSDIslands.cpp, from: "    if ( (ranges == nullptr) || (rangeCount == 0) )", to: "    if ( false )"}
+- {name: reach not checked, file: DarlingTSDIslands.cpp, from: "return veneerReaches(site, leftAddress) ? (int)left : -1;", to: "return (int)left;"}
+# Not killable on the host, by design: a short pwrite on /proc/self/mem cannot be provoked, and this CPU runs the
+# translated code correctly without the `ic ivau` of procSync (its instruction fetch is coherent with the kernel's copy).
