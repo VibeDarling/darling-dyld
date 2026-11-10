@@ -143,6 +143,9 @@ extern "C" int __fork();
 #include "Loading.h"
 #include "DyldSharedCache.h"
 #include "SharedCacheRuntime.h"
+#ifdef DARLING
+#include "DarlingArm64eAdapters.h"
+#endif
 #include "StringUtils.h"
 #include "Tracing.h"
 #include "ClosureBuilder.h"
@@ -1798,7 +1801,9 @@ static void overrideSplitCacheGotSlots()
 			const ImageLoader* foundIn;
 			uintptr_t found;
 			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) ) {
-				*address = found;
+				// the importer is a cache image, which is arm64e; a callback-taking export of a plain image gets a thunk. found is
+				// the exporter's own definition, so unlike a resolved bind it can never be an interposer's address
+				*address = dyld3::darling::adaptedTarget(symbol, found, dyld3::darling::cpusubtypeIsArm64e(foundIn->machHeader()->cpusubtype));
 				if ( verbose )
 					dyld::log("dyld: patched %s %s -> %s\n", installPath, symbol, foundIn->getPath());
 				return true;
@@ -2361,6 +2366,11 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	// A restricted process must not choose which cache it maps, so this needs the path permission as well.
 	else if ( (strcmp(key, "DYLD_SHARED_CACHE_SPLIT_DIR") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
 		sSharedCacheSplitDir = value;
+	}
+	// gated like DYLD_SHARED_CACHE_SPLIT_DIR: a restricted process must not choose how its imports are bound
+	else if ( (strcmp(key, "DYLD_DARLING_ARM64E_ADAPTERS") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
+		// "off" binds the raw targets to arm64e importers again, to show what the adapters change; "report" also names the imports with no row
+		dyld3::darling::setAdapterMode(strcmp(value, "off") == 0 ? dyld3::darling::AdapterMode::Off : (strcmp(value, "report") == 0 ? dyld3::darling::AdapterMode::Report : dyld3::darling::AdapterMode::On));
 	}
 #endif
 	else if ( strcmp(key, "DYLD_USE_CLOSURES") == 0 ) {

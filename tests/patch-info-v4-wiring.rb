@@ -17,7 +17,7 @@ runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
 runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
 override_fn = dyld2[/^static struct \{ uint64_t patched, missing, unexplained; \} sSplitCachePatchTotals;.*?^static void overrideSplitCacheGotSlots\(\).*?^\}/m] or abort 'overrideSplitCacheGotSlots missing'
 record_struct = dyld2_h[/^\tstruct DiskOverrideOfCacheImage \{.*?^\t\};/m] or abort 'DiskOverrideOfCacheImage missing'
-allow_list = runtime[/^\/\/ libz is a leaf library.*?^bool sharedCachePathIsAllowListed\(.*?^\}/m] or abort 'allow-list code missing'
+allow_list = runtime[/^static const char\* const kSharedCacheServedOverDisk\[\].*?^bool sharedCachePathIsAllowListed\(.*?^\}/m] or abort 'allow-list code missing'
 allow_decl = runtime_h[/^struct SharedCacheAllowList \{.*?^\};/m] or abort 'SharedCacheAllowList missing'
 
 # The hook: at the end of link() (under dyld's lock), after the image and everything it needs are linked, and nowhere else.
@@ -56,7 +56,14 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       #{allow_decl}
       #{allow_list}
       struct SharedCacheLoadInfo { const struct ::DyldSharedCache* loadAddress; };
+      // The adapters themselves are tested in darling-arm64e-adapters*.rb; here only what the override hands them and what it stores.
+      namespace darling {
+        const uint64_t kThunkBit = 1ull << 40;
+        inline bool cpusubtypeIsArm64e(int subtype) { return subtype == 2; }
+        inline uint64_t adaptedTarget(const char *symbol, uint64_t target, bool targetIsArm64e) { return targetIsArm64e ? target : target | kThunkBit; }
+      }
     }
+    struct mach_header { int cpusubtype; };
     // The cache: which images it has, whether it has version 4 patch info, and what overridePatchGotSlots does.
     struct DyldSharedCache {
       struct PatchOverrideStats { uint64_t exports, slots, patched, unexplained, missingExports, missingSlots; bool alreadyApplied; };
@@ -85,15 +92,17 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     };
     struct ImageLoader {
       struct LinkContext { bool verboseMapping = false; };
-      std::string install, path; bool inCache = false; std::map<std::string, uintptr_t> exports;
+      std::string install, path; bool inCache = false; mach_header header = {1}; std::map<std::string, uintptr_t> exports; std::map<std::string, const ImageLoader*> reexportedFrom;
       const char *getInstallPath() const { return install.c_str(); }
       const char *getPath() const { return path.c_str(); }
       bool inSharedCache() const { return inCache; }
+      const mach_header *machHeader() const { return &header; }
       // the real lookup is ImageLoader::findExportedSymbolAddress (searchReExports, resolvers run for a GOT pointer)
       bool findExportedSymbolAddress(const LinkContext &, const char *name, const ImageLoader *requestor, int ordinal, bool runResolver, const ImageLoader **foundIn, uintptr_t *address) const {
         if (requestor != nullptr || ordinal != -1 || !runResolver) return false;
         auto it = exports.find(name); if (it == exports.end()) return false;
-        *foundIn = this; *address = it->second; return true;
+        auto via = reexportedFrom.find(name);
+        *foundIn = via == reexportedFrom.end() ? this : via->second; *address = it->second; return true;
       }
     };
     namespace dyld {
@@ -142,7 +151,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       shadow("/usr/lib/libz.1.dylib", 3);
       overrideSplitCacheGotSlots();
       CHECK(cache.calls == std::vector<uint32_t>{1});
-      CHECK(cache.lastAddress.size() == 2 && cache.lastAddress["_open"] == 0x1000 && cache.lastAddress["_close"] == 0x2000);   // the loaded image's addresses
+      CHECK(cache.lastAddress.size() == 2 && cache.lastAddress["_open"] == (0x1000 | dyld3::darling::kThunkBit) && cache.lastAddress["_close"] == (0x2000 | dyld3::darling::kThunkBit));   // the loaded image's addresses, through the adapters for a plain exporter
       CHECK(logged.empty());                                              // a symbol Darling lacks is normal: no line without the verbose mapping option
 
       // --- a second pass (the next link) does not count the same exporter twice, a new one is added ---
@@ -177,6 +186,23 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       for (const std::string &l : logged) { sawMissing |= l.find("_nosuchsymbol") != std::string::npos && l.find("does not export") != std::string::npos; patchedLines += l.rfind("dyld: patched ", 0) == 0; }
       CHECK(sawMissing && patchedLines == 2 && summaries() == 1);
       gLinkContext.verboseMapping = false;
+
+      // --- the exporter's own cpu subtype decides whether the adapters wrap the target: an arm64e exporter is bound as it is ---
+      reset(cache); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+      ImageLoader *signedKernel = image("/usr/lib/system/libsystem_kernel.dylib"); signedKernel->header.cpusubtype = 2;
+      sAllImages.push_back(signedKernel); sDiskOverridesOfCacheImages.push_back({signedKernel, 1});
+      overrideSplitCacheGotSlots();
+      CHECK(cache.lastAddress.size() == 2 && cache.lastAddress["_open"] == 0x1000 && cache.lastAddress["_close"] == 0x2000);
+      reset(cache); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true)); shadow("/usr/lib/system/libsystem_kernel.dylib", 1);
+      overrideSplitCacheGotSlots();
+      CHECK(cache.lastAddress["_open"] == (0x1000 | dyld3::darling::kThunkBit));   // the control: the same exporter as a plain image
+      // a symbol the recorded image re-exports belongs to the image that defines it, and its subtype is the one that counts
+      reset(cache); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+      ImageLoader *definer = image("/usr/lib/system/libsystem_c.dylib"); definer->header.cpusubtype = 2;
+      ImageLoader *facade = image("/usr/lib/system/libsystem_kernel.dylib"); facade->reexportedFrom["_close"] = definer;
+      sAllImages.push_back(facade); sDiskOverridesOfCacheImages.push_back({facade, 1});
+      overrideSplitCacheGotSlots();
+      CHECK(cache.lastAddress["_open"] == (0x1000 | dyld3::darling::kThunkBit) && cache.lastAddress["_close"] == 0x2000);
 
       // --- a reader error halts, naming the exporter and the reason ---
       reset(cache);

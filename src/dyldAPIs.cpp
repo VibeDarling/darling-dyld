@@ -55,13 +55,16 @@
 #include "dyldLibSystemInterface.h"
 #include "DyldSharedCache.h"
 #include "MachOFile.h"
+#ifdef DARLING
+#include "DarlingArm64eAdapters.h"
+#endif
 
 #undef _POSIX_C_SOURCE
 #include <dlfcn.h>
 
 #if __has_feature(ptrauth_calls)
 	#define DARLING_DLSYM_SIGN(p) __builtin_ptrauth_sign_unauthenticated(p, ptrauth_key_asia, 0)
-	#define DARLING_DLSYM_SIGN_FOR_CALLER(p, callerAddress) DARLING_DLSYM_SIGN(p)
+	#define DARLING_DLSYM_SIGN_FOR_CALLER(p, callerAddress, machoName) DARLING_DLSYM_SIGN(p)
 #elif defined(DARLING) && defined(__arm64__) && defined(__LP64__)
 	// DARLING arm64e compat: arm64e code calls dlsym results with BLRAA (IA key, zero discriminator), so sign
 	// them with the same software PAC helper dyld uses for chained fixups.
@@ -70,14 +73,18 @@
 	// Darling's own libraries are plain arm64 even in an arm64e process, and call a dlsym result with a
 	// plain BLR, which faults on a signed pointer. So only sign for callers in arm64e images; code outside
 	// any Mach-O image (e.g. Darling's ELF side) gets the plain pointer too.
-	static void* darlingDlsymSignForCaller(void* result, void* callerAddress)
+	static void* darlingDlsymSignForCaller(void* result, void* callerAddress, const char* machoName)
 	{
 		const ImageLoader* callerImage = dyld::findImageContainingAddress(callerAddress);
-		if ( (callerImage == NULL) || ((callerImage->machHeader()->cpusubtype & ~CPU_SUBTYPE_MASK) != CPU_SUBTYPE_ARM64E) )
+		if ( (callerImage == NULL) || !dyld3::darling::cpusubtypeIsArm64e(callerImage->machHeader()->cpusubtype) )
 			return result;
+		// a callback-taking export of a plain image is handed out as the thunk that authenticates the caller's signatures
+		const ImageLoader* resultImage = dyld::findImageContainingAddress(result);
+		if ( resultImage != NULL )
+			result = (void*)dyld3::darling::adaptedTarget(machoName, (uint64_t)result, dyld3::darling::cpusubtypeIsArm64e(resultImage->machHeader()->cpusubtype));
 		return DARLING_DLSYM_SIGN(result);
 	}
-	#define DARLING_DLSYM_SIGN_FOR_CALLER(p, callerAddress) darlingDlsymSignForCaller(p, callerAddress)
+	#define DARLING_DLSYM_SIGN_FOR_CALLER(p, callerAddress, machoName) darlingDlsymSignForCaller(p, callerAddress, machoName)
 #endif
 
 #if __has_feature(ptrauth_calls)
@@ -1901,7 +1908,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress);
+					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress, underscoredName);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -1935,7 +1942,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress);
+					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress, underscoredName);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -1981,7 +1988,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress);
+					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress, underscoredName);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -2026,7 +2033,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress);
+					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress, underscoredName);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -2077,7 +2084,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress);
+					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress, underscoredName);
 			}
 #endif
 			if ( dyld::gLogAPIs )
