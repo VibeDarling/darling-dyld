@@ -2,8 +2,9 @@
 
 Rung L2 of the shared-cache ladder. No shared cache is involved. One arm64e executable
 (`abi_probe_arm64e`, built with the 3.3a recipe) hands PAC-signed pointers to Darling's plain
-arm64 libSystem family, libc++abi and libunwind, and reports for each of 20 numbered checks
-whether the callee could use them. The same sources built as plain arm64 are the control. The
+arm64 libSystem family, libc++abi and libunwind, and reports for each of 32 numbered checks
+whether the callee could use them. Checks 01-20 are the measurement; 21-32 exercise the PAC-aware
+libunwind and carry an expected verdict. The same sources built as plain arm64 are the control. The
 result decides whether cache-served arm64e libraries can run on Darling's libs with per-API
 adapters (ADAPTER) or need arm64e rebuilds of those libs (REBUILD).
 
@@ -22,7 +23,7 @@ The link-only `libc++abi.*.linkonly.dylib` stubs are never installed (see `../h0
 ## Files
 
 - `abi_decl.h`: local declarations (the Darling SDK header symlinks do not resolve outside its build tree).
-- `abi_harness.[ch]`: output, fault handler, driver, self-test. `abi_checks.c`: the 20 checks. `abi_cxx.cpp`: the C++ ones.
+- `abi_harness.[ch]`: output, fault handler, driver, self-test. `abi_checks.c`: the 32 checks. `abi_cxx.cpp`: the C++ ones.
 - `build_abi.py`: builds `abi_probe_arm64e`, `abi_probe_arm64` (control) and four arm64e variants, then checks their structure.
 - `run_guest.sh`, `run_matrix.sh`, `tally.py`: the guest runner (shared lock, memory cap) and the per-variant tally.
 - `arm64e-abi-probe.rb`, `symbolize_faults.py`, `libcxxabi_symbols.txt`.
@@ -45,11 +46,20 @@ One limit: a fault in a TSD destructor at thread exit is a SIGSEGV kill with no 
 signal-trampoline death, check 18: 137) counts as `faulted`. A child that writes more than the
 driver's buffer is drained and flagged `output_truncated=yes`, not killed by SIGPIPE.
 
-PAC collision: a signed pointer whose PAC field is all zero is a valid plain pointer (7 PAC bits,
-about 1 in 128 per signing). An `ok` on a pointer the compiler signed (`HAND ... expect_signed=yes
-orig_signed=no`) is flagged `pac_field_was_zero=yes` and is not a pass; the flag cannot fire in a
-build that signs nothing (`nosign`, the control). The personality slot cannot be inspected, so a
-rare `ok` of a C++ check in a signed build may be a collision too; the tables count runs.
+Expectations: checks 21-23 and 29-30 expect `ok`; the negative checks 24-28 and 31-32 expect
+`faulted`, because the unwinder must reject the corrupted value. The driver compares these in the
+reference arm64e build only (unmutated); there a mismatch prints `EXPECT-MISMATCH`, increments the
+`expect_mismatches=` count and sets the run's exit status to 1. Checks 01-20 carry no expectation:
+their verdicts are the data. The control and the signing variants have no signature to corrupt, so
+their negative checks report `ok` and the expectations do not apply there.
+
+PAC collision: a signed pointer whose PAC field is all zero is a valid plain pointer. An `ok` on a
+pointer the compiler signed (`HAND ... expect_signed=yes orig_signed=no`) is flagged
+`pac_field_was_zero=yes`; it is neither a pass nor a failure of the unwinder (there was no
+signature to authenticate), and the driver does not count it as an `EXPECT-MISMATCH`. Checks
+21-23 hand their pointers through `hand()`, and 24-27 and 29-32 record the original signed pointer,
+so the flag covers them; the personality slot (28) cannot be inspected, so a collision there is
+invisible and a rare `ok` of a C++ check in a signed build may be one too; the tables count runs.
 
 ## Variants (the mutation probes)
 
@@ -64,26 +74,49 @@ rare `ok` of a C++ check in a signed build may be a collision too; the tables co
 
 Added for the PAC-aware Darling libunwind (VibeDarling/darling-libunwind). They exercise libunwind with
 function pointers and frames the arm64e executable signs, and corrupt the signature to show that the
-unwinder authenticates instead of stripping. Expected results are for a libunwind that authenticates;
-against the unmodified one, 29 fails, 30 faults and 32 is `ok` (the unsigned return address resumes).
+unwinder authenticates instead of stripping. The positive checks 21-23 prove only that libunwind can
+call a signed callback; a stripping unwinder calls it too, so the discriminating checks are the
+negative ones: 24-28, 31 and 32 must end `faulted`, and a strip in their place makes them fail.
+
+The DWARF fixture (29-32) hand-writes a frame whose CFI states, in the convention open-source libunwind
+implements, what the frame does: the CIE's `B` augmentation marks the return address as signed with the
+B key (`DwarfParser.hpp`: `B` -> `addressesSignedWithBKey`), and the FDE's first instruction
+`DW_CFA_AARCH64_negate_ra_state` sets the RA sign state (`DwarfInstructions.hpp`: `autib1716` with the
+CFA when it is set). `pacibsp` signs with SP, and the frame's CFA equals its entry SP, so the modifier
+agrees. `.cfi_b_key_frame` and `.cfi_negate_ra_state` emit exactly those two facts; the DWARF unwind
+mode itself is not forced by CFI but by the frame being inline asm, so the linker emits the DWARF-mode
+compact encoding for it. `build_abi.py` asserts all three structurally on the reference build: the
+function's compact encoding is `UNWIND_ARM64_MODE_DWARF`, the CIE augmentation contains `B`, and the
+FDE's first opcode is `0x2d`.
 
 | # | check | what it does | arm64e expectation |
 |---|---|---|---|
-| 21 | x_unwind_delete_exception_cleanup | `_Unwind_DeleteException` on an exception whose `exception_cleanup` the compiler signed (IA, discriminator 0) | ok |
-| 22 | x_unwind_backtrace_callback | `_Unwind_Backtrace` with a signed trace function | ok |
-| 23 | x_unwind_forced_stop_callback | `_Unwind_ForcedUnwind` with a signed stop function | ok |
-| 24 | neg_corrupt_return_address | flip a PAC bit in the saved lr of the throwing frame, then throw | faulted (terminate) |
-| 25-27 | neg_corrupt_* | flip a PAC bit in the cleanup, trace or stop pointer | faulted |
-| 28 | neg_corrupt_personality_slot | flip a PAC bit in the personality GOT slot (found through `__unwind_info`), then throw | faulted |
-| 29 | dwarf_frame_walk | walk through a hand-written frame forced into DWARF unwind mode (`.cfi_escape`), saved lr signed with pacibsp and no negate_ra_state CFI, as Apple's compilers emit for Mach-O | ok |
+| 21 | x_unwind_delete_exception_cleanup | `_Unwind_DeleteException` on an exception whose `exception_cleanup` the compiler signed (IA, discriminator 0), handed through `hand()` | ok |
+| 22 | x_unwind_backtrace_callback | `_Unwind_Backtrace` with a signed trace function, handed through `hand()` | ok |
+| 23 | x_unwind_forced_stop_callback | `_Unwind_ForcedUnwind` with a signed stop function, handed through `hand()` | ok |
+| 24 | neg_corrupt_return_address | flip the lowest set bit of the saved lr's signature (`saved ^ xpaci(saved)`), then throw | faulted (terminate) |
+| 25-27 | neg_corrupt_* | the same corruption in the cleanup, trace or stop pointer | faulted |
+| 28 | neg_corrupt_personality_slot | the same corruption in the personality GOT slot (found through `__unwind_info`), then throw | faulted |
+| 29 | dwarf_frame_walk | walk through the hand-written DWARF-mode frame: CIE `B` augmentation, `DW_CFA_AARCH64_negate_ra_state`, saved lr signed with `pacibsp` | ok |
 | 30 | dwarf_frame_throw_catch | C++ throw and catch through that frame | ok |
-| 31 | neg_dwarf_frame_flip_pac_bit | same, saved lr with a PAC bit flipped | faulted |
-| 32 | neg_dwarf_frame_unsigned_lr | same, saved lr overwritten with the raw unsigned address (1 in 128 per boot: the correct signature may be zero) | faulted |
+| 31 | neg_dwarf_frame_flip_pac_bit | same, saved lr with the lowest set bit of its signature flipped | faulted |
+| 32 | neg_dwarf_frame_unsigned_lr | same, saved lr overwritten with the raw unsigned address | faulted |
+
+The corruption is derived from the signature (`saved ^ xpaci(saved)`), so the changed bit lies in the
+PAC field by construction and a zero signature makes the corruption a no-op; the frame records the
+original saved lr through `hand()`, so that case is flagged `pac_field_was_zero=yes` instead of
+counted.
 
 The negative checks mean nothing in the plain-arm64 control (it has no signatures; a flipped bit just corrupts
 the pointer) and in the `noret*` variants (an arm64e image with unsigned return addresses, which libunwind
-no longer walks). Read them in the `arm64e` column. A strip in place of the authentication makes 24-27, 28,
-31 and 32 `ok`.
+no longer walks). Read them in the `arm64e` column, where they expect `faulted`; a strip in place of
+the authentication makes them `failed` (the callback ran, or the corrupted return address resumed).
+
+Checks 21-32 have no guest run in this build; the host test checks their source and structure and the
+driver's bookkeeping only. Predicted against the unmodified Darling libunwind, which strips: 21-23 `ok`
+(a stripping unwinder calls the callbacks); 24-28 `failed` (the corrupted pointer or return address is
+used); 29 `failed` (its walk does not see the DWARF frame as DWARF); 31-32 `failed` if the corrupted
+frame resumes at the catch, `faulted` if the throw cannot pass the frame. None of these is a pass.
 
 ## Results
 
@@ -118,7 +151,7 @@ failure, 0 `EXPECT-MISMATCH` in 162 self-test children. Cells are counts over th
 
 - A lone `ok` in a signed column is a PAC collision: arm64e check 07, `noret_unsigned` check 04 and
   `+addend` check 07 each carry `pac_field_was_zero=yes` in their log (3 of 240 signed callback
-  hand-overs in checks 01-10, about the 1 in 128 expected).
+  hand-overs in checks 01-10). The PAC-field width behind that rate was not measured on this host.
 - `mutate` is defined per check (see Variants). For 16 it strips the pointer Darling's dyld signed, so
   a fault there is the expected result; `nosign` faults in 16 because it is a non-PAC caller of a
   signed pointer (an artefact).
@@ -257,12 +290,18 @@ shapes measured per API. Decision input only.
   process ends with status 137 and no handler output.
 - Compiler: upstream clang 23 with its arm64e defaults and the 3.3a caps-byte rule, not Apple's.
   Hardware: one M1 host, no FPAC.
-- Collisions: a signed pointer has a 1 in 128 chance of a zero PAC field; the harness flags the ones
-  it can see (`pac_field_was_zero`), not the personality slot.
+- Collisions: a signed pointer can have a zero PAC field, which makes it a valid plain pointer. The
+  observed rate in checks 01-10 was 3 of 240 hand-overs; the field width was not measured. The harness
+  flags the collisions it can see (`pac_field_was_zero`, now also for checks 21-32), not the
+  personality slot.
 - Runtime-harness mutants that the host cannot kill because it cannot execute Mach-O: `hand()`
   stripping nothing, `STRIP` as identity, a faulted exit counted ok, `ok` without `OKMARK`, a missing
   re-sign in 16/17/19, check 03 not handing its pointer, the collision flag removed. The guest
   self-test (`selftest`, `selftest mutate`, expectations compared in code) kills the first four and the
   `exit 0` variant; the others are visible only in the guest matrix (e.g. a missing re-sign turns the
   `mutate` column of 17 or 19 from ok to faulted), so they are killed by comparing a guest run
-  against this table, not by a script.
+  against this table, not by a script. The host test does check the unwinder group's source and
+  structure: a row without its expectation, a negative check that prints its own `OKMARK` or skips
+  `neg_finished`, an `ok_mark` hidden in a comment, a fixed PAC bit instead of one read from the
+  signature, a missing `hand()` in 21-23, and a DWARF fixture that lacks the CIE `B` augmentation,
+  the `negate_ra_state` opcode or the DWARF-mode compact encoding.

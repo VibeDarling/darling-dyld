@@ -34,7 +34,7 @@ def main(paths):
                 tab[col][n][m.group(3)] += 1
                 zero_pac[col] += "pac_field_was_zero=yes" in m.group(4)
                 mismatches += "EXPECT-MISMATCH" in m.group(4)
-    print("complete boots: %d of %d, selftest EXPECT-MISMATCH lines: %d" % (boots, len(paths), mismatches))
+    print("complete boots: %d of %d, EXPECT-MISMATCH lines: %d" % (boots, len(paths), mismatches))
     for sset in ("checks", "selftest"):
         cols = sorted(c for c in tab if c[1] == sset)
         print("\n[%s]" % sset)
@@ -46,7 +46,8 @@ def main(paths):
                 row += "%-26s" % ", ".join("%d %s" % (cnt[k], k) for k in ("ok", "faulted", "hung", "failed") if cnt[k])
             print(row)
     print("\npac_field_was_zero=yes lines per column:", {c[0]: v for c, v in zero_pac.items() if v})
-    return 0
+    # an EXPECT-MISMATCH is a check whose verdict differs from what the reference build must get
+    return 1 if mismatches else 0
 
 
 if __name__ == "__main__":

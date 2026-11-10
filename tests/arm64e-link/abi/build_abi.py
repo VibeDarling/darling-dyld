@@ -168,6 +168,169 @@ def import_names(m, arch, path):
     return None, None
 
 
+# --------------------------------------------------- DWARF-mode fixture (checks 29-32)
+# The fixture's claims are structural: the linker gives _dwarf_frame_call DWARF mode, and its FDE
+# says what the frame does in the convention open-source libunwind reads - the CIE's B augmentation
+# (B key) and the FDE's first instruction DW_CFA_AARCH64_negate_ra_state (RA sign state set).
+
+def _section(m, segname, secname):
+    for s in m.segments:
+        if s["name"] == segname:
+            for sec in s["sections"]:
+                if sec["name"] == secname:
+                    return sec
+    return None
+
+
+def _u32(data, off):
+    return struct.unpack_from("<I", data, off)[0]
+
+
+def _uleb(data, off):
+    v = shift = 0
+    while off < len(data):
+        b = data[off]; off += 1
+        v |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return v, off
+        shift += 7
+    raise rec.RecipeError("truncated ULEB128")
+
+
+def _cstr(data, off):
+    end = data.index(b"\0", off)
+    return data[off:end].decode("ascii", "replace"), end + 1
+
+
+def _cie_augmentation(cie):
+    """(augmentation string, FDE pointer encoding or None) of a CIE at bytes cie."""
+    if cie[8] not in (1, 3, 4):
+        raise rec.RecipeError("unexpected CIE version %d" % cie[8])
+    aug, off = _cstr(cie, 9)
+    _code, off = _uleb(cie, off)      # code alignment
+    _data, off = _uleb(cie, off)      # data alignment (SLEB; the width is what matters)
+    _ret, off = _uleb(cie, off)       # return address register
+    enc = None
+    if aug.startswith("z"):
+        alen, off = _uleb(cie, off)
+        data_end, p = off + alen, off
+        for ch in aug[1:]:
+            if ch == "R":
+                enc = cie[p]; p += 1
+            elif ch == "L":
+                p += 1
+            elif ch == "P":
+                p += 1
+                # an encoded personality pointer; our fixture has none, so stop rather than guess
+                break
+        off = data_end
+    return aug, enc, off
+
+
+def compact_encoding(m, func_addr):
+    """The compact-unwind encoding of func_addr from __TEXT,__unwind_info, or raise."""
+    sec = _section(m, "__TEXT", "__unwind_info")
+    if sec is None:
+        raise rec.RecipeError("no __TEXT,__unwind_info")
+    ui = m.read_vm(sec["addr"], sec["size"])
+    if _u32(ui, 0) != 1:
+        raise rec.RecipeError("unexpected __unwind_info version %d" % _u32(ui, 0))
+    index_off, index_count = _u32(ui, 20), _u32(ui, 24)
+    func_off, first, second = func_addr - m.image_base(), None, None
+    for i in range(index_count):
+        foff, page = struct.unpack_from("<II", ui, index_off + i * 12)
+        if foff <= func_off:
+            first, second = foff, page
+        else:
+            break
+    if second is None:
+        raise rec.RecipeError("_dwarf_frame_call is below the first unwind index entry")
+    kind = _u32(ui, second)
+    if kind == 2:                                    # UNWIND_SECOND_LEVEL_REGULAR
+        # regular second-level offsets are absolute (from the image base)
+        page_off, count = struct.unpack_from("<HH", ui, second + 4)
+        for i in range(count):
+            foff, enc = struct.unpack_from("<II", ui, second + page_off + i * 8)
+            if foff == func_off:
+                return enc
+        raise rec.RecipeError("no compact-unwind entry for _dwarf_frame_call")
+    if kind == 3:                                    # UNWIND_SECOND_LEVEL_COMPRESSED
+        # compressed second-level offsets are relative to the first-level entry's functionOffset;
+        # an encoding index below the common count selects the section's common encodings
+        page_target = func_off - first
+        page_off, count, enc_off, _n = struct.unpack_from("<HHHH", ui, second + 4)
+        common_off, common_count = _u32(ui, 4), _u32(ui, 8)
+        for i in range(count):
+            word = _u32(ui, second + page_off + i * 4)
+            if word & 0xFFFFFF == page_target:
+                eidx = word >> 24
+                if eidx < common_count:
+                    return _u32(ui, common_off + eidx * 4)
+                return _u32(ui, second + enc_off + (eidx - common_count) * 4)
+        raise rec.RecipeError("no compact-unwind entry for _dwarf_frame_call")
+    raise rec.RecipeError("unknown second-level unwind page kind %d" % kind)
+
+
+def dwarf_fde_cfi(m, func_addr):
+    """(CIE augmentation, first FDE instruction opcode) of the FDE for func_addr."""
+    sec = _section(m, "__TEXT", "__eh_frame")
+    if sec is None:
+        raise rec.RecipeError("no __TEXT,__eh_frame")
+    eh = m.read_vm(sec["addr"], sec["size"])
+    off = 0
+    while off + 4 <= len(eh):
+        length = _u32(eh, off)
+        if length == 0:
+            break
+        if length == 0xFFFFFFFF:
+            raise rec.RecipeError("64-bit .eh_frame length in a 32-bit fixture")
+        body = off + 4
+        cie_ptr = _u32(eh, body)
+        if cie_ptr:
+            cie_off = body - cie_ptr
+            aug, enc, _cie_len = _cie_augmentation(eh[cie_off:])
+            p = body + 4
+            field_addr = sec["addr"] + p
+            if enc == 0x10:                          # DW_EH_PE_pcrel | DW_EH_PE_absptr
+                init = (struct.unpack_from("<Q", eh, p)[0] + field_addr) & 0xFFFFFFFFFFFFFFFF
+                p += 8 + 8                           # initial location and address range
+            elif enc == 0x1B:                        # DW_EH_PE_pcrel | DW_EH_PE_sdata4
+                init = (struct.unpack_from("<i", eh, p)[0] + field_addr) & 0xFFFFFFFFFFFFFFFF
+                p += 4 + 4
+            elif enc is None:
+                raise rec.RecipeError("CIE has no FDE pointer encoding")
+            else:
+                raise rec.RecipeError("unhandled FDE pointer encoding 0x%x" % enc)
+            if init == func_addr:
+                if aug.startswith("z"):
+                    alen, p = _uleb(eh, p)
+                    p += alen
+                return aug, eh[p]
+        off = body + length
+    raise rec.RecipeError("no FDE for _dwarf_frame_call")
+
+
+def dwarf_mode_problems(m):
+    """Problems with the reference build's DWARF-mode fixture; empty means it is as claimed."""
+    sym = m.symbols().get("_dwarf_frame_call")
+    if sym is None:
+        return ["no _dwarf_frame_call symbol"]
+    problems = []
+    try:
+        enc = compact_encoding(m, sym)
+        if enc & 0x0F000000 != 0x03000000:          # UNWIND_ARM64_MODE_MASK / _MODE_DWARF
+            problems.append("_dwarf_frame_call is not in DWARF mode (compact encoding 0x%08x)" % enc)
+        aug, opcode = dwarf_fde_cfi(m, sym)
+        if "B" not in aug:
+            problems.append("the CIE augmentation %r does not mark the B key (B)" % aug)
+        if opcode != 0x2D:                          # DW_CFA_AARCH64_negate_ra_state
+            problems.append("the FDE's first instruction is 0x%02x, not DW_CFA_AARCH64_negate_ra_state" % opcode)
+    except rec.RecipeError as e:
+        problems.append(str(e))
+    return problems
+
+
+
 def check_exe(path, arch, variant=None):
     """Problems with a built probe executable; empty means it passed."""
     problems = []
@@ -225,6 +388,8 @@ def check_exe(path, arch, variant=None):
     if variant is None and dec is not None and not any(
             f["kind"] == "auth_bind" and f["import"] == "___gxx_personality_v0" for f in dec["fixups"]):
         problems.append("arm64e probe lacks the signed personality slot the C++ checks are about")
+    if arch == "arm64e" and variant is None:
+        problems.extend(dwarf_mode_problems(m))
     if names is not None:
         for lib, wanted in REQUIRED_IMPORTS.items():
             ordinal = {"libSystem": 1, "libc++abi": 2}[lib]

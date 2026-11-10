@@ -37,20 +37,57 @@ def build_script(*args)
 end
 
 # ---------------------------------------------------------------- source bookkeeping
-src = File.read(File.join(HERE, 'abi_checks.c'))
+def strip_comments(s)
+  s.gsub(%r{/\*.*?\*/}m, '').gsub(%r{//[^\n]*}, '')
+end
+
+src = strip_comments(File.read(File.join(HERE, 'abi_checks.c')))
 table = src[/const struct check checks\[\] = \{(.*?)\n\};/m, 1].to_s
-names = table.scan(/\{"([a-z0-9_]+)", (\w+), 0\}/)
-check 'the check table lists 32 checks with unique names', names.size == 32 && names.map(&:first).uniq.size == 32, names.size
-body = src
-marks = body.scan(/ok_mark\((\d+)\)|wait_async\(\d+, (\d+)\)/).flatten.compact.map(&:to_i)
-check 'every check number 1..32 has exactly one ok_mark', marks.sort == (1..32).to_a, marks.sort.inspect
-names.each_with_index do |(name, fn), i|
+rows = table.scan(/\{"([a-z0-9_]+)", (\w+), ("[a-z]+"|0)\}/)
+expects = rows.map { |r| r[2] == '0' ? nil : r[2][1..-2] }
+names = rows.map(&:first)
+check 'the check table lists 32 checks with unique names', rows.size == 32 && names.uniq.size == 32, rows.size
+marks = src.scan(/ok_mark\((\d+)\)|wait_async\(\d+, (\d+)\)|neg_finished\((\d+),/).flatten.compact.map(&:to_i)
+check 'every check number 1..32 has exactly one verdict path', marks.sort == (1..32).to_a, marks.sort.inspect
+check 'checks 01-20 carry no expectation (their verdicts are the measurement)', expects[0, 20].all?(&:nil?)
+check 'checks 21-23 and 29-30 expect ok', (expects[20, 3] + expects[28, 2]).all? { |e| e == 'ok' }
+check 'checks 24-28 and 31-32 expect faulted', (expects[23, 5] + expects[30, 2]).all? { |e| e == 'faulted' }
+nf = src[/static int neg_finished\(int number.*?\n\}\n/m].to_s
+check 'neg_finished marks ok only when the check had no signature to authenticate',
+      nf.include?('if (!applied)') && nf.include?('ok_mark(number)') && nf.include?('fail(why)')
+check 'the corruption is derived from the signature, not a fixed bit',
+      !src.include?('PACBIT') && src.match?(/sig = v \^ \(uintptr_t\)STRIP\(p\)/)
+check 'checks 21-23 hand their pointer through hand()',
+      (20..22).all? { |i| src[/static int #{rows[i][1]}\(void\).*?\n\}/m].to_s.include?('hand(') }
+neg = (23..27).to_a + [30, 31]
+check 'the negative checks report through neg_finished, never by printing their own OKMARK',
+      neg.all? { |i|
+        b = src[/static int #{rows[i][1]}\(void\).*?\n\}\n/m].to_s
+        b.include?("neg_finished(#{i + 1},") && !b.include?("ok_mark(#{i + 1})")
+      }
+rows.each_with_index do |(name, fn), i|
   # the function (or the handler/callback it registers) must print its own number
   fbody = src[/static int #{fn}\(void\).*?\n\}\n|static int #{fn}\(void\) \{[^\n]*\n/m].to_s
   handler = fbody.scan(/\b(h_\w+|key_dtor|thr_run|once_init|cmp_int|on_image)\b/).flatten.first
   hbody = handler ? src[/(?:static void|static void \*|static int) \*?#{handler}\([^\n]*\n(?:[^\n]*\n)*?\}\n|[^\n]*#{handler}\([^\n]*\{[^\n]*\n/m].to_s : ''
-  check "check #{i + 1} (#{name}) prints OKMARK #{i + 1}", (fbody + hbody).match?(/ok_mark\(#{i + 1}\)|wait_async\(\d+, #{i + 1}\)/), fn
+  check "check #{i + 1} (#{name}) prints OKMARK #{i + 1}",
+        (fbody + hbody).match?(/ok_mark\(#{i + 1}\)|wait_async\(\d+, #{i + 1}\)|neg_finished\(#{i + 1},/), fn
 end
+
+cxx = File.read(File.join(HERE, 'abi_cxx.cpp'))
+check 'the DWARF fixture states the B key and the RA sign state in its CFI',
+      cxx.include?('.cfi_b_key_frame') && cxx.include?('.cfi_negate_ra_state')
+check 'the DWARF fixture does not rely on .cfi_escape to select DWARF mode', !cxx.include?('.cfi_escape')
+check 'the DWARF corruption is derived from the saved signature, not a fixed bit',
+      !cxx.include?('1ULL << 50') && !cxx.include?('PACBIT') && cxx.match?(/xpaci/)
+
+harness = File.read(File.join(HERE, 'abi_harness.c'))
+check 'the driver compares expectations in the unmutated arm64e checks build only',
+      harness.include?('int reference = streq(set->name, "checks") && ' \
+                       'streq(ABI_VARIANT, "arm64e") && !mutate;')
+check 'a reference mismatch sets the exit status',
+      harness.include?('EXPECT-MISMATCH expected=') &&
+      harness.include?('if (streq(ABI_VARIANT, "arm64e") && !mutate) return mismatches ? 1 : 0;')
 
 # ---------------------------------------------------------------- compile-only, both archs
 %w[arm64e arm64].each do |arch|
