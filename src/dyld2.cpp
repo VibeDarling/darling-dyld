@@ -4427,17 +4427,36 @@ static void mapSharedCache(uintptr_t mainExecutableSlide)
 //#endif
 }
 
+static const char* basename(const char* path)
+{
+    const char* last = path;
+    for (const char* s = path; *s != '\0'; s++) {
+        if (*s == '/') 
+			last = s+1;
+    }
+    return last;
+}
+
 #ifdef DARLING
 // The user asked for this cache with DYLD_SHARED_CACHE_SPLIT_DIR, so a failure to map it must not leave the process running without it.
-static void mapSplitSharedCache(const macho_header* mainExecutableMH)
+// The one exception is a directory that has no cache for this process's architecture (macOS ships an arm64e cache only, and the
+// variable reaches every process): that process runs without a cache, and false is returned. No message names the host's
+// directory, only the files in it.
+static bool mapSplitSharedCache(const macho_header* mainExecutableMH)
 {
 	char path[sizeof(sSharedCacheLoadInfo.path)];
 	if ( const char* error = dyld3::splitCacheMainFilePath(sSharedCacheSplitDir, mainExecutableMH->cputype, mainExecutableMH->cpusubtype, path, sizeof(path)) )
-		halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_DIR='%s': %s\n", sSharedCacheSplitDir, error));
+		halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_DIR: %s\n", error));
+	if ( dyld3::splitCacheMainFileIsMissing(sSharedCacheSplitDir, path) ) {
+		if ( gLinkContext.verboseMapping )
+			dyld::log("dyld: DYLD_SHARED_CACHE_SPLIT_DIR has no %s, running without a split dyld cache\n", basename(path));
+		return false;
+	}
 	dyld3::SplitCacheMapStats stats;
 	if ( !dyld3::mapSplitCachePrivate(path, gLinkContext.verboseMapping, &sSharedCacheLoadInfo, &stats) )
-		halt(mkstringf("could not map the split dyld cache '%s': %s\n", path, sSharedCacheLoadInfo.errorMessage ? sSharedCacheLoadInfo.errorMessage : "no reason given"));
+		halt(mkstringf("could not map the split dyld cache '%s': %s\n", basename(path), sSharedCacheLoadInfo.errorMessage ? sSharedCacheLoadInfo.errorMessage : "no reason given"));
 	installSharedCacheGlobalState(true);
+	return true;
 }
 #endif
 
@@ -5115,16 +5134,6 @@ static ImageLoader* libraryLocator(const char* libraryName, bool search, const c
 	context.origin				= origin;
 	context.rpath				= rpaths;
 	return load(libraryName, context, cacheIndex);
-}
-
-static const char* basename(const char* path)
-{
-    const char* last = path;
-    for (const char* s = path; *s != '\0'; s++) {
-        if (*s == '/') 
-			last = s+1;
-    }
-    return last;
 }
 
 static void setContext(const macho_header* mainExecutableMH, int argc, const char* argv[], const char* envp[], const char* apple[])
@@ -7040,10 +7049,11 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 	if ( sSharedCacheSplitDir != nullptr ) {
 		// the cache is private to this process, and addImage only records its dylibs' UUIDs in that mode
 		gLinkContext.sharedRegionMode = ImageLoader::kUsePrivateSharedRegion;
-		mapSplitSharedCache(mainExecutableMH);
-		sClosureMode = ClosureMode::Off;
-		// mapSplitCachePrivate maps __DATA_CONST read-only whatever this process wants, so that is the state to match
-		matchSharedCacheDataConstState(true);
+		if ( mapSplitSharedCache(mainExecutableMH) ) {
+			sClosureMode = ClosureMode::Off;
+			// mapSplitCachePrivate maps __DATA_CONST read-only whatever this process wants, so that is the state to match
+			matchSharedCacheDataConstState(true);
+		}
 	}
 #endif // !DARLING
 

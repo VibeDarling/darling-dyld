@@ -1616,8 +1616,10 @@ bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLo
     results->loadAddress = (const DyldSharedCache*)(uintptr_t)regionStart;
     strlcpy(results->path, mainCachePath, sizeof(results->path));
     if ( verbose ) {
+        // The path names the host's store; the log carries the file name only.
+        const char* fileName = strrchr(results->path, '/');
         dyld::log("mapped split dyld cache private to process (%s): %u mappings in %u files, %llu plain pointers rebased, %llu authenticated pointers signed, %llu authenticated pointers left in on-disk form\n",
-                  results->path, mappingCount, files.count, (unsigned long long)stats->plainRebased,
+                  (fileName != nullptr) ? fileName + 1 : results->path, mappingCount, files.count, (unsigned long long)stats->plainRebased,
                   (unsigned long long)stats->authSigned, (unsigned long long)stats->authLeftAlone);
     }
     reservation.keep();
@@ -1758,6 +1760,16 @@ const char* translateSplitCacheTSD(const SharedCacheLoadInfo& cache, const mach_
     return sSplitTSD.patcher->patchImage((uintptr_t)image, sSplitTSD.memory->memory(), stats);
 }
 #endif
+
+bool splitCacheMainFileIsMissing(const char* dir, const char* mainFilePath)
+{
+    // Only "the directory exists and has no such file" counts. A bad directory and a file that is there but cannot be
+    // read stay errors for the mapper to report, so that a mistake in the setup is never mistaken for a missing architecture.
+    struct stat statBuf;
+    if ( dyld3::stat(dir, &statBuf) != 0 )
+        return false;
+    return (dyld3::stat(mainFilePath, &statBuf) != 0) && (errno == ENOENT);
+}
 #endif // DARLING && !TARGET_OS_SIMULATOR
 
 

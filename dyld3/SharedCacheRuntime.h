@@ -100,6 +100,10 @@ const char* splitCacheMainFilePath(const char* dir, uint32_t cputype, uint32_t c
 // nullptr on success, else why not (the caller halts: a half-translated cache image would read a null TSD base).
 const char* translateSplitCacheTSD(const SharedCacheLoadInfo& cache, const mach_header* image, darling_tsd::PatchStats* stats);
 #endif
+
+// True only when dir is a directory and mainFilePath (the file splitCacheMainFilePath built) does not exist in it: the
+// directory has no cache for this architecture. Every other failure to use the file is left to mapSplitCachePrivate.
+bool splitCacheMainFileIsMissing(const char* dir, const char* mainFilePath);
 #endif
 
 
