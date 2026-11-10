@@ -454,6 +454,159 @@ int x8_get_unexpected_via_dlsym() {
     PASS();
 }
 
+// Diagnostics y1 and y2 look at the cache's terminate-handler slot, the pointer that made every c3 throw trap: Darling's libobjc
+// calls std::set_terminate(&_objc_terminate) at init with a plain pointer, and the cache's arm64e libc++abi then failed to
+// re-sign it for the exception header. Recorded only.
+static unsigned long y_sign(unsigned long stripped, int key, unsigned long disc) {
+    switch (key) {
+    case 0: return (unsigned long)L4_SIGN(stripped, 0, disc);
+    case 1: return (unsigned long)L4_SIGN(stripped, 1, disc);
+    case 2: return (unsigned long)L4_SIGN(stripped, 2, disc);
+    default: return (unsigned long)L4_SIGN(stripped, 3, disc);
+    }
+}
+// non-trapping: a slot value authenticates under (key, disc) iff it equals the signature of its own stripped value
+static void y_try(const char *label, unsigned long raw, unsigned long slot) {
+    unsigned long stripped = (unsigned long)L4_STRIP(raw);
+    unsigned long blend = slot ? L4_BLEND(slot, 0) : 0;
+    put("Y variant="); put(label);
+    put(" raw_is_unsigned="); puthex(raw == stripped);
+    put(" IA_d0="); puthex(raw == y_sign(stripped, 0, 0));
+    put(" IA_addr_d0="); puthex(slot && raw == y_sign(stripped, 0, blend));
+    put(" DA_d0="); puthex(raw == y_sign(stripped, 2, 0));
+    put(" IB_d0="); puthex(raw == y_sign(stripped, 1, 0));
+    nl();
+}
+static unsigned long y_slot(const char *sym) {
+    void *p = dlsym(RTLD_DEFAULT, sym);
+    put("Y sym="); put(sym); put(" addr="); puthex((unsigned long)p); nl();
+    if (!p) return 0;
+    unsigned long raw = *(unsigned long *)p;
+    Dl_info di;
+    put("Y target of="); put(sym); put(" raw="); puthex(raw);
+    if (dladdr(L4_STRIP(raw), &di)) {
+        put(" image="); put(di.dli_fname ? di.dli_fname : "(none)");
+        put(" sname="); put(di.dli_sname ? di.dli_sname : "(none)");
+    }
+    nl();
+    y_try(sym, raw, (unsigned long)p);
+    return raw;
+}
+int y1_handler_slots() {
+    y_slot("__cxa_terminate_handler");
+    y_slot("__cxa_unexpected_handler");
+    y_try("get_terminate()", (unsigned long)(void *)std::get_terminate(), 0);
+    PASS();
+}
+void y_my_handler() { std::abort(); }
+// the counterfactual: hand the runtime a compiler-signed handler, then the trap site must pass and a throw must work
+int y2_set_signed_terminate_then_init() {
+    y_slot("__cxa_terminate_handler");
+    std::set_terminate(y_my_handler);
+    unsigned long after = y_slot("__cxa_terminate_handler");
+    put("Y after_set slot_equals_signed_handler="); puthex(after == y_sign((unsigned long)L4_STRIP(y_my_handler), 0, 0)); nl();
+    typedef void (*init_fn)(void *, std::type_info *, void (*)(void *));
+    init_fn f = (init_fn)dlsym(RTLD_DEFAULT, "__cxa_init_primary_exception");
+    if (!f) return fail("dlsym(__cxa_init_primary_exception) failed");
+    f(__cxa_allocate_exception(8), (std::type_info *)&typeid(int), nullptr);
+    try { throw 7; } catch (int v) { REQUIRE(v == 7); }
+    PASS();
+}
+
+
+// Checks z1..z8 drive the dyld reverse adapters from real plain code: l4_plain.dylib (plain arm64, built by build_plain_dylib.py,
+// loaded by dlopen from the directory of this executable) binds the cache's std::set_terminate and std::get_terminate. In c3
+// those binds are thunks that sign a function pointer argument only when it is a function entry of a plain image (or a handler
+// handed back before), and authenticate a handler result before plain code gets it raw. Each check looks at the cache's
+// __cxa_terminate_handler slot, the value the arm64e libc++abi stored.
+typedef void (*z_handler_t)(void);
+struct z_plain { z_handler_t (*set)(z_handler_t); z_handler_t (*get)(void); void (*entry)(void); int *data; unsigned long *slot; };
+static unsigned long z_sign(unsigned long p) { return (unsigned long)L4_SIGN(p, 0, 0); }
+static unsigned long z_strip(unsigned long p) { return (unsigned long)L4_STRIP(p); }
+void z_arm64e_handler() { std::abort(); }
+static int z_load(z_plain *p) {
+    Dl_info self;
+    if (!dladdr((void *)&g_check, &self) || !self.dli_fname || self.dli_fname[0] != '/') return fail("cannot find the directory of this executable");
+    std::string path(self.dli_fname);
+    path.resize(path.rfind('/') + 1);
+    path += "l4_plain.dylib";
+    void *h = dlopen(path.c_str(), RTLD_NOW);
+    if (!h) return fail("dlopen of l4_plain.dylib failed");
+    p->set = (z_handler_t (*)(z_handler_t))dlsym(h, "plain_set_terminate");   // dlsym signs these for this arm64e caller
+    p->get = (z_handler_t (*)(void))dlsym(h, "plain_get_terminate");
+    p->entry = (void (*)(void))dlsym(h, "plain_entry");
+    p->data = (int *)dlsym(h, "plain_data");
+    p->slot = (unsigned long *)dlsym(RTLD_DEFAULT, "__cxa_terminate_handler");
+    if (!p->set || !p->get || !p->entry || !p->data || !p->slot) return fail("a symbol of l4_plain.dylib or the handler slot is missing");
+    return 0;
+}
+int z1_plain_entry_is_signed() {
+    z_plain p; if (z_load(&p)) return 1;
+    unsigned long entry = z_strip((unsigned long)p.entry);
+    z_handler_t old = p.set((z_handler_t)entry);
+    REQUIRE((unsigned long)old == z_strip((unsigned long)old));   // the old handler came back raw
+    REQUIRE(*p.slot == z_sign(entry));                            // and the callee got the IA/0 signature of the entry
+    REQUIRE(*p.slot != entry);
+    PASS();
+}
+int z2_mid_function_address_not_signed() {
+    z_plain p; if (z_load(&p)) return 1;
+    unsigned long mid = z_strip((unsigned long)p.entry) + 4;
+    p.set((z_handler_t)mid);
+    REQUIRE(*p.slot == mid);   // stored as it was: no signature for an address that is not a function entry
+    PASS();
+}
+int z3_arm64e_image_address_not_signed() {
+    z_plain p; if (z_load(&p)) return 1;
+    unsigned long a = z_strip((unsigned long)z_arm64e_handler);
+    p.set((z_handler_t)a);
+    REQUIRE(*p.slot == a);
+    PASS();
+}
+int z4_data_address_not_signed() {
+    z_plain p; if (z_load(&p)) return 1;
+    unsigned long a = (unsigned long)p.data;
+    p.set((z_handler_t)a);
+    REQUIRE(*p.slot == a);
+    PASS();
+}
+int z5_round_trip() {
+    z_plain p; if (z_load(&p)) return 1;
+    std::set_terminate(z_arm64e_handler);                       // arm64e code installs a handler (signed by the compiler)
+    unsigned long h = (unsigned long)p.get();                   // plain code receives it
+    REQUIRE(h == z_strip((unsigned long)z_arm64e_handler));     // raw, authenticated
+    p.set((z_handler_t)z_strip((unsigned long)p.entry));        // something else in the slot
+    REQUIRE(*p.slot != 0 && *p.slot != z_strip(*p.slot));
+    p.set((z_handler_t)h);                                      // plain code restores it: an arm64e address it was handed
+    REQUIRE(*p.slot == z_sign(h));
+    // control: an arm64e address that plain code was never handed is not signed
+    unsigned long other = z_strip((unsigned long)dlsym(RTLD_DEFAULT, "_ZSt9terminatev"));
+    REQUIRE(other != 0);
+    p.set((z_handler_t)other);
+    REQUIRE(*p.slot == other);
+    PASS();
+}
+int z6_corrupted_return_stops() {
+    z_plain p; if (z_load(&p)) return 1;
+    *p.slot = 0x0000000100001234UL;   // a handler that does not authenticate
+    p.get();                          // must stop the process, not hand plain code a stripped pointer
+    return fail("plain code was handed a handler that failed authentication");
+}
+int z7_null_maps_to_default() {
+    z_plain p; if (z_load(&p)) return 1;
+    p.set((z_handler_t)(void *)0);   // the standard maps a null handler to the default one, which the cache signed
+    REQUIRE(*p.slot != 0 && *p.slot != z_strip(*p.slot));
+    unsigned long got = (unsigned long)p.get();
+    REQUIRE(got != 0 && got == z_strip(*p.slot));
+    PASS();
+}
+int z8_throw_after_plain_set() {
+    z_plain p; if (z_load(&p)) return 1;
+    p.set((z_handler_t)z_strip((unsigned long)p.entry));   // plain code installs its own handler through the thunk
+    try { throw 5; } catch (int v) { REQUIRE(v == 5); }
+    PASS();
+}
+
 #define EXP_STD "c1=ok,c2=any,c3=ok,native=ok"
 // not from the cache is a recorded fact (failed), never a fault
 #define EXP_CACHE "c1=failed,c2=failed,c3=ok,native=failed"
@@ -461,6 +614,10 @@ int x8_get_unexpected_via_dlsym() {
 #define EXP_ADDEND "c1=ok,c2=any,c3=any,native=ok"
 // recorded only, in every configuration
 #define EXP_DIAG "c1=any,c2=any,c3=any,native=any"
+// the reverse-adapter checks need the cache and the dyld that has them; elsewhere they are recorded only
+#define EXP_REVERSE "c1=any,c2=any,c3=ok,native=any"
+// plain code is handed a handler that fails authentication: the process stops, which the driver reports as faulted
+#define EXP_REVERSE_STOP "c1=any,c2=any,c3=faulted,native=any"
 
 }  // namespace
 
@@ -502,6 +659,16 @@ const struct check checks[] = {
     {"x6_init_primary_stripped_dtor", x6_init_primary_stripped_dtor, EXP_DIAG},
     {"x7_init_primary_class_typeinfo", x7_init_primary_class_typeinfo, EXP_DIAG},
     {"x8_get_unexpected_via_dlsym", x8_get_unexpected_via_dlsym, EXP_DIAG},
+    {"y1_handler_slots", y1_handler_slots, EXP_DIAG},
+    {"y2_set_signed_terminate_then_init", y2_set_signed_terminate_then_init, EXP_DIAG},
+    {"z1_plain_entry_is_signed", z1_plain_entry_is_signed, EXP_REVERSE},
+    {"z2_mid_function_address_not_signed", z2_mid_function_address_not_signed, EXP_REVERSE},
+    {"z3_arm64e_image_address_not_signed", z3_arm64e_image_address_not_signed, EXP_REVERSE},
+    {"z4_data_address_not_signed", z4_data_address_not_signed, EXP_REVERSE},
+    {"z5_round_trip", z5_round_trip, EXP_REVERSE},
+    {"z6_corrupted_return_stops", z6_corrupted_return_stops, EXP_REVERSE_STOP},
+    {"z7_null_maps_to_default", z7_null_maps_to_default, EXP_REVERSE},
+    {"z8_throw_after_plain_set", z8_throw_after_plain_set, EXP_REVERSE},
 };
 const int nchecks = sizeof checks / sizeof checks[0];
 }

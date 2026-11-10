@@ -47,16 +47,22 @@ src = File.read(File.join(HERE, 'l4_checks.cpp'))
 table = src[/const struct check checks\[\] = \{(.*?)\n\};/m, 1].to_s
 rows = table.scan(/\{"([a-z0-9_]+)", (\w+), ([A-Z_]+)((?: ";need=[^"]*")?)\}/)
 names = rows.map(&:first)
-# the plan's 28 checks (q1..q6) and the 8 diagnostics x1..x8 that bisect the c3 throw failure, recorded only
+# the plan's 28 checks (q1..q6), the 8 diagnostics x1..x8 that bisect the c3 throw failure (recorded only), the 2 diagnostics y1 and
+# y2 on the cache's terminate-handler slot (recorded only) and the 8 checks z1..z8 that drive the dyld reverse adapters from plain code
 PLAN_COUNT = 28
 DIAG_COUNT = 8
-EXPECTED_COUNT = PLAN_COUNT + DIAG_COUNT
+SLOT_COUNT = 2
+REVERSE_COUNT = 8
+EXPECTED_COUNT = PLAN_COUNT + DIAG_COUNT + SLOT_COUNT + REVERSE_COUNT
 plan_names = names.select { |n| n.start_with?('q') }
 diag_names = names.select { |n| n.start_with?('x') }
+slot_names = names.select { |n| n.start_with?('y') }
+reverse_names = names.select { |n| n.start_with?('z') }
 check "the check table lists #{EXPECTED_COUNT} checks with unique names", rows.size == EXPECTED_COUNT && names.uniq.size == EXPECTED_COUNT, rows.size
-check "#{PLAN_COUNT} checks are grouped q1..q6 in order and every Q4 group has a check, followed by the #{DIAG_COUNT} diagnostics x1..x8",
-      plan_names.size == PLAN_COUNT && names.first(PLAN_COUNT) == plan_names && diag_names.size == DIAG_COUNT &&
-      diag_names.map { |n| n[/\Ax(\d)_/, 1] } == %w[1 2 3 4 5 6 7 8] &&
+check "#{PLAN_COUNT} checks are grouped q1..q6 in order and every Q4 group has a check, followed by the #{DIAG_COUNT} diagnostics x1..x8, y1 and y2, and z1..z8",
+      plan_names.size == PLAN_COUNT && names == plan_names + diag_names + slot_names + reverse_names && diag_names.size == DIAG_COUNT &&
+      diag_names.map { |n| n[/\Ax(\d)_/, 1] } == %w[1 2 3 4 5 6 7 8] && slot_names.map { |n| n[/\Ay(\d)_/, 1] } == %w[1 2] &&
+      reverse_names.map { |n| n[/\Az(\d)_/, 1] } == %w[1 2 3 4 5 6 7 8] &&
       plan_names.map { |n| n[/\Aq(\d)_/, 1].to_i } == plan_names.map { |n| n[/\Aq(\d)_/, 1].to_i }.sort &&
       plan_names.map { |n| n[/\Aq(\d)_/, 1] }.uniq == %w[1 2 3 4 5 6]
 rows.each_with_index do |(name, fn, _exp, _need), i|
@@ -66,11 +72,15 @@ rows.each_with_index do |(name, fn, _exp, _need), i|
   helper = { 'atexit_and_static_destructor' => 'void exit_first_registered', 'served_libcxx' => 'int served_by_cache',
              'served_cxa_throw' => 'int served_by_cache' }.fetch(fn) { fn.start_with?('x') && body.include?('x_init_primary(') ? 'int x_init_primary' : nil }
   body += src[/^#{helper}\(.*?^\}/m].to_s if helper
-  check "check #{i + 1} (#{name}) reports through PASS() or ok_mark(g_check)", body.match?(/PASS\(\)|ok_mark\(g_check\)/), fn
+  # z6 hands plain code a handler that fails authentication: it must stop the process, so it never reaches a PASS
+  reports = fn == 'z6_corrupted_return_stops' ? body.match?(/p\.get\(\);.*return fail\(/m) : body.match?(/PASS\(\)|ok_mark\(g_check\)/)
+  check "check #{i + 1} (#{name}) reports through PASS() or ok_mark(g_check)", reports, fn
 end
 macros = src.scan(/^#define (EXP_\w+) "([^"]*)"/).to_h
-check 'the diagnostics are recorded only: every configuration says any',
-      rows.select { |r| r[0].start_with?('x') }.all? { |r| macros[r[2]] == 'c1=any,c2=any,c3=any,native=any' }
+check 'the diagnostics x and y are recorded only: every configuration says any',
+      rows.select { |r| r[0].start_with?('x') || r[0].start_with?('y') }.all? { |r| macros[r[2]] == 'c1=any,c2=any,c3=any,native=any' }
+check 'the reverse-adapter checks z expect ok in c3 (z6 faulted: plain code is stopped, not handed a stripped pointer) and are recorded only elsewhere',
+      rows.select { |r| r[0].start_with?('z') }.all? { |r| macros[r[2]] == (r[0].start_with?('z6_') ? 'c1=any,c2=any,c3=faulted,native=any' : 'c1=any,c2=any,c3=ok,native=any') }
 check 'every expectation macro names c1, c2, c3 and native', macros.size >= 3 &&
       macros.values.all? { |v| %w[c1 c2 c3 native].all? { |c| v.include?("#{c}=") } }, macros.inspect
 user_class = names.select { |n| n.include?('known_ld64_addend') }
@@ -269,9 +279,11 @@ Dir.mktmpdir('l4-probe-') do |tmp|
   out, rc = run_native(native, 'native')
   base = verdicts(out)
   check 'the native run has one RESULT per check', base.size == EXPECTED_COUNT, base.size
-  check 'native: every check is ok except the two served-from-cache checks, which record "not from cache"',
-        base.reject { |n, _| n.start_with?('q1_') }.all? { |_, (v, _)| v == 'ok' } &&
-        base.select { |n, _| n.start_with?('q1_') }.all? { |_, (v, r)| v == 'failed' && r.include?('expected_not_ok=failed') }, base.reject { |_, (v, _)| v == 'ok' }.keys.inspect
+  check 'native: every check is ok except the two served-from-cache checks, which record "not from cache", and z1..z8, which need the plain Mach-O dylib',
+        base.reject { |n, _| n.start_with?('q1_', 'z') }.all? { |_, (v, _)| v == 'ok' } &&
+        base.select { |n, _| n.start_with?('q1_') }.all? { |_, (v, r)| v == 'failed' && r.include?('expected_not_ok=failed') } &&
+        base.select { |n, _| n.start_with?('z') }.size == REVERSE_COUNT && base.select { |n, _| n.start_with?('z') }.all? { |_, (v, _)| v == 'failed' },
+        base.reject { |_, (v, _)| v == 'ok' }.keys.inspect
   check 'native: the run meets its table (expect_mismatches=0, exit 0)', out.include?('expect_mismatches=0') && rc.zero?, rc
   check 'native: the not-from-cache fact is printed with the image that served the function',
         out.scan(/^  \| FACT served .*in_cache=no/).size == 2
@@ -282,8 +294,9 @@ Dir.mktmpdir('l4-probe-') do |tmp|
   c1_out, c1_rc = run_native(native, 'c1')
   check 'native under config c1: the table expects the same verdicts', c1_rc.zero? && c1_out.include?('expect_mismatches=0')
   c3_out, c3_rc = run_native(native, 'c3')
-  check 'config c3 on a run without the cache is a mismatch on exactly the two served-from-cache checks (table-driven verdicts)',
-        c3_rc == 1 && c3_out.scan(/^RESULT .*EXPECT-MISMATCH/).size == 2 && c3_out.scan(/^RESULT 0[12] .*EXPECT-MISMATCH expected=ok/).size == 2
+  check 'config c3 on a run without the cache is a mismatch on exactly the two served-from-cache checks and z1..z8 (table-driven verdicts)',
+        c3_rc == 1 && c3_out.scan(/^RESULT .*EXPECT-MISMATCH/).size == 2 + REVERSE_COUNT && c3_out.scan(/^RESULT 0[12] .*EXPECT-MISMATCH expected=ok/).size == 2 &&
+        c3_out.scan(/^RESULT \d+ z\d_\S+ failed.*EXPECT-MISMATCH/).size == REVERSE_COUNT
   zz_out, zz_rc = run_native(native, 'zz')
   check 'a configuration without a table entry is a mismatch for every check, not a pass',
         zz_rc == 1 && zz_out.scan(/EXPECT-MISMATCH expected=\(no entry for the configuration\)/).size == EXPECTED_COUNT
@@ -309,6 +322,7 @@ Dir.mktmpdir('l4-probe-') do |tmp|
     ['the diagnostic that allocates and frees an exception sees no memory', [['REQUIRE(p != nullptr);', 'REQUIRE(p == nullptr);']], 'x3_allocate_free_exception', 'failed'],
     ['the diagnostic that sets the terminate handler sees another one come back', [['REQUIRE(old == h && std::get_terminate() == h);', 'REQUIRE(old != h && std::get_terminate() == h);']], 'x2_set_get_terminate', 'failed'],
     ['the diagnostic that finds get_unexpected by name finds nothing', [['REQUIRE(f() != nullptr);', 'REQUIRE(f() == nullptr);']], 'x8_get_unexpected_via_dlsym', 'failed'],
+    ['the counterfactual diagnostic catches the wrong value', [['try { throw 7; } catch (int v) { REQUIRE(v == 7); }', 'try { throw 7; } catch (int v) { REQUIRE(v == 8); }']], 'y2_set_signed_terminate_then_init', 'failed'],
     ['the cout line is not printed (the required output is missing)', [['std::cout << "L4-COUT-LINE " << 42 << \' \' << 1.25 << std::endl;', 'std::cout << "x" << std::endl;']], 'q3_cout_and_cerr', 'failed'],
     ['the harness expectation for a check says faulted while it passes (EXPECT-MISMATCH)',
      [['#define EXP_STD "c1=ok,c2=any,c3=ok,native=ok"', '#define EXP_STD "c1=ok,c2=any,c3=ok,native=faulted"']], :all_mismatch, nil]
@@ -464,6 +478,8 @@ Dir.mktmpdir('l4-probe-') do |tmp|
     lines = ->(f) { File.readlines(File.join(CACHE_EXPORTS_DIR, f)).map(&:strip) }
     check 'every libc++ stub name is exported by the cache\'s libc++ (direct or re-exported)',
           (cxx - lines.call('exports-cache-libc++.1.txt')).empty?, (cxx - lines.call('exports-cache-libc++.1.txt')).first(5).inspect
+    check 'the two names l4_plain.dylib imports from libc++ are exported by the cache\'s libc++ (re-exported from libc++abi)',
+          %w[__ZSt13set_terminatePFvvE __ZSt13get_terminatev].all? { |n| lines.call('exports-cache-libc++.1.txt').include?(n) }
     check 'every libc++abi stub name is exported by the cache\'s libc++abi',
           (abi - lines.call('exports-cache-libc++abi.txt')).empty?, (abi - lines.call('exports-cache-libc++abi.txt')).first(5).inspect
   else
