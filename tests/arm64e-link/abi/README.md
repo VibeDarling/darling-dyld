@@ -133,7 +133,8 @@ Guest: the private Darling build (superproject `b456e0f1b`, dyld `a5ac1eb`), hos
 Asahi Linux (PAuth present, no FPAC: a failed authentication does not trap by itself). Six
 independent boots, each running every configuration once, plus the self-test (plain and under
 `mutate`) for the arm64e probe and the control: 6 of 6 boots completed, no boot or shellspawn
-failure, 0 `EXPECT-MISMATCH` in 162 self-test children. Cells are counts over the six boots.
+failure, 0 `EXPECT-MISMATCH` in every self-test child (rows x 3 self-test runs x 6 boots).
+Cells are counts over the six boots.
 
 | # | check | control | arm64e | arm64e mutate | noret | noret_unsigned | +addend | +addend mutate | nosign |
 |---|---|---|---|---|---|---|---|---|---|
@@ -303,6 +304,9 @@ shapes measured per API. Decision input only.
   observed rate in checks 01-10 was 3 of 240 hand-overs; the field width was not measured. The harness
   flags the collisions it can see (`pac_field_was_zero`, now also for checks 21-32), not the
   personality slot.
+- The self-test's `corrupt()` row is checked on two values; if both had a zero PAC field, its
+  no-op path would accept a no-op `corrupt()`. Guest checks 24-32, not that row, are the
+  discriminator.
 - Runtime-harness mutants that the host cannot kill because it cannot execute Mach-O: `hand()`
   stripping nothing, `STRIP` as identity, a faulted exit counted ok, `ok` without `OKMARK`, a missing
   re-sign in 16/17/19, check 03 not handing its pointer, the collision flag removed. The guest

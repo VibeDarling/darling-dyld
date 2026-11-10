@@ -85,6 +85,22 @@ check 'the DWARF fixture states the B key and the RA sign state in its CFI',
 check 'the DWARF fixture does not rely on .cfi_escape to select DWARF mode', !cxx.include?('.cfi_escape')
 check 'HINT (source): the DWARF corruption is derived from the saved signature, not a fixed bit',
       !cxx.include?('1ULL << 50') && !cxx.include?('PACBIT') && cxx.match?(/xpaci/)
+dwf_walk = src[/static int dwf_walk\(void\) \{(.*?)\n\}\n/m, 1].to_s
+dwf_pre = src[/static int dwf_preflight\(void\) \{(.*?)\n\}/m, 1].to_s
+check 'dwf_preflight is the DWARF walk itself, with a reason when it fails',
+      dwf_pre.strip == 'return dwarf_frame_call(dwf_walk, 0) ? ' \
+        'fail("the DWARF frame was not found before the corruption test") : 0;'
+check 'the DWARF walk fails per stage: frame not found, not DWARF mode, too few frames after',
+      ['fail("dwarf_frame_call frame not seen")',
+       'fail("a frame has a signed ip, no unwind info, or is not in DWARF mode")',
+       'fail("the walk ended too soon after the DWARF frame")'].all? { |m| dwf_walk.include?(m) } &&
+      dwf_walk.include?('0x03000000')
+[['c_dwf_flip', 31], ['c_dwf_unsigned', 32]].each do |fn, n|
+  body = src[/static int #{fn}\(void\) \{(.*?)\n\}\n/m, 1].to_s
+  pre_at = body.index('if (dwf_preflight()) return 1;')
+  check "check #{n} walks to the DWARF frame before corrupting it",
+        !pre_at.nil? && pre_at < (body.index('cxx_dwarf_frame(') || 0)
+end
 
 harness = File.read(File.join(HERE, 'abi_harness.c'))
 check 'the driver compares expectations in the unmutated arm64e checks build only',
@@ -95,6 +111,13 @@ check 'a reference mismatch sets the exit status',
       harness.include?('if (streq(ABI_VARIANT, "arm64e") && !mutate) return (mismatches || collisions) ? 1 : 0;')
 check 'a reference PAC collision prints PAC-COLLISION-MISMATCH and fails the run',
       harness.include?('put("PAC-COLLISION-MISMATCH check=");') && harness.include?('collisions++;')
+check 'the PAC collision line guards the nullable expectation (checks 01-20 carry none)',
+      harness[/if \(pac_collision\) \{(.*?)\n        \}/m, 1].to_s.include?(
+        'if (set->t[n - 1].expect) { put(" expected="); put(set->t[n - 1].expect); }')
+check 'the PAC collision line stays on its own line (tally.py reads it from column 0)',
+      harness.match?(/nl\(\);\n\s*if \(pac_collision\) \{/)
+check 'the mismatch exemption is the reference gate, not every collision',
+      harness.include?('int pac_collision = reference && collision;')
 # The behavioural proof of corrupt(): a selftest row in the self-test set that calls it (and STRIP) on
 # values handed through hand(). The source hints above are not evidence on their own.
 sel_table = harness[/static const struct check selftests\[\] = \{(.*?)\n\};/m, 1].to_s
@@ -216,6 +239,22 @@ Dir.mktmpdir('abi-probe-') do |out|
   o, _e, st = py(File.join(HERE, 'symbolize_faults.py'), log)
   check 'symbolize_faults.py reports an unreadable image and still names a readable one',
         st.success? && o.include?('image.dylib+0x10 (symbols unreadable)') && o.include?('_main'), o[0, 300]
+
+  head = "ABI-PROBE arch=arm64e set=checks mutate=0 variant=arm64e checks=32 " \
+         "fault_handler_signature_stripped_by_harness=1\n"
+  res = "RESULT 21 x_unwind_backtrace_callback ok exit=0\n"
+  coll = "PAC-COLLISION-MISMATCH check=21 x_unwind_backtrace_callback expected=ok\n"
+  sum = "SUMMARY arch=arm64e set=checks mutate=0 ok=1 faulted=0 hung=0 failed=0 " \
+        "expect_mismatches=0 pac_collisions=1\n"
+  tlog = File.join(out, 'tally_collision.log')
+  File.write(tlog, head + res + coll + sum)
+  o, e, st = py(File.join(HERE, 'tally.py'), tlog)
+  check 'tally.py fails on a column-0 PAC-COLLISION-MISMATCH line',
+        st.exitstatus == 1 && o.include?('PAC-COLLISION-MISMATCH lines: 1'), (o + e)[0, 300]
+  File.write(tlog, head + res.chomp + coll + sum)
+  o, e, st = py(File.join(HERE, 'tally.py'), tlog)
+  check 'tally.py ignores a collision line glued to the previous one (the driver must keep its nl())',
+        st.exitstatus == 0 && o.include?('PAC-COLLISION-MISMATCH lines: 0'), (o + e)[0, 300]
 end
 
 puts "#{$failures.zero? ? 'ALL PASS' : "#{$failures} FAILED"}"

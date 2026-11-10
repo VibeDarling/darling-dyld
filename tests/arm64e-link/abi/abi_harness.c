@@ -332,9 +332,9 @@ static int driver(const char *self, const struct set *set, int mutate) {
         else { put(" exit="); putdec(code); }
         // A signed pointer whose PAC field is all zero is a valid plain pointer, so a plain callee can
         // use it: report it, it is not a pass of the ABI and carries no signature to authenticate.
-        int collision = !hung && code == 0 && !sig && !mutate && contains(out, mark) &&
+        int collision = !hung && code == 0 && !sig && contains(out, mark) &&
                         contains(out, "expect_signed=yes orig_signed=no");
-        if (collision) put(" pac_field_was_zero=yes");
+        if (collision && !mutate) put(" pac_field_was_zero=yes");
         if (truncated) put(" output_truncated=yes");
         // Expectations are compared for the selftest and for the real checks in the reference arm64e
         // build. The control and the signing variants have no signature to corrupt, so their
@@ -350,7 +350,8 @@ static int driver(const char *self, const struct set *set, int mutate) {
         nl();
         if (pac_collision) {
             put("PAC-COLLISION-MISMATCH check="); putnum2(n); put(" "); put(set->t[n - 1].name);
-            put(" expected="); put(set->t[n - 1].expect); collisions++; nl();
+            if (set->t[n - 1].expect) { put(" expected="); put(set->t[n - 1].expect); }
+            collisions++; nl();
         }
     }
     put("SUMMARY arch="); put(ARCH); put(" set="); put(set->name); put(" mutate="); putdec(mutate);
