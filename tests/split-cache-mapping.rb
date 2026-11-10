@@ -168,6 +168,7 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
         // macOS ships dyld_shared_cache_arm64e only: an arm64 process finds no main file there, an arm64e one maps it
         assert(dyld3::splitCacheMainFileIsMissing(dir.c_str(), (dir + "/dyld_shared_cache_arm64").c_str()));
         assert(!dyld3::splitCacheMainFileIsMissing(dir.c_str(), (dir + "/dyld_shared_cache_arm64e").c_str()));
+        assert(!dyld3::splitCacheMainFileIsMissing(dir.c_str(), (dir + "/dyld_shared_cache_dangling").c_str()));
         assert(!dyld3::splitCacheMainFileIsMissing((dir + "/no-such-dir").c_str(), (dir + "/no-such-dir/dyld_shared_cache_arm64").c_str()));
         mainFile = dir + "/dyld_shared_cache_arm64e";
       }
@@ -315,6 +316,7 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
   # The directory as macOS lays it out: the arm64e main file and its sub-caches under their real names, nothing for arm64.
   out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/named", '--base', base)
   abort out unless st.success?
+  File.symlink("#{dir}/no-such-target", "#{dir}/named/dyld_shared_cache_dangling")
   %w[cache cache.01 cache.02.dylddata].each { |f| FileUtils.cp("#{dir}/named/#{f}", "#{dir}/named/dyld_shared_cache_arm64e#{f.sub('cache', '')}") }
   out, st = Open3.capture2e("#{dir}/test", "#{dir}/named", 'leave', '/proc/self/auxv', 'named')
   named_ok = st.success? && out[/^RESULT .*$/] == 'RESULT ok'

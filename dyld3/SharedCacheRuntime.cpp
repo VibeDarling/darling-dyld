@@ -1773,7 +1773,8 @@ bool splitCacheMainFileIsMissing(const char* dir, const char* mainFilePath)
     struct stat statBuf;
     if ( dyld3::stat(dir, &statBuf) != 0 )
         return false;
-    return (dyld3::stat(mainFilePath, &statBuf) != 0) && (errno == ENOENT);
+    // lstat: a symbolic link that points nowhere is a broken store, not a missing architecture.
+    return (::lstat(mainFilePath, &statBuf) != 0) && (errno == ENOENT);
 }
 #endif // DARLING && !TARGET_OS_SIMULATOR
 

@@ -497,6 +497,8 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
   File.write("#{store}/dyld_shared_cache_arm64e", '')
   FileUtils.mkdir_p("#{dir}/emptystore")
   File.write("#{dir}/store-is-a-file", '')
+  FileUtils.mkdir_p("#{dir}/dangling")
+  File.symlink("#{dir}/no-such-target", "#{dir}/dangling/dyld_shared_cache_arm64")   # a store whose file went missing
   noaccess_check = Process.uid == 0 ? '// (the unreadable-directory case is skipped as root: permissions do not apply)' :
     "m = attempt(\"#{dir}/noaccess\", CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL);\n      CHECK(m.empty() && lastResult && dyld3::mapper.calls == 1);"
   FileUtils.mkdir_p("#{dir}/noaccess")
@@ -628,6 +630,9 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
       m = attempt("#{dir}/store-is-a-file", CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL);
       CHECK(m.empty() && lastResult && dyld3::mapper.calls == 1);
       #{noaccess_check}
+      // a dangling symbolic link at the main file's name is a broken store, not a missing architecture: the mapper reports it
+      m = attempt("#{dir}/dangling", CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL);
+      CHECK(m.empty() && lastResult && dyld3::mapper.calls == 1);
       // an empty real directory has no cache for any architecture
       m = attempt("#{dir}/emptystore", CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E);
       CHECK(m.empty() && !lastResult && dyld3::mapper.calls == 0);

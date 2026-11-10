@@ -105,8 +105,9 @@ const char* splitCacheMainFilePath(const char* dir, uint32_t cputype, uint32_t c
 const char* translateSplitCacheTSD(const SharedCacheLoadInfo& cache, const mach_header* image, darling_tsd::PatchStats* stats);
 #endif
 
-// True only when dir is a directory and mainFilePath (the file splitCacheMainFilePath built) does not exist in it: the
-// directory has no cache for this architecture. Every other failure to use the file is left to mapSplitCachePrivate.
+
+// True only when dir is a directory and mainFilePath (the file splitCacheMainFilePath built) does not exist in it (not
+// even as a dangling symbolic link): the directory has no cache for this architecture. Every other failure to use the file is left to mapSplitCachePrivate.
 bool splitCacheMainFileIsMissing(const char* dir, const char* mainFilePath);
 
 // Replaces the built-in allow-list with the policy file at path (DYLD_SHARED_CACHE_SPLIT_POLICY): the header line
