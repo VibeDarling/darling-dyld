@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include "MachOLoaded.h"
 
@@ -123,8 +124,6 @@ const char* validateAdapterRows(const AdapterRow* rows, size_t count)
 }
 
 // ------------------------------------------------------------------------------------------ thunks
-
-static const uint32_t kNop = 0xD503201F;
 
 static void putLiteral(uint32_t* words, uint64_t value)
 {
@@ -369,6 +368,29 @@ static HandlerArg authenticateHandler(uint64_t pointer)
 	return { result, false };
 }
 
+// The real sigaction() returns EFAULT for a pointer it cannot read or write, and an adapter that touches the caller's
+// structs must not crash instead. A pipe is a copy that the kernel does and that fails with EFAULT: write() reads the
+// source, read() writes the destination. When it fails the caller's own pointer goes through to the real call unchanged,
+// which then returns the error with the errno of the caller's libc (dyld's own errno is not the process's). The
+// descriptors exist for the length of one copy; no memory is mapped or probed in any other way.
+enum class Access { Ok, Fault, NoResource };
+
+static Access copyThroughPipe(void* destination, const void* source, size_t length)
+{
+	int fds[2];
+	if ( pipe(fds) != 0 )
+		return Access::NoResource;
+	const bool ok = (write(fds[1], source, length) == (ssize_t)length) && (read(fds[0], destination, length) == (ssize_t)length);
+	close(fds[0]);
+	close(fds[1]);
+	return ok ? Access::Ok : Access::Fault;
+}
+
+static void warnNoDescriptors(const AdapterRow* row)
+{
+	dyld::warn("arm64e adapters: %s could not make a pipe to copy the caller's struct, so the call goes through unadapted\n", row->symbol);
+}
+
 // Rewriting a shared block would corrupt it for its other users, and the proxy block that would serve both needs an
 // arm64e compiled shim: until then the call stops here, with the reason.
 static void refuseBlock(const AdapterRow* row, const char* what)
@@ -416,23 +438,39 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 	}
 
 	// The callee gets private copies of both structs: the caller's can be read-only, and another thread can write to the
-	// caller's memory while the call runs, so nothing is read from it again after the copy. The old action is copied
-	// out afterwards, and the handler that is remembered as handed out is the one in the private copy.
+	// caller's memory while the call runs, so nothing is read from it again after the copy. The old action goes back to
+	// the caller only when the call succeeded (a failed call leaves it as it was). A pointer that cannot be read, or an old
+	// action that cannot be written, goes through as the caller gave it, and the real call answers EFAULT.
 	uint64_t structCopy[2];
 	uint64_t oldCopy[2];
-	bool structGenuine = false;
+	bool actCopied = false, structGenuine = false;
 	void* callerOld = nullptr;
 	if ( (row->structArg != 0) && (a[row->structArg - 1] != 0) ) {
-		memcpy(structCopy, (const void*)a[row->structArg - 1], sizeof(structCopy));
-		const HandlerArg arg = authenticateHandler(structCopy[0]);
-		structCopy[0] = arg.value;
-		structGenuine = arg.genuine;
-		a[row->structArg - 1] = (uint64_t)structCopy;
+		const Access access = copyThroughPipe(structCopy, (const void*)a[row->structArg - 1], sizeof(structCopy));
+		if ( access == Access::Ok ) {
+			const HandlerArg arg = authenticateHandler(structCopy[0]);
+			structCopy[0] = arg.value;
+			structGenuine = arg.genuine;
+			actCopied = true;
+			a[row->structArg - 1] = (uint64_t)structCopy;
+		}
+		else if ( access == Access::NoResource ) {
+			warnNoDescriptors(row);
+		}
 	}
 	if ( (row->structArg != 0) && (a[row->structArg] != 0) ) {
-		callerOld = (void*)a[row->structArg];
-		memcpy(oldCopy, callerOld, sizeof(oldCopy));
-		a[row->structArg] = (uint64_t)oldCopy;
+		// writable means that what is in it can be written back: the bytes are read and put back unchanged
+		uint64_t current[2];
+		void* old = (void*)a[row->structArg];
+		const Access access = copyThroughPipe(current, old, sizeof(current));
+		if ( (access == Access::Ok) && (copyThroughPipe(old, current, sizeof(current)) == Access::Ok) ) {
+			callerOld = old;
+			oldCopy[0] = oldCopy[1] = 0;
+			a[row->structArg] = (uint64_t)oldCopy;
+		}
+		else if ( access == Access::NoResource ) {
+			warnNoDescriptors(row);
+		}
 	}
 
 	// Block_copy: the original's signature is checked before anything is signed for the copy
@@ -451,16 +489,25 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 	if ( restoreSlot != nullptr )
 		*restoreSlot = restoreValue;
 	const int32_t sig = signalNumber(a[0]);
-	if ( row->structArg != 0 ) {
-		// sigaction returned 0: the handler in act is the one installed (remembered only when its signature was real), and
-		// the old action holds the handler that plain code has, which arm64e code may pass back
-		if ( ((int)result == 0) && (a[row->structArg - 1] != 0) )
-			recordInstalledHandler(sig, structGenuine ? structCopy[0] : 0);
+	if ( (row->structArg != 0) && ((int)result == 0) ) {
+		// sigaction succeeded. The old action holds the handler that was installed before. Like signal(), it is signed
+		// only when it is the one that arm64e code installed with a real signature; any other (plain code's) goes back as it
+		// is, and is remembered so that arm64e code can pass it back. This looks at the table before the new handler is
+		// recorded in it.
 		if ( callerOld != nullptr ) {
-			memcpy(callerOld, oldCopy, sizeof(oldCopy));
-			if ( (int)result == 0 )
-				recordHandedOut(oldCopy[0]);
+			if ( !isSpecialHandler(oldCopy[0]) ) {
+				if ( wasInstalledHere(sig, oldCopy[0]) )
+					oldCopy[0] = AdapterSign::signPointer(oldCopy[0], nullptr, false, 0, 0);
+				else
+					recordHandedOut(oldCopy[0]);
+			}
+			const Access access = copyThroughPipe(callerOld, oldCopy, sizeof(oldCopy));
+			if ( access == Access::NoResource )
+				warnNoDescriptors(row);
 		}
+		// the handler in act is the one installed, remembered only when its signature was real
+		if ( actCopied )
+			recordInstalledHandler(sig, structGenuine ? structCopy[0] : 0);
 	}
 	switch ( row->ret ) {
 		case ReturnFix::None:

@@ -13,6 +13,8 @@
 
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <errno.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -81,6 +83,7 @@ typedef uint64_t (*Fn8)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64
 static const uint64_t kSentinel[8] = { 0x1111111111111111, 0x2222222222222222, 0x3333333333333333, 0x4444444444444444,
 									   0x5555555555555555, 0x6666666666666666, 0x7777777777777777, 0x0888888888888888 };
 
+static uint64_t codeWithSignature(uint64_t modifier);
 static uint64_t codeAddress(int n) { return 0x0000000100003000ULL + 0x40 * n; }
 
 static std::vector<uint64_t> gThunkAddresses;
@@ -100,7 +103,7 @@ static const Block* gGlobalBlock;
 static void makeGlobalBlock()
 {
 	Block* page = (Block*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-	*page = { nullptr, kGlobal, 0, (void*)oracleSign(0x0000000100004000ULL, (uint64_t)&page->invoke), nullptr };
+	*page = { nullptr, kGlobal, 0, (void*)oracleSign(codeWithSignature((uint64_t)&page->invoke), (uint64_t)&page->invoke), nullptr };
 	mprotect(page, 4096, PROT_READ);
 	gGlobalBlock = page;
 }
@@ -113,7 +116,7 @@ static const Block* gReadOnlyHeapBlock;
 static void makeReadOnlyHeapBlock()
 {
 	Block* page = (Block*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-	*page = { nullptr, kHeap, 0, (void*)oracleSign(0x0000000100005000ULL, (uint64_t)&page->invoke), nullptr };
+	*page = { nullptr, kHeap, 0, (void*)oracleSign(codeWithSignature((uint64_t)&page->invoke), (uint64_t)&page->invoke), nullptr };
 	mprotect(page, 4096, PROT_READ);
 	gReadOnlyHeapBlock = page;
 }
@@ -123,7 +126,12 @@ static void snapshotBlock(const uint64_t* a) { const Block* b = (const Block*)a[
 
 static void checkPacWorks()
 {
-	const uint64_t p = codeAddress(1), s = oracleSign(p, 0);
+	// an address whose signatures for modifiers 0 and 1 differ and are not zero: with 7 PAC bits two signatures of one
+	// address are equal about once in 128, and that must not make a check fail
+	uint64_t p = codeAddress(1);
+	while ( (oracleSign(p, 0) == p) || (oracleSign(p, 1) == oracleSign(p, 0)) )
+		p += 0x40;
+	const uint64_t s = oracleSign(p, 0);
 	CHECK(s != p, "this host does not sign (no pointer authentication): the test cannot say anything");
 	CHECK(oracleStrip(s) == p, "oracle strip");
 	CHECK(oracleAuth(s, 0) == p, "oracle auth");
@@ -237,7 +245,19 @@ static uint64_t codeWithSignature(uint64_t modifier)
 }
 
 static bool gFpac;
-static void touch() { }
+// functions whose address, signed with modifier 0, differs from the address: with the process's random key about one
+// in 128 would sign to itself, and a "corrupted" copy of that is no corruption at all
+static void touch0() { }
+static void touch1() { }
+static void touch2() { }
+static void touch3() { }
+static uint64_t touch()
+{
+	for (void (*f)() : { touch0, touch1, touch2, touch3 })
+		if ( oracleSign((uint64_t)f, 0) != (uint64_t)f )
+			return (uint64_t)f;
+	return (uint64_t)touch0;
+}
 static uint64_t callArg0(uint64_t p, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t)
 {
 	((void (*)())p)();
@@ -251,7 +271,7 @@ static void detectFpac()
 	pid_t pid = fork();
 	if ( pid == 0 ) {
 		signal(SIGSEGV, SIG_DFL);
-		oracleAuth(corrupted(oracleSign(codeAddress(1), 0)), 0);
+		oracleAuth(corrupted(oracleSign(codeWithSignature(0), 0)), 0);
 		_exit(0);
 	}
 	int status = 0;
@@ -304,8 +324,8 @@ static int childOutput(void (*body)(), std::string& out)
 }
 
 static Fn8 gCallingThunk;
-static void callGoodPointer() { gCallingThunk(oracleSign((uint64_t)&touch, 0), 0, 0, 0, 0, 0, 0, 0); }
-static void callCorruptedPointer() { gCallingThunk(corrupted(oracleSign((uint64_t)&touch, 0)), 0, 0, 0, 0, 0, 0, 0); }
+static void callGoodPointer() { gCallingThunk(oracleSign(touch(), 0), 0, 0, 0, 0, 0, 0, 0); }
+static void callCorruptedPointer() { gCallingThunk(corrupted(oracleSign(touch(), 0)), 0, 0, 0, 0, 0, 0, 0); }
 
 static void checkAuthRows()
 {
@@ -472,7 +492,7 @@ static void checkHandlerRoundTrip()
 	// ones are refused. Shifting the start by 0..64 puts the wrap-around at every slot, so a ring that is a slot too long
 	// or too short loses a handler in one of the rounds.
 	if ( !gFpac ) {
-		uint64_t next = 0x000000010000a000ULL;
+		uint64_t next = 0x0000000200000000ULL;	// far from every other test's handlers: a value already in the ring is not entered twice
 		auto fresh = [&]() { next = codeWithSignatureAfter(next + 0x40, 0); return next; };
 		for (int shift = 0; shift <= 64; ++shift) {
 			for (int i = 0; i != shift; ++i) {
@@ -629,7 +649,7 @@ static void checkSignalNumbers()
 	// SIG_HOLD (5) is only for sigset, which has no adapter: here it is a pointer like any other and does not authenticate
 	if ( !gFpac ) {
 		sig(14, 5, 0, 0, 0, 0, 0, 0);
-		CHECK(gSeen[1] == oracleAuth(5, 0) && gSeen[1] != 5, "signal numbers: SIG_HOLD reached the callee as a valid pointer");
+		CHECK(gSeen[1] == oracleAuth(5, 0) && ((oracleSign(5, 0) == 5) || (gSeen[1] != 5)), "signal numbers: SIG_HOLD reached the callee as a valid pointer");
 	}
 }
 
@@ -650,11 +670,13 @@ static void checkBlockCopy()
 	CHECK(t((uint64_t)&original, 0, 0, 0, 0, 0, 0, 0) == (uint64_t)&gHeapResult, "Block_copy: the block pointer changed");
 	CHECK(oracleAuth((uint64_t)gHeapResult.invoke, (uint64_t)&gHeapResult.invoke) == plainTarget, "Block_copy: the copy's invoke is not signed for its own address (IA, address-diversified, discriminator 0)");
 	CHECK(gHeapResult.flags == kHeap, "Block_copy: flags changed");
-	CHECK((uint64_t)original.invoke != (uint64_t)gHeapResult.invoke || (uint64_t)&original == (uint64_t)&gHeapResult, "Block_copy: the copy kept the stale signature");
+	// (the two signatures differ unless the PAC of the two addresses happens to be equal, about once in 128)
+	CHECK(oracleSign(plainTarget, (uint64_t)&original.invoke) == oracleSign(plainTarget, (uint64_t)&gHeapResult.invoke) || (uint64_t)original.invoke != (uint64_t)gHeapResult.invoke, "Block_copy: the copy kept the stale signature");
 
 	// the original's signature is checked first: a corrupted one is not turned into a valid signature for the copy
 	Block bad = original;
-	bad.invoke = (void*)corrupted((uint64_t)original.invoke);
+	// signed for its own address and then corrupted: a signature made for another address would verify by luck about once in 128
+	bad.invoke = (void*)corrupted(oracleSign(codeWithSignature((uint64_t)&bad.invoke), (uint64_t)&bad.invoke));
 	gHeapResult = bad;
 	gHeapResult.flags = kHeap;
 	t((uint64_t)&bad, 0, 0, 0, 0, 0, 0, 0);
@@ -735,7 +757,7 @@ static void checkDispatch()
 
 		// a stack block with a corrupted signature reaches the callee unusable and is left as it was
 		Block badStack = stack;
-		badStack.invoke = (void*)corrupted((uint64_t)original);
+		badStack.invoke = (void*)corrupted(oracleSign(codeWithSignature((uint64_t)&badStack.invoke), (uint64_t)&badStack.invoke));
 		void* badOriginal = badStack.invoke;
 		if ( !gFpac ) {
 			t(0x1010, (uint64_t)&badStack, 0, 0, 0, 0, 0, 0);
@@ -763,6 +785,122 @@ static void checkDispatch()
 		CHECK(gSeen[1] == 0, "%s: NULL block", name);
 		gHook = nullptr;
 	}
+}
+
+// A pointer that cannot be read or written goes through to the real call as the caller gave it, which answers EFAULT; the
+// thunk itself must not crash. Here the real call is the fake, which sees the caller's pointers.
+static void checkSigactionFaults()
+{
+	Fn8 act = thunkFor("_sigaction");
+	struct Act { uint64_t handler; uint32_t mask; int32_t flags; };
+	const uint64_t handlerA = oracleSign(codeWithSignature(0), 0);
+	Act good = { handlerA, 1, 2 };
+	Act oldGood = { 0, 0, 0 };
+	// a page that cannot be touched, a read-only page and the null page
+	void* unmapped = mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	Act* readOnly = (Act*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	*readOnly = { 0x1111, 2, 3 };
+	mprotect(readOnly, 4096, PROT_READ);
+	const uint64_t bad[] = { (uint64_t)unmapped, 0x10 };
+
+	gFakeResult = 0xffffffffULL;	// -1: what the real call answers for EFAULT
+	for (uint64_t b : bad) {
+		// invalid act, good old action
+		uint64_t result = act(5, b, (uint64_t)&oldGood, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] == b && (int)result == -1, "EFAULT: an unreadable act did not go through unchanged (0x%llx)", (unsigned long long)gSeen[1]);
+		// good act, invalid old action
+		result = act(5, (uint64_t)&good, b, 0, 0, 0, 0, 0);
+		CHECK(gSeen[2] == b && gSeen[1] != (uint64_t)&good && (int)result == -1, "EFAULT: an unwritable old action did not go through unchanged");
+		// both
+		result = act(5, b, b, 0, 0, 0, 0, 0);
+		CHECK(gSeen[1] == b && gSeen[2] == b && (int)result == -1, "EFAULT: invalid act and old action");
+	}
+	// an old action that can be read but not written is handed on as it is, and what it holds is untouched
+	const Act before = *readOnly;
+	act(5, (uint64_t)&good, (uint64_t)readOnly, 0, 0, 0, 0, 0);
+	CHECK(gSeen[2] == (uint64_t)readOnly && memcmp(readOnly, &before, sizeof(Act)) == 0, "EFAULT: a read-only old action was replaced by a private copy");
+
+	// a failed call leaves the caller's old action exactly as it was, whatever the callee wrote into the copy it was given
+	Act untouched = { 0x7777, 0x88, 0x99 };
+	static Act written;
+	written = { 0x5555, 0x66, 0x77 };
+	gHook = [](const uint64_t* a) { if (a[2]) memcpy((void*)a[2], &written, sizeof(written)); };
+	gFakeResult = 0xffffffffULL;
+	act(5, (uint64_t)&good, (uint64_t)&untouched, 0, 0, 0, 0, 0);
+	CHECK(untouched.handler == 0x7777 && untouched.mask == 0x88 && untouched.flags == 0x99, "a failed sigaction changed the caller's old action (0x%llx)", (unsigned long long)untouched.handler);
+	// and a successful one hands it back
+	gFakeResult = 0;
+	act(5, (uint64_t)&good, (uint64_t)&untouched, 0, 0, 0, 0, 0);
+	CHECK(untouched.handler == 0x5555 && untouched.mask == 0x66 && untouched.flags == 0x77, "a successful sigaction did not hand back the old action");
+	gHook = nullptr;
+}
+
+// no descriptor for the pipe: the call goes through unadapted, with a warning that says why
+struct PipeAct { uint64_t handler; uint32_t mask; int32_t flags; };
+static Fn8 gPipeThunk;
+static PipeAct* gPipeAct;
+static void withoutDescriptors()
+{
+	struct rlimit none = { 3, 3 };
+	setrlimit(RLIMIT_NOFILE, &none);
+	gFakeResult = 0;
+	gPipeThunk(5, (uint64_t)gPipeAct, 0, 0, 0, 0, 0, 0);
+	_exit(gSeen[1] == (uint64_t)gPipeAct ? 0 : 1);
+}
+
+static void checkNoDescriptors()
+{
+	PipeAct act = { oracleSign(codeWithSignature(0), 0), 0, 0 };
+	gPipeThunk = thunkFor("_sigaction");
+	gPipeAct = &act;
+	std::string message;
+	const int status = childOutput(withoutDescriptors, message);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0 && message.find("could not make a pipe") != std::string::npos, "no descriptors: status 0x%x, '%s'", status, message.c_str());
+}
+
+// The old action is signed like signal()'s result: only when it is the handler that arm64e code installed with a real
+// signature. Plain code's handlers, and SIG_DFL and SIG_IGN, come back as they are.
+static void checkOldActionSigning()
+{
+	Fn8 act = thunkFor("_sigaction");
+	struct Act { uint64_t handler; uint32_t mask; int32_t flags; };
+	const uint64_t handlerA = oracleSign(codeWithSignature(0), 0), plainA = oracleStrip(handlerA);
+	const uint64_t handlerB = oracleSign(codeWithSignature(0) + 0x400, 0);
+	const uint64_t plainOld = codeWithSignatureAfter(0x000000010000b000ULL, 0);
+	static uint64_t oldWritten;
+	gHook = [](const uint64_t* a) { if (a[2]) ((Act*)a[2])->handler = oldWritten; };
+	gFakeResult = 0;
+
+	// arm64e code installs A; the next call, installing B, reads A back: signed, and the chained call authenticates
+	Act installA = { handlerA, 0, 0 }, installB = { handlerB, 0, 0 }, old = { 0, 0, 0 };
+	oldWritten = 0;
+	act(18, (uint64_t)&installA, 0, 0, 0, 0, 0, 0);
+	oldWritten = plainA;
+	act(18, (uint64_t)&installB, (uint64_t)&old, 0, 0, 0, 0, 0);
+	CHECK(old.handler != plainA && oracleAuth(old.handler, 0) == plainA, "old action: the handler arm64e code installed came back unsigned (0x%llx)", (unsigned long long)old.handler);
+
+	// plain code's handler comes back as it is, and the ring takes it
+	oldWritten = plainOld;
+	act(18, (uint64_t)&installA, (uint64_t)&old, 0, 0, 0, 0, 0);
+	CHECK(old.handler == plainOld, "old action: a plain handler was signed (0x%llx)", (unsigned long long)old.handler);
+
+	// SIG_DFL and SIG_IGN come back as they are, even for a signal that arm64e code has installed a handler on
+	for (uint64_t special : { 0ULL, 1ULL }) {
+		oldWritten = special;
+		old.handler = 0xabc;
+		act(18, (uint64_t)&installB, (uint64_t)&old, 0, 0, 0, 0, 0);
+		CHECK(old.handler == special, "old action: special value %llu came back as 0x%llx", (unsigned long long)special, (unsigned long long)old.handler);
+	}
+
+	// A is recorded again by installing it; a handler that only the ring accepted is not: it is never signed
+	oldWritten = 0;
+	act(17, (uint64_t)&installA, 0, 0, 0, 0, 0, 0);
+	Act viaRing = { plainOld, 0, 0 };
+	act(17, (uint64_t)&viaRing, 0, 0, 0, 0, 0, 0);	// accepted through the ring, installed, recorded as 0
+	oldWritten = plainOld;
+	act(17, (uint64_t)&installB, (uint64_t)&old, 0, 0, 0, 0, 0);
+	CHECK(old.handler == plainOld, "old action: a handler that only the ring accepted was signed (0x%llx)", (unsigned long long)old.handler);
+	gHook = nullptr;
 }
 
 static void checkSigaction()
@@ -896,6 +1034,9 @@ int main(int argc, char** argv)
 	checkDispatch();
 	checkRefusedBlocks();
 	checkSigaction();
+	checkSigactionFaults();
+	checkNoDescriptors();
+	checkOldActionSigning();
 	checkHandlerRoundTrip();
 	checkSignalNumbers();
 	checkNoSigningOracle();
