@@ -5,7 +5,8 @@
 //   abi_probe                 driver: run every check in its own child, print one RESULT per check
 //   abi_probe mutate          same, but every pointer handed to the subject API is first stripped
 //                             of its signature (xpaci): the mutation probe
-//   abi_probe run N [0|1]     one check in this process (the driver execs this); 1 = mutate
+//   abi_probe run N [0|1] [SET]  one check of SET (checks or selftest) in this process (the driver
+//                             execs this); 1 = mutate
 //   abi_probe selftest        harness self-test: deliberate ok/fault/hang/fail children (st_* below)
 //   abi_probe list
 //
