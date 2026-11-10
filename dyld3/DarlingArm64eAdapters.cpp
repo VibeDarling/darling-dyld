@@ -32,6 +32,7 @@ struct BlockLiteral {
 };
 static_assert(sizeof(BlockLiteral) == 32, "block literal layout");
 static const int32_t kBlockNeedsFree = 1 << 24;
+static const int32_t kBlockHasCopyDispose = 1 << 25;
 static const int32_t kBlockIsGlobal  = 1 << 28;
 
 // The plain arm64 assembler of this build refuses the PAC mnemonics, so these are .inst words on x17 and x16.
@@ -314,6 +315,14 @@ static bool wasInstalledHere(uint64_t signalNumber, uint64_t handler)
 	return same;
 }
 
+// Rewriting a shared block would corrupt it for its other users, and the proxy block that would serve both needs an
+// arm64e compiled shim: until then the call stops here, with the reason.
+static void refuseBlock(const AdapterRow* row, const char* what)
+{
+	dyld::warn("arm64e adapters: %s was passed %s by an arm64e image; plain code cannot call it and rewriting it in place would corrupt it for its other users: this needs the arm64e shim (decision Q3 option B)\n", row->symbol, what);
+	__builtin_trap();
+}
+
 typedef uint64_t (*Call8)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
 static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
@@ -325,9 +334,10 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 			a[i] = authenticateFunction(a[i]);
 	}
 
-	// An address-diversified invoke is authenticated with the address of its own field. A stack block that the callee
-	// copies or runs before it returns gets its signature back afterwards; a heap block stays authenticated, so arm64e
-	// code that calls that same object itself later faults (not shown by the probe: L2 checks 07-09 use stack and global blocks).
+	// An address-diversified invoke is authenticated with the address of its own field. A stack block is rewritten for the
+	// call only (the callee copies it or runs it before it returns) and gets its signature back afterwards. A heap block
+	// is shared: plain code needs its invoke unsigned and arm64e code needs it signed, and no rewrite serves both, so it
+	// is refused. So is any block with copy or dispose helpers, whose pointers arm64e signs and plain code calls unsigned.
 	void** restoreSlot = nullptr;
 	void* restoreValue = nullptr;
 	if ( (row->blockArg != 0) && (a[row->blockArg - 1] != 0) ) {
@@ -337,10 +347,12 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 			a[row->blockArg - 1] = (uint64_t)mirrorOfGlobalBlock(block, plainInvoke);
 		}
 		else {
-			if ( (block->flags & kBlockNeedsFree) == 0 ) {
-				restoreSlot = &block->invoke;
-				restoreValue = block->invoke;
-			}
+			if ( block->flags & kBlockHasCopyDispose )
+				refuseBlock(row, "a block with copy and dispose helpers");
+			if ( block->flags & kBlockNeedsFree )
+				refuseBlock(row, "a heap block");
+			restoreSlot = &block->invoke;
+			restoreValue = block->invoke;
 			block->invoke = (void*)plainInvoke;
 		}
 	}
@@ -357,6 +369,8 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 	uint64_t originalBlock = 0, originalInvoke = 0;
 	if ( (row->ret == ReturnFix::ResignCopiedBlock) && (a[0] != 0) ) {
 		const BlockLiteral* block = (const BlockLiteral*)a[0];
+		if ( (block->flags & kBlockHasCopyDispose) && ((block->flags & kBlockIsGlobal) == 0) )
+			refuseBlock(row, "a block with copy and dispose helpers");
 		originalBlock = a[0];
 		originalInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);
 	}

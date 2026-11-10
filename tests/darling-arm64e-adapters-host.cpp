@@ -23,6 +23,7 @@
 using namespace dyld3::darling;
 
 static std::string gWarnings;
+static bool gEcho;	// a child that is about to be killed has nowhere to keep its warnings but stderr
 namespace dyld {
 void warn(const char* format, ...)
 {
@@ -32,6 +33,8 @@ void warn(const char* format, ...)
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
 	gWarnings += line;
+	if ( gEcho )
+		fputs(line, stderr);
 }
 }
 
@@ -102,6 +105,9 @@ static void makeGlobalBlock()
 	gGlobalBlock = page;
 }
 
+static Block* gSharedBlock;
+static const char* gRefusedSymbol;
+static void passSharedBlock() { ((Fn8)adaptedTarget(gRefusedSymbol, (uint64_t)&fake8, false))((uint64_t)gSharedBlock, (uint64_t)gSharedBlock, 0, 0, 0, 0, 0, 0); }
 // a heap block in read-only memory: Block_copy of it is a retain, and a write into it by the module crashes the test
 static const Block* gReadOnlyHeapBlock;
 static void makeReadOnlyHeapBlock()
@@ -268,6 +274,34 @@ static bool childSurvives(void (*body)())
 	return WIFEXITED(status) && (WEXITSTATUS(status) == 0);
 }
 
+// Runs body in a child with stderr in a pipe. Returns the wait status; out gets what the child wrote to stderr.
+static int childOutput(void (*body)(), std::string& out)
+{
+	int fds[2];
+	if ( pipe(fds) != 0 )
+		return -1;
+	fflush(stdout);
+	pid_t pid = fork();
+	if ( pid == 0 ) {
+		close(fds[0]);
+		dup2(fds[1], 2);
+		gEcho = true;
+		signal(SIGSEGV, SIG_DFL); signal(SIGBUS, SIG_DFL); signal(SIGILL, SIG_DFL); signal(SIGTRAP, SIG_DFL);
+		body();
+		_exit(0);
+	}
+	close(fds[1]);
+	char buf[512];
+	ssize_t n;
+	out.clear();
+	while ( (n = read(fds[0], buf, sizeof(buf))) > 0 )
+		out.append(buf, n);
+	close(fds[0]);
+	int status = 0;
+	waitpid(pid, &status, 0);
+	return status;
+}
+
 static Fn8 gCallingThunk;
 static void callGoodPointer() { gCallingThunk(oracleSign((uint64_t)&touch, 0), 0, 0, 0, 0, 0, 0, 0); }
 static void callCorruptedPointer() { gCallingThunk(corrupted(oracleSign((uint64_t)&touch, 0)), 0, 0, 0, 0, 0, 0, 0); }
@@ -415,6 +449,17 @@ static void checkBlockCopy()
 	gFakeResult = (uint64_t)gReadOnlyHeapBlock;
 	CHECK(t((uint64_t)gReadOnlyHeapBlock, 0, 0, 0, 0, 0, 0, 0) == (uint64_t)gReadOnlyHeapBlock, "Block_copy: a retained block");
 
+	// a block with copy and dispose helpers is refused before the plain Block_copy calls helpers it cannot call
+	{
+		Block withHelpers = original;
+		withHelpers.flags = 1 << 25;
+		*gSharedBlock = withHelpers;
+		gRefusedSymbol = "__Block_copy";
+		std::string message;
+		const int status = childOutput(passSharedBlock, message);
+		CHECK(WIFSIGNALED(status) && message.find("copy and dispose helpers") != std::string::npos, "Block_copy: helpers were not refused: '%s'", message.c_str());
+	}
+
 	// a global block comes back as it is (its literal is read-only), and NULL stays NULL
 	CHECK(gGlobalBlock->invoke != (void*)oracleStrip((uint64_t)gGlobalBlock->invoke), "the global block of this test is not signed");
 	const void* signedInvoke = gGlobalBlock->invoke;
@@ -422,6 +467,30 @@ static void checkBlockCopy()
 	CHECK(t((uint64_t)gGlobalBlock, 0, 0, 0, 0, 0, 0, 0) == (uint64_t)gGlobalBlock && gGlobalBlock->invoke == signedInvoke, "Block_copy: a global block was touched");
 	gFakeResult = 0;
 	CHECK(t(0, 0, 0, 0, 0, 0, 0, 0) == 0, "Block_copy: NULL");
+}
+
+// A heap block, or a block with helpers, is refused: the child dies with a message that names the symbol and the shim, and the
+// block (in memory that parent and child share) is exactly as it was, so it is not corrupted for its other users.
+static void checkRefusedBlocks()
+{
+	struct Case { const char* symbol; int32_t flags; const char* what; };
+	const Case cases[] = {
+		{ "_dispatch_async", kHeap, "a heap block" }, { "_dispatch_once", kHeap, "a heap block" },
+		{ "_dispatch_async", 1 << 25, "a block with copy and dispose helpers" },
+		{ "_dispatch_async", kHeap | (1 << 25), "a block with copy and dispose helpers" }, { "_dispatch_once", 1 << 25, "a block with copy and dispose helpers" },
+	};
+	for (const Case& c : cases) {
+		*gSharedBlock = { nullptr, c.flags, 0, (void*)oracleSign(codeWithSignature((uint64_t)&gSharedBlock->invoke), (uint64_t)&gSharedBlock->invoke), nullptr };
+		const Block before = *gSharedBlock;
+		gRefusedSymbol = c.symbol;
+		std::string message;
+		const int status = childOutput(passSharedBlock, message);
+		CHECK(WIFSIGNALED(status), "%s: %s was not refused (status 0x%x)", c.symbol, c.what, status);
+		CHECK(message.find(c.symbol) != std::string::npos && message.find(c.what) != std::string::npos && message.find("option B") != std::string::npos, "%s: the refusal says '%s'", c.symbol, message.c_str());
+		CHECK(memcmp(gSharedBlock, &before, sizeof(Block)) == 0, "%s: %s was rewritten before it was refused", c.symbol, c.what);
+		// the block queued and passed again: still its own, still signed, because nothing ever rewrote it
+		CHECK(gSharedBlock->invoke == before.invoke, "%s: the shared block lost its signature", c.symbol);
+	}
 }
 
 static void checkDispatch()
@@ -451,11 +520,9 @@ static void checkDispatch()
 			CHECK(badStack.invoke == badOriginal, "%s: a corrupted stack block was changed", name);
 		}
 
-		// a heap block: authenticated for good (the callee keeps it)
-		Block heap = { nullptr, kHeap, 0, nullptr, nullptr };
-		heap.invoke = (void*)oracleSign(target, (uint64_t)&heap.invoke);
-		t(0x1010, (uint64_t)&heap, 0, 0, 0, 0, 0, 0);
-		CHECK(gBlockInvokeSeen == target && heap.invoke == (void*)target, "%s: heap block", name);
+		// the same stack block twice: the second call finds the signature the first one restored
+		t(0x1010, (uint64_t)&stack, 0, 0, 0, 0, 0, 0);
+		CHECK(gBlockInvokeSeen == target && stack.invoke == original, "%s: a second call with the same stack block", name);
 
 		// a global block lives in read-only memory: the callee gets a mirror with the invoke authenticated, the literal is untouched
 		const void* globalBefore = gGlobalBlock->invoke;
@@ -577,11 +644,13 @@ int main(int argc, char** argv)
 	detectFpac();
 	makeGlobalBlock();
 	makeReadOnlyHeapBlock();
+	gSharedBlock = (Block*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	checkTable();
 	checkAuthRows();
 	checkSignal();
 	checkBlockCopy();
 	checkDispatch();
+	checkRefusedBlocks();
 	checkSigaction();
 	checkBind();
 	checkSeal();
