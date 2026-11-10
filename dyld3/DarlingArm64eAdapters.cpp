@@ -157,8 +157,9 @@ uint64_t callThunkHelperAddress()
 	return (uint64_t)&callRow;
 }
 
-// Saves x0-x7 below a frame record, then callRow(regs, row, real) does the work and returns the result in x0.
-size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real)
+// Saves x0-x7 below a frame record, then helper(regs, row, real) does the work and returns the result in x0. Both
+// directions use this template; the row is whichever table the helper reads.
+static size_t emitCallThunkWith(uint32_t* words, const void* row, uint64_t real, uint64_t helper)
 {
 	static const uint32_t kTemplate[14] = {
 		0xA9BB7BFD,		// stp x29, x30, [sp, #-80]!
@@ -179,8 +180,13 @@ size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real)
 	memcpy(words, kTemplate, sizeof(kTemplate));
 	putLiteral(&words[14], (uint64_t)row);
 	putLiteral(&words[16], real);
-	putLiteral(&words[18], callThunkHelperAddress());
+	putLiteral(&words[18], helper);
 	return 20;
+}
+
+size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real)
+{
+	return emitCallThunkWith(words, row, real, callThunkHelperAddress());
 }
 
 // Thunks are never in a page that is writable and executable at once. Each new thunk gets its own page: mapped read-write,
