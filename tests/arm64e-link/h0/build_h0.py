@@ -33,8 +33,10 @@ STUBS = {
     # versions as in the cache's libexpat (compat 7.0.0, current 8.0.0)
     "libexpat": ("/usr/lib/libexpat.1.dylib", "libexpat_symbols.txt", "7.0.0", "8.0.0",
                  "libexpat.1.linkonly.dylib"),
-    # symbols file given by the caller (abi/libcxxabi_symbols.txt, the ABI probe's stub)
+    # symbols file given by the caller (abi/libcxxabi_symbols.txt, the ABI probe's stub; l4/ writes
+    # both lists from the names its objects reference)
     "libc++abi": ("/usr/lib/libc++abi.dylib", None, "1.0.0", "1.0.0", "libc++abi.linkonly.dylib"),
+    "libc++": ("/usr/lib/libc++.1.dylib", None, "1.0.0", "1.0.0", "libc++.1.linkonly.dylib"),
 }
 
 # leaf library under test: its program, the executable's name and its expected structure.
@@ -90,8 +92,9 @@ def build_all(out_dir, mode="stub", libz_symbols=None, leaf="libz"):
 
 # ---------------------------------------------------------------------- checks
 
-def check_stub(path, which, symbols_file=None):
-    """Problems with a link-only stub: install name, versions, exports, trap bodies."""
+def check_stub(path, which, symbols_file=None, subtype=None):
+    """Problems with a link-only stub: install name, versions, exports, trap bodies. `subtype` is
+    the cpusubtype it must have (default arm64e; the ABI and L4 controls pass 0 for plain arm64)."""
     install, symbols, compat, current, _ = STUBS[which]
     want = {"_" + n for n in gen_stub.read_symbols(symbols_file or os.path.join(HERE, symbols))}
     problems = []
@@ -99,8 +102,9 @@ def check_stub(path, which, symbols_file=None):
         m = rec.load_macho(path)
     except rec.RecipeError as e:
         return [str(e)]
-    if (m.cputype, m.cpusubtype, m.filetype) != (rec.CPU_TYPE_ARM64, rec.CPU_SUBTYPE_ARM64E, rec.MH_DYLIB):
-        problems.append("%s is not an arm64e dylib" % path)
+    subtype = rec.CPU_SUBTYPE_ARM64E if subtype is None else subtype
+    if (m.cputype, m.cpusubtype, m.filetype) != (rec.CPU_TYPE_ARM64, subtype, rec.MH_DYLIB):
+        problems.append("%s is not an arm64 dylib of cpusubtype 0x%x" % (path, subtype))
     if m.install_name != install:
         problems.append("install name %r, expected %r" % (m.install_name, install))
     got = tuple(rec.version_str(v) for v in m.install_versions or ())
