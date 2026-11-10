@@ -19,7 +19,11 @@ python3 -I tests/arm64e-link/abi/tally.py <build>/logs/run-PREFIX*.out  # per (a
 
 ## Files
 
-- `l4_checks.cpp`: the 28 checks, the 8 diagnostics x1..x8 after them, the expectation table, `l4_iface.h` (the harness as C++ sees it).
+- `l4_checks.cpp`: the 28 checks, the 8 diagnostics x1..x8 after them, the 2 slot diagnostics y1 and y2, the 8 reverse-adapter checks
+  z1..z8, the expectation table, `l4_iface.h` (the harness as C++ sees it, and `L4_SIGN`/`L4_BLEND`, the identity without pointer authentication).
+- `l4_plain.c`, `build_plain_dylib.py`: `l4_plain.dylib`, a plain arm64 dylib that binds the cache's `std::set_terminate` and
+  `std::get_terminate`; z1..z8 load it with `dlopen` from the directory of the probe executable (build it into the same `--out` directory:
+  `python3 -I build_plain_dylib.py build --out DIR/plain; cp DIR/plain/l4_plain.dylib DIR/`).
 - `../abi/abi_harness.c`: the driver, reused (one child per check, `OKMARK`, fault handler, 12 s watchdog,
   self-test). It gained the per-configuration expectation grammar and a native branch for this test;
   `../abi/tally.py` gained a config column.
@@ -89,6 +93,9 @@ recorded fact, never a fault. In c3 it also requires the image to be `/usr/lib/l
 
 | x1-x8 | x1_get_terminate, x2_set_get_terminate, x3_allocate_free_exception, x4-x7_init_primary_*, x8_get_unexpected_via_dlsym | diagnostics, not in the plan: public runtime API calls that bisect a throw failure; `__cxa_init_primary_exception` is found by `dlsym` with a null, a signed and a stripped destructor and a class typeinfo. Recorded only (`any` everywhere), so they never turn a run into a mismatch |
 
+| y1-y2 | y1_handler_slots, y2_set_signed_terminate_then_init | diagnostics on the cache's `__cxa_terminate_handler` slot, the value that made every c3 throw trap (Darling's libobjc calls `std::set_terminate(&_objc_terminate)` with a plain pointer): y1 prints which key and discriminator the slot authenticates under and the image its target lies in; y2 hands the runtime a compiler-signed handler, then runs `__cxa_init_primary_exception` and a throw. Recorded only |
+| z1-z8 | z1_plain_entry_is_signed ... z8_throw_after_plain_set | plain code (`l4_plain.dylib`) calls the cache's `set_terminate`/`get_terminate` through the dyld reverse adapters. z1: a plain function entry is signed IA/0 and the old handler comes back raw. z2-z4: entry + 4, an arm64e address and a data address are stored as they are. z5: a handler that arm64e code installed comes back raw and is signed again when handed back; an arm64e address never handed out is not signed. z6: a corrupted slot stops the process (expected `faulted`) instead of handing plain code a stripped pointer. z7: a null handler becomes the default. z8: a throw works after plain code installed its handler. `ok` in c3 (z6 `faulted`), recorded only elsewhere |
+
 The sources avoid `std::sort` of arithmetic ranges (T0: the `extern template` `__insertion_sort_incomplete`
 set is exported by Darling's libc++ but not by the cache's; a binary calling it would not bind against the
 cache). The host test checks this.
@@ -106,19 +113,20 @@ defect on the built binary (authenticated vtable binds with addend 0). When the 
 
 ## Host validation (this branch)
 
-Host test: 118 checks, `ALL PASS`, with LD64, SDKROOT, LIBCXX_INCLUDE, DARLING_USR_LIB and CACHE_EXPORTS_DIR
-(the T0 export lists) set; 113 without the last two. The native part alone needs only clang and g++.
-Native run (libstdc++, aarch64 Linux, no PAC): 34 `ok` (the 26 plan checks and x1..x8), the two q1 checks `failed` as the
-table says, `expect_mismatches=0`; with `PROBE_CONFIG=c3` exactly checks 1 and 2 mismatch, with an unknown config all 36.
+Host test: 135 checks, `ALL PASS`, with LD64, SDKROOT, LIBCXX_INCLUDE, DARLING_USR_LIB and CACHE_EXPORTS_DIR
+(the T0 export lists) set. The native part needs only clang and g++; the plain dylib is built and checked in the Mach-O part (plain arm64,
+no PAC instruction, the two libc++ imports, system install names; a copy with one PAC instruction and the arm64e executable are refused). The native part alone needs only clang and g++.
+Native run (libstdc++, aarch64 Linux, no PAC): 36 `ok` (the 26 plan checks, x1..x8, y1 and y2), the two q1 checks and z1..z8 `failed` (the plain Mach-O
+dylib cannot be loaded), `expect_mismatches=0`; with `PROBE_CONFIG=c3` exactly checks 1, 2 and z1..z8 mismatch, with an unknown config all 46.
 The harness's own changes are tested natively on code extracted from `../abi/abi_harness.c` and `run_matrix.sh`, with 17 probes:
 the handler policy (signed under c2 and c3, stripped everywhere else; 6 probes), the filter for dyld's adapter warnings (6) and
-the policy variable of the matrix runner (5). Mutation probes on the checks: 19, each rebuilt natively and each changing the verdict of exactly the named check:
+the policy variable of the matrix runner (5). Mutation probes on the checks: 20, each rebuilt natively and each changing the verdict of exactly the named check:
 dropped rethrow (05), a changed value through the frames (04), the cleanup destructor order (07), a
 non-caught exception type (08, faulted), a lambda that does not throw (09), `catch(...)` replaced (06,
 faulted), a lost capture (20), `call_once` bypassed (23), a thread-local destructor that does not count (24),
 a lost atexit registration (25), a static destructor that prints nothing (25, the `need` text), `_Exit` instead
 of `exit` (26, the `need` text), a non-static local (27), a first initialisation that does not throw (28), a
-cout line not printed (19, the `need` text), three diagnostics (x2, x3, x8), and an expectation table that says `faulted`
+cout line not printed (19, the `need` text), four diagnostics (x2, x3, x8, y2), and an expectation table that says `faulted`
 (every `EXP_STD` check mismatches). Measured against the T0 export lists of the cache (names only): every stub name is
 exported by the cache's libc++ and libc++abi respectively.
 libc++ is not installed on the host, so the native run uses libstdc++ only.
@@ -187,6 +195,51 @@ baselines above; one guest child per check, because a driver run of several muta
 | m5 | no `_pthread_create` row | c2, c3 | new faults: 20, 21, 22, 24, 27 (and 10 in c2) |
 | m6 | adapter hook off for the main program's binds | c2, c3 | every child dies of SIGSEGV with no report |
 
+## Measured with the reverse adapters (c3, private guest build)
+
+Why every c3 throw trapped: Darling's libobjc calls `std::set_terminate(&_objc_terminate)` at init in every guest process. With the cache
+serving libc++abi that lands in the cache's arm64e `std::set_terminate`, which stores the pointer it is given; `__cxa_init_primary_exception`
+then authenticates it (IA, discriminator 0), fails and traps (`brk #0xc470`, the compiler's trap for a failed IA authentication). y1 shows the
+slot holding the unsigned address of `_objc_terminate`; y2 shows that a compiler-signed handler makes the same call pass. The adapters of
+`feat/shared-cache-m3-l4-adapters` only cover an arm64e importer binding a plain exporter; the opposite direction (a plain importer binding an
+export of an arm64e image) is `feat/l4-reverse-adapters`.
+
+Build under test: the TSD-wired dyld line, the adapters with the reverse direction, the policy file (PR #37) and the libdyld change that signs
+the TLV thunk, as in the T5 build; libunwind PR 4 plus the commit that authenticates the landing pad an arm64e personality passes to
+`_Unwind_SetIP` (IB key, modifier SP of the resumed frame), without which the cache's personality hands a signed landing pad to a plain unwinder
+that installs it raw. Cache, policy and boot method as in T5, one full c3 boot per run (46 children, about 25 s). The 46 checks:
+
+| build | boots | ok | faulted | failed | checks that are not ok |
+|---|---|---|---|---|---|
+| reverse adapters, libunwind with the landing-pad commit | 8, identical | 40 | 6 | 0 | 11-14 (ld64 addend), x6 (a stripped destructor handed to `__cxa_init_primary_exception`: the arm64e callee still demands a signed one), z6 (by design) |
+| control: the adapters of `feat/shared-cache-m3-l4-adapters` alone, same libunwind | 3 | 23-25 | 17-19 | 4 | every throw: 03-14, 23, 28 (28 and x5 passed in one boot, not investigated), x4-x7, z8; y2 passes (a compiler-signed handler); z1, z5, z6, z7 fail and z2-z4 pass, since nothing is signed |
+| reverse adapters, libunwind PR 4 without the landing-pad commit | 2, identical | 28 | 18 | 0 | every throw check faults at the signed landing pad: 03-14, 23, 28, y2, z8, plus x6 and z6 |
+
+The control has the T5 failure (`__cxa_init_primary_exception` trap) in every check that throws. With the reverse adapters the 28 plan checks
+are 24 ok and 4 faulted (11-14, the ld64 addend defect, unchanged), in 8 of 8 boots; z1-z5, z7 and z8 are ok and z6 stops the process, in the same boots.
+
+Mutants of the dyld change, one rebuild each, one boot each, checks that changed from the 40 ok / 6 faulted baseline:
+
+| mutant | rule | changed |
+|---|---|---|
+| arm64e check removed from the entry predicate | an address in an arm64e image is never signed | z3 failed |
+| function-starts match removed | only a function entry is signed | z2 failed |
+| authenticate replaced by strip on the result | never strip without authenticating | z6 failed (plain code was handed a bad pointer instead of stopping) |
+| failed authentication ignored | a handler that does not authenticate stops the process | z6 failed |
+| authenticate with a wrong modifier | IA with discriminator 0 | no verdict: the probe driver itself dies of SIGTRAP (exit 133) when libobjc calls `set_terminate` |
+| signing skipped | signed IA/0 | z1 faulted and z2-z8 changed, with every throw |
+| entry check removed | predicate or round trip | z2, z3, z4, z5 failed |
+| round-trip ring accepts any value | only a handler handed back is signed again | z2, z3, z4, z5 failed |
+| hook of the chained fixups removed | a plain dylib's binds | z1, z5, z6, z7 failed, z8 faulted; the throws still pass |
+| hook of the dyld-info binds removed | libobjc's bind | every throw faults, as in the control |
+| executable-segment check removed | defence in depth | nothing changed: the function-starts check already refuses a data address |
+| shared-cache check removed | defence in depth | nothing changed: the cache images are arm64e |
+
+The last two are equivalent on this cache. z6's message in a single child names the symbol (`__ZSt13get_terminatev returned a handler that does
+not authenticate (IA, discriminator 0)`); the driver counts it with the other adapter warnings (97 instead of 96). Boots: 18 first boots in a
+row after the dyld, libunwind and libdyld binaries of the private prefix were replaced died within seconds with no output (`mldr` SIGABRT in the
+shell, exit 134) until two trivial boots had run, and later boots shortly after a rebuild did the same; none of them ran the test.
+
 ## What T5 needs
 
 - Build: `build_l4.py build --out DIR` with LD64, SDKROOT, LIBCXX_INCLUDE.
@@ -208,6 +261,10 @@ baselines above; one guest child per check, because a driver run of several muta
 ## Not verified
 
 The guest runs above measured that the executable loads, that the c1 control passes on Darling's libc++, that
-`_dyld_get_shared_cache_range` covers libc++ and libc++abi in a split cache, and every c2 and c3 verdict. Still open: the cause of the c3 trap in the cache's `__cxa_init_primary_exception` (every c3 throw), and a
-run on a dyld without the experiments (the libdyld change is a separate branch, not part of this one). The `thread_local` check depended on the libdyld thunk signing. The native run
+`_dyld_get_shared_cache_range` covers libc++ and libc++abi in a split cache, and every c2 and c3 verdict. The cause of the c3 trap in the cache's `__cxa_init_primary_exception` (every c3 throw) is the unsigned handler that Darling's libobjc
+stores through `std::set_terminate` (see "Measured with the reverse adapters"). Still open: the four `known_ld64_addend` checks; plain
+C++ code that throws or creates objects with vtables that cross into the cache's libc++abi and libc++ (plain vtables and typeinfo are
+unsigned, which a register thunk cannot fix); `dlsym` by plain code of a cache export (returns the raw address); the other 22 rows of the
+reverse table, which no guest check drives (only `set_terminate` and `get_terminate` are driven, by z1-z8, and `set_terminate` by libobjc in
+every boot). The `thread_local` check depended on the libdyld thunk signing. The native run
 uses libstdc++, not libc++. The cache's libc++ may behave differently from LLVM 15 headers in ways the export names do not show.
