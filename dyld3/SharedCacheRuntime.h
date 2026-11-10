@@ -84,6 +84,10 @@ bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLo
 // nullptr when no cache exists for it. Subtype flag bits are ignored. x86_64 has a name but no split mapper.
 const char* splitCacheArchName(uint32_t cputype, uint32_t cpusubtype);
 
+// True when the split mapper can map a cache for this architecture. False for x86_64, which has a cache name but
+// no mapper, and for architectures with no cache at all; a process of such an architecture runs without a cache.
+bool splitCacheArchHasMapper(uint32_t cputype, uint32_t cpusubtype);
+
 // nullptr when dir is usable as a cache directory (absolute, no control characters, short enough), else why not.
 const char* splitCacheDirError(const char* dir);
 
@@ -100,6 +104,16 @@ const char* splitCacheMainFilePath(const char* dir, uint32_t cputype, uint32_t c
 // nullptr on success, else why not (the caller halts: a half-translated cache image would read a null TSD base).
 const char* translateSplitCacheTSD(const SharedCacheLoadInfo& cache, const mach_header* image, darling_tsd::PatchStats* stats);
 #endif
+
+
+// True only when dir is a directory and mainFilePath (the file splitCacheMainFilePath built) does not exist in it (not
+// even as a dangling symbolic link): the directory has no cache for this architecture. Every other failure to use the file is left to mapSplitCachePrivate.
+bool splitCacheMainFileIsMissing(const char* dir, const char* mainFilePath);
+
+// Replaces the built-in allow-list with the policy file at path (DYLD_SHARED_CACHE_SPLIT_POLICY): the header line
+// "darling-dyld-cache-policy 1", then one absolute install name per line. nullptr on success; otherwise why not,
+// the allow-list is unchanged and *errorLine is the line at fault (0 when it is not about one line).
+const char* loadSplitCachePolicy(const char* path, size_t* errorLine);
 #endif
 
 

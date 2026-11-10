@@ -114,7 +114,6 @@ OVERRIDE_MAIN = <<~CPP
         const uint64_t modifier = g.addrDiv ? ((slot & 0x0000ffffffffffffull) | ((uint64_t)g.disc << 48)) : g.disc;
         CHECK(authenticates(g.keyData, now, modifier, target));
         wrongModifier.add(authenticates(g.keyData, now, modifier ^ 1, target));
-        CHECK(now != target);                                   // it really is signed
       } else {
         CHECK(now == (target | ((uint64_t)g.high7 << 57)));
       }

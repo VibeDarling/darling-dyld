@@ -8,6 +8,7 @@
 require 'tmpdir'
 require 'open3'
 require 'rbconfig'
+require 'fileutils'
 root = File.realpath(ARGV.fetch(0, File.expand_path('..', __dir__)))
 base = ARGV.fetch(1, '0x180000000')
 require_relative 'split-cache-harness'
@@ -71,6 +72,8 @@ SCENARIOS = {
   'auxv_missing_fails' => ['valid', 'sign', :missing, 'cannot be opened'],
 }
 
+missing_src = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")[/^bool splitCacheMainFileIsMissing\(.*?^\}/m] or abort 'splitCacheMainFileIsMissing missing'
+
 Dir.mktmpdir('split-cache-mapping-') do |dir|
   File.write("#{dir}/test.cpp", <<~CPP)
     #{SplitCacheHarness.prefix(root)}
@@ -110,6 +113,12 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
     struct Rejections { const char *name; unsigned trials = 0, rejected = 0;
       void add(bool authenticated) { ++trials; if (!authenticated) ++rejected; }
       void check() const { printf("rejected %s: %u of %u\\n", name, rejected, trials); assert(trials >= 4 && rejected * 2 > trials); } };
+
+    // The real "no cache for this architecture" test, on the real directory the harness lays out below.
+    namespace dyld3 {
+      static int stat(const char *path, struct stat *buf) { return ::stat(path, buf); }
+      #{missing_src}
+    }
 
     static unsigned seenImages; static char seenName[128];
     static unsigned regionCount; static uint64_t regionAddress[8]; static const void *regionContent[8]; static uint32_t regionProt[8];
@@ -154,7 +163,16 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
       fclose(manifest);
 
       SharedCacheLoadInfo result = {}; SplitCacheMapStats stats;
-      bool ok = mapSplitCachePrivate((dir + "/cache").c_str(), true, &result, &stats, sign ? kSplitCacheAuthSign : kSplitCacheAuthLeaveAlone);
+      std::string mainFile = dir + "/cache";
+      if (argc > 4 && !strcmp(argv[4], "named")) {
+        // macOS ships dyld_shared_cache_arm64e only: an arm64 process finds no main file there, an arm64e one maps it
+        assert(dyld3::splitCacheMainFileIsMissing(dir.c_str(), (dir + "/dyld_shared_cache_arm64").c_str()));
+        assert(!dyld3::splitCacheMainFileIsMissing(dir.c_str(), (dir + "/dyld_shared_cache_arm64e").c_str()));
+        assert(!dyld3::splitCacheMainFileIsMissing(dir.c_str(), (dir + "/dyld_shared_cache_dangling").c_str()));
+        assert(!dyld3::splitCacheMainFileIsMissing((dir + "/no-such-dir").c_str(), (dir + "/no-such-dir/dyld_shared_cache_arm64").c_str()));
+        mainFile = dir + "/dyld_shared_cache_arm64e";
+      }
+      bool ok = mapSplitCachePrivate(mainFile.c_str(), true, &result, &stats, sign ? kSplitCacheAuthSign : kSplitCacheAuthLeaveAlone);
       if (!ok) {
         assert(result.errorMessage && !result.loadAddress);
         // A failed map must leave the whole region free again.
@@ -295,6 +313,20 @@ Dir.mktmpdir('split-cache-mapping-') do |dir|
     next puts("skip #{label} (host has no pointer authentication)") if EXECUTES_PAC.include?(label) && !host_pac
     run.call(label, variant, mode, auxv_content, expected_error)
   end
+  # The directory as macOS lays it out: the arm64e main file and its sub-caches under their real names, nothing for arm64.
+  out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/named", '--base', base)
+  abort out unless st.success?
+  File.symlink("#{dir}/no-such-target", "#{dir}/named/dyld_shared_cache_dangling")
+  %w[cache cache.01 cache.02.dylddata].each { |f| FileUtils.cp("#{dir}/named/#{f}", "#{dir}/named/dyld_shared_cache_arm64e#{f.sub('cache', '')}") }
+  out, st = Open3.capture2e("#{dir}/test", "#{dir}/named", 'leave', '/proc/self/auxv', 'named')
+  named_ok = st.success? && out[/^RESULT .*$/] == 'RESULT ok'
+  puts "#{named_ok ? 'ok  ' : 'FAIL'} arm64e main file by its real name maps, arm64 has none (#{out[/^RESULT .*$/]})"
+  failures += 1 unless named_ok
+  # the log names the file only, never the directory it was found in
+  mapped_line = out[/^LOG mapped split dyld cache private to process \(.*$/]
+  hidden = mapped_line&.start_with?('LOG mapped split dyld cache private to process (dyld_shared_cache_arm64e):') && !out.include?(dir)
+  puts "#{hidden ? 'ok  ' : 'FAIL'} the mapping log carries the file name and not the directory"
+  failures += 1 unless hidden
   # a second cache at another base, mapped by a fresh process, enumerates its own regions
   other = '0x1c0000000'
   out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/other", '--base', other)

@@ -252,6 +252,7 @@ struct EnvironmentVariables {
 	bool						hasOverride;
                             //  DYLD_SHARED_CACHE_DIR           ==> sSharedCacheOverrideDir
                             //  DYLD_SHARED_CACHE_SPLIT_DIR     ==> sSharedCacheSplitDir (Darling only)
+                            //  DYLD_SHARED_CACHE_SPLIT_POLICY  ==> sSharedCacheSplitPolicy (Darling only)
 							//	DYLD_ROOT_PATH					==> gLinkContext.rootPaths
 							//	DYLD_IMAGE_SUFFIX				==> gLinkContext.imageSuffix
 							//	DYLD_PRINT_OPTS					==> gLinkContext.verboseOpts
@@ -321,6 +322,7 @@ static dyld3::SharedCacheLoadInfo	sSharedCacheLoadInfo;
 static const char*					sSharedCacheOverrideDir;
 #ifdef DARLING
 static const char*					sSharedCacheSplitDir;	// DYLD_SHARED_CACHE_SPLIT_DIR, null when not set
+static const char*					sSharedCacheSplitPolicy;	// DYLD_SHARED_CACHE_SPLIT_POLICY, null when not set
 #endif
        bool							gSharedCacheOverridden = false;
 ImageLoader::LinkContext			gLinkContext;
@@ -2371,6 +2373,10 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	else if ( (strcmp(key, "DYLD_DARLING_ARM64E_ADAPTERS") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
 		// "off" binds the raw targets to arm64e importers again, to show what the adapters change; "report" also names the imports with no row
 		dyld3::darling::setAdapterMode(strcmp(value, "off") == 0 ? dyld3::darling::AdapterMode::Off : (strcmp(value, "report") == 0 ? dyld3::darling::AdapterMode::Report : dyld3::darling::AdapterMode::On));
+	}
+	// The policy replaces the list of libraries the cache serves, so it is as restricted as the directory.
+	else if ( (strcmp(key, "DYLD_SHARED_CACHE_SPLIT_POLICY") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
+		sSharedCacheSplitPolicy = value;
 	}
 #endif
 	else if ( strcmp(key, "DYLD_USE_CLOSURES") == 0 ) {
@@ -4437,17 +4443,58 @@ static void mapSharedCache(uintptr_t mainExecutableSlide)
 //#endif
 }
 
+static const char* basename(const char* path)
+{
+    const char* last = path;
+    for (const char* s = path; *s != '\0'; s++) {
+        if (*s == '/') 
+			last = s+1;
+    }
+    return last;
+}
+
 #ifdef DARLING
 // The user asked for this cache with DYLD_SHARED_CACHE_SPLIT_DIR, so a failure to map it must not leave the process running without it.
-static void mapSplitSharedCache(const macho_header* mainExecutableMH)
+// The exceptions are a process whose architecture has no split mapper (x86_64, i386: the variable reaches every child) and a
+// directory that has no cache file for this process's architecture (macOS ships an arm64e cache only): that process runs
+// without a cache, and false is returned. Neither has any use for the policy, so only a process that maps a cache reads it.
+// No message names the host's directory, only the files in it.
+static bool mapSplitSharedCache(const macho_header* mainExecutableMH)
 {
+	if ( !dyld3::splitCacheArchHasMapper(mainExecutableMH->cputype, mainExecutableMH->cpusubtype) ) {
+		if ( gLinkContext.verboseMapping )
+			dyld::log("dyld: continuing without a shared cache: no split cache mapper for this architecture\n");
+		return false;
+	}
 	char path[sizeof(sSharedCacheLoadInfo.path)];
 	if ( const char* error = dyld3::splitCacheMainFilePath(sSharedCacheSplitDir, mainExecutableMH->cputype, mainExecutableMH->cpusubtype, path, sizeof(path)) )
-		halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_DIR='%s': %s\n", sSharedCacheSplitDir, error));
+		halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_DIR: %s\n", error));
+	if ( dyld3::splitCacheMainFileIsMissing(sSharedCacheSplitDir, path) ) {
+		if ( gLinkContext.verboseMapping )
+			dyld::log("dyld: continuing without a shared cache: %s not found\n", basename(path));
+		return false;
+	}
+	if ( sSharedCacheSplitPolicy != nullptr ) {
+		size_t errorLine;
+		if ( const char* error = dyld3::loadSplitCachePolicy(sSharedCacheSplitPolicy, &errorLine) ) {
+			if ( errorLine == 0 )
+				halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_POLICY '%s': %s\n", basename(sSharedCacheSplitPolicy), error));
+			halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_POLICY '%s': %s (line %lu)\n", basename(sSharedCacheSplitPolicy), error, (unsigned long)errorLine));
+		}
+	}
 	dyld3::SplitCacheMapStats stats;
 	if ( !dyld3::mapSplitCachePrivate(path, gLinkContext.verboseMapping, &sSharedCacheLoadInfo, &stats) )
-		halt(mkstringf("could not map the split dyld cache '%s': %s\n", path, sSharedCacheLoadInfo.errorMessage ? sSharedCacheLoadInfo.errorMessage : "no reason given"));
+		halt(mkstringf("could not map the split dyld cache '%s': %s\n", basename(path), sSharedCacheLoadInfo.errorMessage ? sSharedCacheLoadInfo.errorMessage : "no reason given"));
 	installSharedCacheGlobalState(true);
+	if ( gLinkContext.verboseMapping ) {
+		const dyld3::SharedCacheAllowList& allowList = dyld3::sharedCacheAllowList();
+		for (size_t i = 0; i != allowList.count; ++i) {
+			dyld3::SharedCacheFindDylibResults found;
+			if ( !dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, allowList.paths[i], &found) || (strcmp(found.pathInCache, allowList.paths[i]) != 0) )
+				dyld::log("dyld: '%s' is not the install name of an image in the split dyld cache, ignored\n", allowList.paths[i]);
+		}
+	}
+	return true;
 }
 #endif
 
@@ -5125,16 +5172,6 @@ static ImageLoader* libraryLocator(const char* libraryName, bool search, const c
 	context.origin				= origin;
 	context.rpath				= rpaths;
 	return load(libraryName, context, cacheIndex);
-}
-
-static const char* basename(const char* path)
-{
-    const char* last = path;
-    for (const char* s = path; *s != '\0'; s++) {
-        if (*s == '/') 
-			last = s+1;
-    }
-    return last;
 }
 
 static void setContext(const macho_header* mainExecutableMH, int argc, const char* argv[], const char* envp[], const char* apple[])
@@ -7050,10 +7087,11 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 	if ( sSharedCacheSplitDir != nullptr ) {
 		// the cache is private to this process, and addImage only records its dylibs' UUIDs in that mode
 		gLinkContext.sharedRegionMode = ImageLoader::kUsePrivateSharedRegion;
-		mapSplitSharedCache(mainExecutableMH);
-		sClosureMode = ClosureMode::Off;
-		// mapSplitCachePrivate maps __DATA_CONST read-only whatever this process wants, so that is the state to match
-		matchSharedCacheDataConstState(true);
+		if ( mapSplitSharedCache(mainExecutableMH) ) {
+			sClosureMode = ClosureMode::Off;
+			// mapSplitCachePrivate maps __DATA_CONST read-only whatever this process wants, so that is the state to match
+			matchSharedCacheDataConstState(true);
+		}
 	}
 #endif // !DARLING
 

@@ -1616,8 +1616,10 @@ bool mapSplitCachePrivate(const char* mainCachePath, bool verbose, SharedCacheLo
     results->loadAddress = (const DyldSharedCache*)(uintptr_t)regionStart;
     strlcpy(results->path, mainCachePath, sizeof(results->path));
     if ( verbose ) {
+        // The path names the host's store; the log carries the file name only.
+        const char* fileName = strrchr(results->path, '/');
         dyld::log("mapped split dyld cache private to process (%s): %u mappings in %u files, %llu plain pointers rebased, %llu authenticated pointers signed, %llu authenticated pointers left in on-disk form\n",
-                  results->path, mappingCount, files.count, (unsigned long long)stats->plainRebased,
+                  (fileName != nullptr) ? fileName + 1 : results->path, mappingCount, files.count, (unsigned long long)stats->plainRebased,
                   (unsigned long long)stats->authSigned, (unsigned long long)stats->authLeftAlone);
     }
     reservation.keep();
@@ -1639,6 +1641,11 @@ const char* splitCacheArchName(uint32_t cputype, uint32_t cpusubtype)
     if ( cputype == CPU_TYPE_X86_64 )
         return "x86_64";
     return nullptr;
+}
+
+bool splitCacheArchHasMapper(uint32_t cputype, uint32_t cpusubtype)
+{
+    return (cputype != CPU_TYPE_X86_64) && (splitCacheArchName(cputype, cpusubtype) != nullptr);
 }
 
 const char* splitCacheDirError(const char* dir)
@@ -1758,6 +1765,17 @@ const char* translateSplitCacheTSD(const SharedCacheLoadInfo& cache, const mach_
     return sSplitTSD.patcher->patchImage((uintptr_t)image, sSplitTSD.memory->memory(), stats);
 }
 #endif
+
+bool splitCacheMainFileIsMissing(const char* dir, const char* mainFilePath)
+{
+    // Only "the directory exists and has no such file" counts. A bad directory and a file that is there but cannot be
+    // read stay errors for the mapper to report, so that a mistake in the setup is never mistaken for a missing architecture.
+    struct stat statBuf;
+    if ( dyld3::stat(dir, &statBuf) != 0 )
+        return false;
+    // lstat: a symbolic link that points nowhere is a broken store, not a missing architecture.
+    return (::lstat(mainFilePath, &statBuf) != 0) && (errno == ENOENT);
+}
 #endif // DARLING && !TARGET_OS_SIMULATOR
 
 
@@ -1876,12 +1894,14 @@ static const char* const kSharedCacheServedOverDisk[] = {
     "/usr/lib/libz.1.dylib",
     "/usr/lib/libexpat.1.dylib",
 };
-static const SharedCacheAllowList kSharedCacheAllowList = { kSharedCacheServedOverDisk,
-                                                            sizeof(kSharedCacheServedOverDisk)/sizeof(kSharedCacheServedOverDisk[0]) };
+// The list in force when DYLD_SHARED_CACHE_SPLIT_POLICY is unset: the two entries above, whatever a policy file says
+// elsewhere. A policy file REPLACES it exactly (once, at start up): to serve libz and libexpat under a policy, list them.
+static SharedCacheAllowList sSharedCacheAllowList = { kSharedCacheServedOverDisk,
+                                                      sizeof(kSharedCacheServedOverDisk)/sizeof(kSharedCacheServedOverDisk[0]) };
 
 const SharedCacheAllowList& sharedCacheAllowList()
 {
-    return kSharedCacheAllowList;
+    return sSharedCacheAllowList;
 }
 
 bool sharedCachePathIsAllowListed(const char* canonicalPath, const SharedCacheAllowList& allowList)
@@ -1915,6 +1935,106 @@ bool pathIsPinnedToSharedCache(const SharedCacheLoadInfo& loadInfo, const char* 
     return findInSharedCacheImage(loadInfo, path, &results)
         && sharedCachePathIsAllowListed(results.pathInCache, sharedCacheAllowList());
 }
+
+#if defined(DARLING) && !TARGET_OS_SIMULATOR
+// ---- the cache policy file (DYLD_SHARED_CACHE_SPLIT_POLICY) ----
+// Text, one line per record, each ended by a line feed. Line 1 is the header, every other line one canonical install
+// name, matched exactly. Zero names is valid and serves nothing over a disk copy. Anything else is an error: the
+// caller halts, because a half-read policy must never turn into a broader one.
+static const size_t kSplitPolicyMaxFileSize = 256 * 1024;
+static const size_t kSplitPolicyMaxLine     = 1024;
+static const size_t kSplitPolicyMaxEntries  = 4096;
+static const char   kSplitPolicyHeader[]    = "darling-dyld-cache-policy 1";
+
+// Ends every line of text with a NUL and stores the install names (pointers into text) in entries.
+// On an error, *errorLine is the 1-based line it is on.
+static const char* parseSplitCachePolicy(char* text, size_t length, const char** entries, size_t* count, size_t* errorLine)
+{
+    *count = 0;
+    *errorLine = 0;
+    if ( length == 0 )
+        return "the file is empty";
+    size_t position = 0;
+    while ( position < length ) {
+        ++*errorLine;
+        char* line = text + position;
+        size_t lineLength = 0;
+        while ( (position + lineLength < length) && (line[lineLength] != '\n') ) {
+            const unsigned char c = (unsigned char)line[lineLength];
+            if ( (c < 0x20) || (c == 0x7f) )
+                return "the line contains a control character";
+            if ( ++lineLength > kSplitPolicyMaxLine )
+                return "the line is too long";
+        }
+        if ( position + lineLength == length )
+            return "the last line has no line feed";
+        line[lineLength] = '\0';
+        position += lineLength + 1;
+        if ( *errorLine == 1 ) {
+            if ( strcmp(line, kSplitPolicyHeader) != 0 )
+                return "the first line is not the policy header";
+            continue;
+        }
+        if ( line[0] != '/' )   // an empty line is caught here too
+            return "the install name is not an absolute path";
+        for (size_t i = 0; i != *count; ++i) {
+            if ( strcmp(entries[i], line) == 0 )
+                return "the install name is listed twice";
+        }
+        if ( *count == kSplitPolicyMaxEntries )
+            return "the policy lists too many install names";
+        entries[(*count)++] = line;
+    }
+    *errorLine = 0;
+    return nullptr;
+}
+
+const char* loadSplitCachePolicy(const char* path, size_t* errorLine)
+{
+    *errorLine = 0;
+    if ( path[0] != '/' )
+        return "the policy path is not an absolute path";
+    const int fd = dyld3::open(path, O_RDONLY, 0);
+    if ( fd == -1 ) {
+        // static texts, so that a missing file and a refused one read differently
+        if ( errno == ENOENT )
+            return "the policy file does not exist";
+        if ( (errno == EACCES) || (errno == EPERM) )
+            return "the policy file is not readable (permission denied)";
+        return "the policy file cannot be opened";
+    }
+    const char* error = nullptr;
+    char* text = nullptr;
+    const char** entries = nullptr;
+    size_t count = 0;
+    struct stat statBuf;
+    if ( ::fstat(fd, &statBuf) != 0 )
+        error = "the policy file cannot be inspected";
+    else if ( (uint64_t)statBuf.st_size > kSplitPolicyMaxFileSize )
+        error = "the policy file is too large";
+    else {
+        const size_t length = (size_t)statBuf.st_size;
+        text = (char*)::malloc(length + 1);
+        entries = (const char**)::malloc(kSplitPolicyMaxEntries * sizeof(char*));
+        if ( (text == nullptr) || (entries == nullptr) )
+            error = "out of memory reading the policy file";
+        else if ( !preadAll(fd, 0, text, length) )
+            error = "the policy file cannot be read";
+        else
+            error = parseSplitCachePolicy(text, length, entries, &count, errorLine);
+    }
+    ::close(fd);
+    if ( error != nullptr ) {
+        ::free(text);
+        ::free(entries);
+        return error;
+    }
+    // kept for the life of the process: the allow-list points into them
+    sSharedCacheAllowList.paths = entries;
+    sSharedCacheAllowList.count = count;
+    return nullptr;
+}
+#endif // DARLING && !TARGET_OS_SIMULATOR
 
 void deallocateExistingSharedCache()
 {

@@ -104,7 +104,30 @@ Environment variables as dyld2 names them (src/dyld2.cpp): `DYLD_PRINT_LIBRARIES
 `DYLD_PRINT_TO_STDERR`. `DYLD_SHARED_CACHE_SPLIT_DIR` (Darling only, honoured when
 the process may use `allowEnvVarsSharedCache` and `allowEnvVarsPath`) names the
 cache directory. Set it only on the test process (a prefix on the one command,
-never `export`ed), because it makes every plain arm64 process fail.
+never `export`ed). A plain arm64 or x86_64 child that inherits it finds no cache for its architecture
+(macOS ships `dyld_shared_cache_arm64e` only) and runs without one, with one line under
+`DYLD_PRINT_SEGMENTS`: `dyld: continuing without a shared cache: <file name> not found`.
+
+Which libraries the cache serves over a copy on disk. With nothing else set it is dyld's built-in list,
+`/usr/lib/libz.1.dylib` and `/usr/lib/libexpat.1.dylib` (`kSharedCacheServedOverDisk`). A test that needs
+others (libc++ and libc++abi, say) names them in a policy file and passes its guest path in
+`DYLD_SHARED_CACHE_SPLIT_POLICY`. The policy REPLACES the built-in list exactly, so it must list every
+library the test needs, libz and libexpat included:
+
+```
+darling-dyld-cache-policy 1
+/usr/lib/libz.1.dylib
+/usr/lib/libexpat.1.dylib
+/usr/lib/libc++.1.dylib
+/usr/lib/libc++abi.dylib
+```
+
+The first line is exactly that header, then one absolute install name per line, each line ended by a line
+feed, no blank lines, no duplicates, at most 4096 names; anything else makes dyld halt (naming the file
+and the line) in a process that maps the cache. Run it in the same private prefix, e.g.
+`DYLD_SHARED_CACHE_SPLIT_POLICY=/tmp/h0.policy` (a path the guest can open). A name that is not a cache image
+is ignored (one `DYLD_PRINT_SEGMENTS` line). `tests/split-cache-policy-served.rb` is the host proof that such a
+policy serves those four libraries under a `DYLD_ROOT_PATH` prefix.
 
 Commands, not run here, in a PRIVATE prefix (never the default prefix), with
 `<priv>` the prefix directory, `<cache>` the split cache directory and `<exe>`
