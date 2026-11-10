@@ -14,7 +14,7 @@ def build_and_run(dir, root, sources)
          *Dir["#{root}/tests/darling-tsd/*_test.cpp"], "#{root}/tests/darling-tsd/oracle.S", *sources, '-lpthread']
   out, status = Open3.capture2e(*cmd)
   return [false, "build failed:\n#{out}"] unless status.success?
-  out, status = Open3.capture2e(exe)
+  out, status = Open3.capture2e('timeout', '20', exe)
   [status.success?, out]
 end
 

@@ -43,3 +43,10 @@
 - {name: instruction cache not synced for veneers, file: DarlingTSDIslands.cpp, from: "memory.sync(memory.context, veneerAt[k], sizeof(words));", to: "(void)0;"}
 - {name: veneer placed in a trapped site, file: DarlingTSDIslands.cpp, from: "        if ( gap < 0 )\n            continue;", to: "        if ( gap < 0 )\n            break;"}
 - {name: invalid slot accepted by init, file: DarlingTSDIslands.cpp, from: "if ( !isValidSlotOffset(slot) )", to: "if ( false )"}
+
+- {name: writer copies straight into the mapping, file: DarlingTSDIslands.cpp, from: "const ssize_t written = ::pwrite(fd, bytes, length, (off_t)address);", to: "memcpy((void*)address, bytes, length); const ssize_t written = (ssize_t)length; (void)fd;"}
+- {name: veneer returns to the site itself, file: DarlingTSDIslands.cpp, from: "encodeBranch(veneer + 16, site + 4, ok)", to: "encodeBranch(veneer + 16, site, ok)"}
+- {name: veneer skips the trap word wrongly, file: DarlingTSDIslands.cpp, from: "0xB5000040U | reg", to: "0xB5000060U | reg"}
+- {name: writer opens the file read only, file: DarlingTSDIslands.cpp, from: "O_RDWR | O_CLOEXEC", to: "O_RDONLY | O_CLOEXEC"}
+# Not killable on the host, by design: a short pwrite on /proc/self/mem cannot be provoked, and this CPU runs the
+# translated code correctly without the `ic ivau` of procSync (its instruction fetch is coherent with the kernel's copy).

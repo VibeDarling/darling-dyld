@@ -33,3 +33,36 @@ oracle_veneer_x30:
 oracle_return:      nop
         .globl oracle_branch_forward
 oracle_branch_forward: b oracle_return
+
+// Code that the native test copies into a mapping that stands in for cache text.
+        .balign 4
+        .globl tsd_code_begin
+tsd_code_begin:
+        .globl tsd_read
+tsd_read:
+        .globl tsd_read_site
+tsd_read_site:      mrs x0, TPIDRRO_EL0
+        ret
+// x0 = int[2]: records the Z and C flags that were set before the read
+        .globl tsd_flags
+tsd_flags:
+        mov x1, x0
+        cmp x1, x1
+        .globl tsd_flags_site
+tsd_flags_site:     mrs x0, TPIDRRO_EL0
+        cset w2, eq
+        cset w3, cs
+        stp w2, w3, [x1]
+        ret
+// x0 = &started (byte), x1 = &stop (word): runs next to the sites until stop is set, returns the iteration count
+        .globl tsd_spinner
+tsd_spinner:
+        mov w2, #1
+        strb w2, [x0]
+        mov x0, xzr
+1:      add x0, x0, #1
+        ldr w2, [x1]
+        cbz w2, 1b
+        ret
+        .globl tsd_code_end
+tsd_code_end:
