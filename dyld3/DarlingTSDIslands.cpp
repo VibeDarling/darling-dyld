@@ -12,7 +12,7 @@ static const char kMagic[8] = { 'D', 'T', 'S', 'D', 'S', 'I', 'T', '1' };
 
 const char* SiteTable::parse(const void* bytes, size_t length)
 {
-    if ( (bytes == nullptr) || (((uintptr_t)bytes & 3) != 0) )
+    if ( (bytes == nullptr) || (((uintptr_t)bytes & 7) != 0) )
         return "TSD site table is missing or misaligned";
     if ( length < sizeof(TableHeader) )
         return "TSD site table is shorter than its header";
@@ -33,9 +33,9 @@ const char* SiteTable::parse(const void* bytes, size_t length)
     for (uint32_t i = 0; i != h->gapCount; ++i) {
         if ( ((g[i].start & 3) != 0) || ((g[i].size & 3) != 0) || (g[i].size < kVeneerBytes) )
             return "TSD site table gap is misaligned or too small";
-        if ( (uint64_t)g[i].start + g[i].size > UINT32_MAX )
-            return "TSD site table gap wraps";
-        if ( (i != 0) && ((uint64_t)g[i-1].start + g[i-1].size > g[i].start) )
+        if ( (g[i].size > UINT32_MAX) || (g[i].start + g[i].size < g[i].start) )
+            return "TSD site table gap is too large or wraps";
+        if ( (i != 0) && (g[i-1].start + g[i-1].size > g[i].start) )
             return "TSD site table gaps are not sorted and disjoint";
     }
     uint32_t nextSite = 0;
@@ -49,16 +49,18 @@ const char* SiteTable::parse(const void* bytes, size_t length)
         if ( r.siteCount > h->siteCount - nextSite )
             return "TSD site table image has more sites than the table";
         nextSite += r.siteCount;
-        const uint64_t limit = (i + 1 == h->imageCount) ? (uint64_t)1 << 32 : images[i+1].imageOffset;
+        const uint64_t limit = (i + 1 == h->imageCount) ? UINT64_MAX : images[i+1].imageOffset;
         uint64_t previous = 0;
         for (uint32_t k = 0; k != r.siteCount; ++k) {
             const uint32_t s = sites[r.firstSite + k];
-            const uint64_t address = (uint64_t)r.imageOffset + siteOffset(s);
+            const uint64_t address = r.imageOffset + siteOffset(s);
+            if ( address < r.imageOffset )
+                return "TSD site table site wraps";
             if ( (address >= limit) || ((k != 0) && (siteOffset(s) <= previous)) )
                 return "TSD site table sites are not ascending inside their image";
             previous = siteOffset(s);
             // A gap that holds a site would let a veneer overwrite code that is rewritten as well.
-            while ( (gapIndex != h->gapCount) && ((uint64_t)g[gapIndex].start + g[gapIndex].size <= address) )
+            while ( (gapIndex != h->gapCount) && (g[gapIndex].start + g[gapIndex].size <= address) )
                 ++gapIndex;
             if ( (gapIndex != h->gapCount) && (g[gapIndex].start <= address) )
                 return "TSD site table has a site inside a gap";
@@ -73,7 +75,7 @@ const char* SiteTable::parse(const void* bytes, size_t length)
     return nullptr;
 }
 
-const ImageRecord* SiteTable::findImage(uint32_t imageOffset, uint32_t* index) const
+const ImageRecord* SiteTable::findImage(uint64_t imageOffset, uint32_t* index) const
 {
     uint32_t low = 0;
     uint32_t high = header->imageCount;
@@ -198,10 +200,10 @@ const char* Patcher::patchImage(uintptr_t machHeader, const Memory& memory, Patc
     PatchStats stats = {};
     if ( statsOut != nullptr )
         *statsOut = stats;
-    if ( (machHeader < cacheBase) || (machHeader - cacheBase > UINT32_MAX) )
+    if ( machHeader < cacheBase )
         return "TSD translation: image lies outside the cache";
     uint32_t index = 0;
-    const ImageRecord* image = table.findImage((uint32_t)(machHeader - cacheBase), &index);
+    const ImageRecord* image = table.findImage(machHeader - cacheBase, &index);
     if ( image == nullptr )
         return "TSD site table does not describe this image (made from another cache?)";
     if ( done[index] )

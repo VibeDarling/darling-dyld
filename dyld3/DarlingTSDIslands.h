@@ -27,7 +27,8 @@ enum SiteKind : uint32_t {
     kCPUIndexRead = 1,  // followed by `lsr Xd, Xd, #12`: the CPU number in the low bits, becomes `mov Xd, xzr`
 };
 
-// Sidecar file, little endian. Offsets are from the cache base (the main file's mapping address).
+// Sidecar file, little endian, 8-byte aligned. Offsets are from the cache base (the main file's mapping address); the
+// cache is more than 4 GiB from its first to its last text page, so they are 64 bits.
 //   TableHeader | Gap[gapCount] | ImageRecord[imageCount] | uint32_t site[siteCount]
 // site = (offset from the image's mach header >> 2) << 6 | kind << 5 | register
 struct TableHeader {
@@ -38,15 +39,15 @@ struct TableHeader {
     uint32_t siteCount;
     uint32_t reserved;      // zero
 };
-struct Gap { uint32_t start; uint32_t size; };
-struct ImageRecord { uint32_t imageOffset; uint32_t firstSite; uint32_t siteCount; };
+struct Gap { uint64_t start; uint64_t size; };
+struct ImageRecord { uint64_t imageOffset; uint32_t firstSite; uint32_t siteCount; };
 
 inline uint32_t encodeSite(uint32_t offsetFromImage, SiteKind kind, uint32_t reg) { return ((offsetFromImage >> 2) << 6) | ((uint32_t)kind << 5) | reg; }
 inline uint32_t siteOffset(uint32_t site) { return (site >> 6) << 2; }
 inline SiteKind siteKind(uint32_t site) { return (SiteKind)((site >> 5) & 1); }
 inline uint32_t siteRegister(uint32_t site) { return site & 31; }
 
-// A validated, borrowed view of a sidecar. The bytes must be 4-byte aligned and outlive the view.
+// A validated, borrowed view of a sidecar. The bytes must be 8-byte aligned and outlive the view.
 class SiteTable {
 public:
     // Returns null when the table is well formed, otherwise a static message. Checks the counts against the
@@ -57,8 +58,9 @@ public:
     uint32_t           gapCount() const { return header->gapCount; }
     const Gap&         gap(uint32_t i) const { return gaps[i]; }
     uint32_t           imageCount() const { return header->imageCount; }
+    const ImageRecord& image(uint32_t i) const { return images[i]; }
     // The record for the image whose mach header is at `imageOffset`, or null.
-    const ImageRecord* findImage(uint32_t imageOffset, uint32_t* index) const;
+    const ImageRecord* findImage(uint64_t imageOffset, uint32_t* index) const;
     const uint32_t*    sites(const ImageRecord& image) const { return sitesArray + image.firstSite; }
 private:
     const TableHeader*  header = nullptr;

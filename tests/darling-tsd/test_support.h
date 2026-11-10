@@ -13,7 +13,7 @@ using namespace dyld3::darling_tsd;
 inline int checks, failures;
 #define CHECK(condition) do { ++checks; if ( !(condition) ) { ++failures; fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition); } } while (0)
 
-struct ImageSpec { uint32_t imageOffset; std::vector<uint32_t> sites; };
+struct ImageSpec { uint64_t imageOffset; std::vector<uint32_t> sites; };
 
 // Builds the sidecar bytes in 4-byte aligned storage.
 struct TableBuilder {

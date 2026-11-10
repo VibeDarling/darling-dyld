@@ -35,6 +35,9 @@ static void testParse() {
     CHECK(table.findImage(0x2000, nullptr) != nullptr);
     CHECK(table.findImage(0x2004, nullptr) == nullptr);
     CHECK(table.findImage(0x30000, nullptr) == nullptr);
+    // the cache spans more than 4 GiB: images and gaps far above the base
+    {   TableBuilder far; far.gaps = { { 0x2'8000'0000ULL, 0x40 } }; far.images = { { 0x2'8100'0000ULL, { encodeSite(0x40, kTSDRead, 3) } } };
+        CHECK(far.parse(table) == nullptr && table.findImage(0x2'8100'0000ULL, nullptr) != nullptr && table.findImage(0x8100'0000ULL, nullptr) == nullptr); }
     // largest offset a site can carry: 26 bits of words
     CHECK(siteOffset(encodeSite(0x0FFFFFFC, kTSDRead, 1)) == 0x0FFFFFFC);
 
@@ -57,7 +60,8 @@ static void testRefusals() {
     { TableBuilder b = sample(); b.gaps[0].size = 16; CHECK(b.parse(table) != nullptr); }                                         // below one veneer
     { TableBuilder b = sample(); b.gaps[1].start = 0x1020; CHECK(b.parse(table) != nullptr); }                                   // overlaps gap 0
     { TableBuilder b = sample(); std::swap(b.gaps[0], b.gaps[1]); CHECK(b.parse(table) != nullptr); }                            // unsorted
-    { TableBuilder b = sample(); b.gaps[1] = { 0xFFFFFFF0, 0x20 }; CHECK(b.parse(table) != nullptr); }                           // wraps
+    { TableBuilder b = sample(); b.gaps[1] = { UINT64_MAX - 0x13, 0x20 }; CHECK(b.parse(table) != nullptr); }                    // wraps
+    { TableBuilder b = sample(); b.gaps[1] = { 0x40000, 1ULL << 32 }; CHECK(b.parse(table) != nullptr); }                          // larger than a gap can be used
     { TableBuilder b = sample(); b.images[1].imageOffset = 0x20000; CHECK(b.parse(table) != nullptr); }                          // duplicate
     { TableBuilder b = sample(); std::swap(b.images[0], b.images[2]); CHECK(b.parse(table) != nullptr); }                        // unsorted
     { TableBuilder b = sample(); b.images[0].sites = { encodeSite(0x104, kTSDRead, 9), encodeSite(0x100, kTSDRead, 9) }; CHECK(b.parse(table) != nullptr); }
@@ -66,9 +70,10 @@ static void testRefusals() {
     { TableBuilder b = sample(); b.images[0].sites = { encodeSite(0x1000, kTSDRead, 9) }; CHECK(b.parse(table) != nullptr); }     // inside gap 0
     { TableBuilder b = sample(); b.images[0].sites = { encodeSite(0x103C, kTSDRead, 9) }; CHECK(b.parse(table) != nullptr); }     // last word of gap 0
     { TableBuilder b = sample(); b.images[0].sites = { encodeSite(0x1040, kTSDRead, 9) }; CHECK(b.parse(table) == nullptr); }     // first word after it
-    // header is 10 words, then 2 gaps of 2 words, then image records of 3 words: {imageOffset, firstSite, siteCount}
-    { TableBuilder b = sample(); b.build(); b.storage[10 + 4 + 1] = 1; CHECK(table.parse(b.storage.data(), b.length) != nullptr); }   // firstSite of image 0
-    { TableBuilder b = sample(); b.build(); b.storage[10 + 4 + 3 + 1] = 1; CHECK(table.parse(b.storage.data(), b.length) != nullptr); } // image 1 starts inside image 0's sites
+    { TableBuilder b; b.images = { { UINT64_MAX - 0x100, { encodeSite(0x200, kTSDRead, 1) } } }; CHECK(b.parse(table) != nullptr); }            // the site address wraps
+    // header is 10 words, then 2 gaps of 4 words, then image records of 4 words: {imageOffset (2), firstSite, siteCount}
+    { TableBuilder b = sample(); b.build(); b.storage[10 + 8 + 2] = 1; CHECK(table.parse(b.storage.data(), b.length) != nullptr); }   // firstSite of image 0
+    { TableBuilder b = sample(); b.build(); b.storage[10 + 8 + 4 + 2] = 1; CHECK(table.parse(b.storage.data(), b.length) != nullptr); } // image 1 starts inside image 0's sites
     { TableBuilder b = sample(); b.build(); b.storage.push_back(0); CHECK(table.parse(b.storage.data(), b.length + 4) != nullptr); }  // trailing bytes
     { TableBuilder b = sample(); b.gaps[1].start = 0x103C; CHECK(b.parse(table) != nullptr); }                                   // overlaps gap 0 by one word
 }

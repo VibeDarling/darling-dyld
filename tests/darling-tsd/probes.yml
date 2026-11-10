@@ -50,3 +50,6 @@
 - {name: writer opens the file read only, file: DarlingTSDIslands.cpp, from: "O_RDWR | O_CLOEXEC", to: "O_RDONLY | O_CLOEXEC"}
 # Not killable on the host, by design: a short pwrite on /proc/self/mem cannot be provoked, and this CPU runs the
 # translated code correctly without the `ic ivau` of procSync (its instruction fetch is coherent with the kernel's copy).
+- {name: gap larger than 4 GiB accepted, file: DarlingTSDIslands.cpp, from: "(g[i].size > UINT32_MAX) || (g[i].start + g[i].size < g[i].start)", to: "(g[i].start + g[i].size < g[i].start)"}
+- {name: wrapping gap accepted, file: DarlingTSDIslands.cpp, from: "(g[i].size > UINT32_MAX) || (g[i].start + g[i].size < g[i].start)", to: "(g[i].size > UINT32_MAX)"}
+- {name: wrapping site accepted, file: DarlingTSDIslands.cpp, from: "            if ( address < r.imageOffset )\n                return \"TSD site table site wraps\";", to: ""}
