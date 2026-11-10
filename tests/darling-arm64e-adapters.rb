@@ -234,6 +234,7 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     end
     mutated = from.is_a?(Regexp) ? text.sub(from, to) : text.sub(from) { to }
     mexe, merr = build(root, dir, "mutant#{i}", adapters_text: (where == :rows ? nil : mutated), rows_text: (where == :rows ? mutated : nil))
+    mout = nil
     dead = mexe.nil? || begin
       mout, mst = run(mexe)
       !mst.success? || mout =~ /^FAIL/
@@ -250,8 +251,11 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
       end
       bytes_dead = bad
     end
-    killed += 1 if dead || spec_dead || bytes_dead
-    check "mutation probe killed: #{desc}", dead || spec_dead || bytes_dead, merr[0, 200]
+    dies = dead || spec_dead || bytes_dead
+    killed += 1 if dies
+    # a surviving mutant has no FAIL line: report what the driver did print, so the probe is not just a bare count
+    detail = !dies && mout ? (mout.lines.grep(/^FAIL/).first || mout.lines.last || 'the driver printed no FAIL line').strip : merr[0, 200]
+    check "mutation probe killed: #{desc}", dies, detail
   end
   puts "probes killed #{killed}/#{mutants.size}"
 end
