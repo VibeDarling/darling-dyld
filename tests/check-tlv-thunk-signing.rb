@@ -10,12 +10,13 @@ require 'rbconfig'
 
 root = File.realpath(ARGV.reject { |a| a.start_with?('--') }.fetch(0, File.expand_path('..', __dir__)))
 source = File.read("#{root}/src/threadLocalVariables.c")
+priv_header = File.read("#{root}/include/mach-o/dyld_priv.h")
 
 def extract(source, signature)
-  source[/^static [^\n]*\b#{signature}\(.*?^\}/m] or abort "#{signature} missing in src/threadLocalVariables.c"
+  source[/^static [^\n]*\b#{signature}\(.*?^\}/m] or abort "#{signature} not found as a static function"
 end
 
-FUNCTIONS = %w[tlv_thunk_for_image tlv_normalize_descriptor tlv_storage_size tlv_initialize_descriptors].freeze
+FUNCTIONS = %w[dyld_header_is_arm64e tlv_thunk_for_image tlv_normalize_descriptor tlv_storage_size tlv_initialize_descriptors].freeze
 
 abort 'needs an ARM64 host' unless RbConfig::CONFIG['host_cpu'] =~ /aarch64|arm64/
 
@@ -26,9 +27,9 @@ PROBES = [
   ['key IB instead of IA', 'hint #8', 'hint #10'],
   ['discriminator 1', 'discriminator __asm__("x16") = 0;', 'discriminator __asm__("x16") = 1;'],
   ['address diversity', 'discriminator __asm__("x16") = 0;', 'discriminator __asm__("x16") = (uint64_t)mh;'],
-  ['the flag bits of the subtype not masked', '(mh->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E', 'mh->cpusubtype == CPU_SUBTYPE_ARM64E'],
-  ['cputype not checked', '(mh->cputype == CPU_TYPE_ARM64) && ', ''],
-  ['every image signed', '(mh->cputype == CPU_TYPE_ARM64) && ((mh->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E)', 'true'],
+  ['the flag bits of the subtype not masked', '(header->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E', 'header->cpusubtype == CPU_SUBTYPE_ARM64E'],
+  ['cputype not checked', '(header->cputype == CPU_TYPE_ARM64) && ', ''],
+  ['every image signed', '(header->cputype == CPU_TYPE_ARM64) && ((header->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E)', 'true'],
   ['a different function signed', '(uint64_t)tlv_get_addr;', '(uint64_t)tlv_free;'],
   ['only the first descriptor given the thunk', 'for (TLVDescriptor* d=start; d < end; ++d) {', 'for (TLVDescriptor* d=start; d < start + 1; ++d) {'],
   ['unsigned result returned after signing', 'return (void*)value;', 'return (void*)tlv_get_addr;'],
@@ -48,7 +49,7 @@ def build_and_run(root, dir, name, extracted, defines)
 end
 
 Dir.mktmpdir('tlv-thunk-signing-') do |dir|
-  extracted = FUNCTIONS.map { |f| extract(source, f) }.join("\n\n")
+  extracted = FUNCTIONS.map { |f| extract(f == 'dyld_header_is_arm64e' ? priv_header : source, f) }.join("\n\n")
   # libdyld is built for arm64 (__arm64__ is Apple's spelling); the second build is what any other architecture compiles.
   variants = { 'arm64-O0' => ['-O0', '-D__arm64__=1'], 'arm64-O2' => ['-O2', '-D__arm64__=1'], 'other-arch' => ['-O1'] }
   variants.each do |name, defines|

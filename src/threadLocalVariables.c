@@ -304,7 +304,7 @@ static void tlv_normalize_descriptor(TLVDescriptor* descriptor, unsigned long st
 static void* tlv_thunk_for_image(const struct mach_header* mh)
 {
 #if __arm64__
-	if ( (mh->cputype == CPU_TYPE_ARM64) && ((mh->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E) ) {
+	if ( dyld_header_is_arm64e(mh) ) {
 		register uint64_t value __asm__("x17") = (uint64_t)tlv_get_addr;
 		register uint64_t discriminator __asm__("x16") = 0;
 		__asm__ volatile("hint #8" : "+r"(value) : "r"(discriminator));

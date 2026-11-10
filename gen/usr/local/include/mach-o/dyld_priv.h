@@ -965,6 +965,15 @@ typedef enum {
 extern bool _dyld_is_objc_constant(DyldObjCConstantKind kind, const void* addr);
 
 
+// True when the mach header is an arm64 image built for the pointer-authenticated ABI. Optional subtype
+// bits (CPU_SUBTYPE_MASK) must not change the answer, which is why callers mask them instead of reading
+// cpusubtype directly. Used by dyld itself around src and dyld3.
+static inline bool dyld_header_is_arm64e(const struct mach_header* header)
+{
+	return (header->cputype == CPU_TYPE_ARM64) && ((header->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E);
+}
+
+
 // temp exports to keep tapi happy, until ASan stops using dyldVersionNumber
 extern double      dyldVersionNumber;
 extern const char* dyldVersionString;
