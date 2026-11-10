@@ -40,10 +40,10 @@ end
 src = File.read(File.join(HERE, 'abi_checks.c'))
 table = src[/const struct check checks\[\] = \{(.*?)\n\};/m, 1].to_s
 names = table.scan(/\{"([a-z0-9_]+)", (\w+)\}/)
-check 'the check table lists 15 checks with unique names', names.size == 15 && names.map(&:first).uniq.size == 15, names.size
+check 'the check table lists 16 checks with unique names', names.size == 16 && names.map(&:first).uniq.size == 16, names.size
 body = src
 marks = body.scan(/ok_mark\((\d+)\)|wait_async\(\d+, (\d+)\)/).flatten.compact.map(&:to_i)
-check 'every check number 1..15 has exactly one ok_mark', marks.sort == (1..15).to_a, marks.sort.inspect
+check 'every check number 1..16 has exactly one ok_mark', marks.sort == (1..16).to_a, marks.sort.inspect
 names.each_with_index do |(name, fn), i|
   # the function (or the handler/callback it registers) must print its own number
   fbody = src[/static int #{fn}\(void\).*?\n\}\n|static int #{fn}\(void\) \{[^\n]*\n/m].to_s

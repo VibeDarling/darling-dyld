@@ -167,6 +167,20 @@ __attribute__((noinline, disable_tail_calls)) static int walk(int depth) {
 static int c_unwind_walk(void) { int r = walk(WALK_DEPTH); if (!r) ok_mark(15); return r; }
 
 
+// 16 The reverse direction: a function pointer that a plain lib returns (dlsym) and this arm64e code
+// calls. The compiler authenticates the pointer before the call and the plain lib returns it
+// unsigned. Under mutation the harness signs it the way the compiler would (IA, discriminator 0).
+static int c_dlsym_result(void) {
+    void *p = dlsym(RTLD_DEFAULT, "getpid");
+    if (!p) return fail("dlsym returned NULL");
+    p = hand("dlsym.result", p);
+    if (g_mutate) p = SIGN_IA0(p);
+    pid_t (*fn)(void) = (pid_t (*)(void))p;
+    if (fn() != getpid()) return fail("wrong result");
+    ok_mark(16);
+    return 0;
+}
+
 const struct check checks[] = {
     {"atexit", c_atexit},
     {"cxa_atexit", c_cxa_atexit},
@@ -183,5 +197,6 @@ const struct check checks[] = {
     {"cxx_throw_class_base_catch", c_cxx_class},
     {"cxx_cleanup_landing_pad", c_cxx_cleanup},
     {"libunwind_walk_signed_frames", c_unwind_walk},
+    {"dlsym_result_called_by_arm64e", c_dlsym_result},
 };
 const int nchecks = (int)(sizeof checks / sizeof checks[0]);

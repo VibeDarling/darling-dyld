@@ -57,6 +57,8 @@ extern long dispatch_semaphore_signal(dispatch_semaphore_t);
 extern dispatch_time_t dispatch_time(dispatch_time_t, long long);
 
 extern void _dyld_register_func_for_add_image(void (*)(const void *, intptr_t));
+extern void *dlsym(void *, const char *);
+#define RTLD_DEFAULT ((void *)-2)
 extern int unw_getcontext(void *);
 extern int unw_init_local(void *, void *);
 extern int unw_step(void *);

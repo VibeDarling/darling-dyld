@@ -7,10 +7,12 @@
 #define ARCH "arm64e"
 #define HAS_PAC 1
 #define STRIP(p) ((void *)__builtin_ptrauth_strip((void *)(p), 0))
+#define SIGN_IA0(p) ((void *)__builtin_ptrauth_sign_unauthenticated((void *)(p), 0, 0))   /* what paciza makes */
 #else
 #define ARCH "arm64"
 #define HAS_PAC 0
 #define STRIP(p) ((void *)(p))
+#define SIGN_IA0(p) ((void *)(p))
 #endif
 
 struct check { const char *name; int (*fn)(void); };

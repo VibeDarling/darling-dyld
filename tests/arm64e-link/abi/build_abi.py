@@ -41,7 +41,7 @@ AUTH_GOT = "__DATA_CONST,__auth_got"
 # calls into the plain libs the probe is about; every one must be imported
 REQUIRED_IMPORTS = {
     "libSystem": ["_atexit", "___cxa_atexit", "_pthread_key_create", "_pthread_create", "_pthread_once",
-                  "_qsort", "_dispatch_async", "_dispatch_once", "__dyld_register_func_for_add_image",
+                  "_qsort", "_dlsym", "_dispatch_async", "_dispatch_once", "__dyld_register_func_for_add_image",
                   "__Unwind_Resume", "__NSConcreteStackBlock", "__NSConcreteGlobalBlock", "_sigaction"],
     "libc++abi": ["___cxa_throw", "___gxx_personality_v0", "__ZTIi",
                   "__ZTVN10__cxxabiv120__si_class_type_infoE"],
