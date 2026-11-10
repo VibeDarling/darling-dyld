@@ -73,6 +73,10 @@ bool sealExecutablePage(void* page, size_t length);
 
 // The thunk bytes, exposed so a test can compare them with an assembler. Both return the number of words written.
 size_t emitAuthThunk(uint32_t* words, uint8_t authMask, uint64_t real);
+size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real);
+uint64_t callThunkHelperAddress();
+size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real);
+uint64_t callThunkHelperAddress();
 
 } // namespace darling
 } // namespace dyld3

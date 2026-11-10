@@ -1,9 +1,11 @@
 // DARLING arm64e compat: see DarlingArm64eAdapters.h.
 #include "DarlingArm64eAdapters.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 
+#include "MachOLoaded.h"
 
 namespace dyld {
 	extern void warn(const char* format, ...) __attribute__((format(printf, 1, 2)));
@@ -14,9 +16,58 @@ namespace darling {
 
 #if defined(__aarch64__) || defined(__arm64__)
 
+using AdapterSign = dyld3::MachOLoaded::ChainedFixupPointerOnDisk::Arm64e;
+
 static const AdapterRow kRows[] = {
 #include "DarlingArm64eAdapterRows.inc"
 };
+
+// A Block_literal_1. flags: 1<<24 BLOCK_NEEDS_FREE (heap), 1<<28 BLOCK_IS_GLOBAL.
+struct BlockLiteral {
+	void*		isa;
+	int32_t		flags;
+	int32_t		reserved;
+	void*		invoke;
+	void*		descriptor;
+};
+static_assert(sizeof(BlockLiteral) == 32, "block literal layout");
+static const int32_t kBlockNeedsFree = 1 << 24;
+static const int32_t kBlockIsGlobal  = 1 << 28;
+
+// The plain arm64 assembler of this build refuses the PAC mnemonics, so these are .inst words on x17 and x16.
+// XPACI is only used to tell a pointer that authenticated (canonical, so stripping changes nothing) from one that did not.
+static inline uint64_t stripCode(uint64_t pointer)
+{
+	uint64_t stripped;
+	__asm__("mov x17, %1\n\t.inst 0xDAC143F1\n\tmov %0, x17" : "=r"(stripped) : "r"(pointer) : "x17");	// xpaci x17
+	return stripped;
+}
+
+// AUTIA with the modifier in a register. Without FPAC a failed authentication returns a pointer with error bits and
+// the later call through it faults; with FPAC the instruction itself faults.
+static inline uint64_t authenticateIA(uint64_t pointer, uint64_t modifier)
+{
+	uint64_t result;
+	__asm__("mov x17, %1\n\tmov x16, %2\n\t.inst 0xDAC11211\n\tmov %0, x17" : "=r"(result) : "r"(pointer), "r"(modifier) : "x16", "x17");	// autia x17, x16
+	return result;
+}
+
+static inline bool authenticated(uint64_t result)
+{
+	return result == stripCode(result);
+}
+
+static inline bool isSpecialHandler(uint64_t value)
+{
+	// NULL, SIG_IGN, SIG_ERR: never signed, never authenticated
+	return (value == 0) || (value == 1) || (value == ~0ULL);
+}
+
+// a function pointer: key IA, discriminator 0 (what paciza makes, and the compiler for a C function pointer)
+static inline uint64_t authenticateFunction(uint64_t pointer)
+{
+	return isSpecialHandler(pointer) ? pointer : authenticateIA(pointer, 0);
+}
 
 static bool sEnabled = true;
 
@@ -78,6 +129,8 @@ const char* validateAdapterRows(const AdapterRow* rows, size_t count)
 
 // ------------------------------------------------------------------------------------------ thunks
 
+static const uint32_t kNop = 0xD503201F;
+
 static void putLiteral(uint32_t* words, uint64_t value)
 {
 	words[0] = (uint32_t)value;
@@ -101,6 +154,39 @@ size_t emitAuthThunk(uint32_t* words, uint8_t authMask, uint64_t real)
 	words[n++] = 0xD61F0200;	// br x16
 	putLiteral(&words[n], real);	// 4 words per argument and two more: the literal is 8 aligned
 	return n + 2;
+}
+
+static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real);
+
+uint64_t callThunkHelperAddress()
+{
+	return (uint64_t)&callRow;
+}
+
+// Saves x0-x7 below a frame record, then callRow(regs, row, real) does the work and returns the result in x0.
+size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real)
+{
+	static const uint32_t kTemplate[14] = {
+		0xA9BB7BFD,		// stp x29, x30, [sp, #-80]!
+		0x910003FD,		// mov x29, sp
+		0xA90107E0,		// stp x0, x1, [sp, #16]
+		0xA9020FE2,		// stp x2, x3, [sp, #32]
+		0xA90317E4,		// stp x4, x5, [sp, #48]
+		0xA9041FE6,		// stp x6, x7, [sp, #64]
+		0x910043E0,		// add x0, sp, #16
+		0x580000E1,		// ldr x1, row
+		0x58000102,		// ldr x2, real
+		0x58000130,		// ldr x16, helper
+		0xD63F0200,		// blr x16
+		0xA8C57BFD,		// ldp x29, x30, [sp], #80
+		0xD65F03C0,		// ret
+		0xD503201F,		// nop (the literals are 8 aligned)
+	};
+	memcpy(words, kTemplate, sizeof(kTemplate));
+	putLiteral(&words[14], (uint64_t)row);
+	putLiteral(&words[16], real);
+	putLiteral(&words[18], callThunkHelperAddress());
+	return 20;
 }
 
 // Thunks are never in a page that is writable and executable at once. Each new thunk gets its own page: mapped read-write,
@@ -147,7 +233,8 @@ static uint64_t emitThunkLocked(const AdapterRow* row, uint64_t real)
 	if ( sThunkCount == sizeof(sThunks) / sizeof(sThunks[0]) )
 		return 0;
 	uint32_t words[40];
-	const size_t count = emitAuthThunk(words, row->authMask, real);
+	const bool simple = (row->blockArg == 0) && (row->structArg == 0) && (row->ret == ReturnFix::None);
+	const size_t count = simple ? emitAuthThunk(words, row->authMask, real) : emitCallThunk(words, row, real);
 	void* page = mmap(nullptr, kThunkPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	if ( page == MAP_FAILED )
 		return 0;
@@ -166,6 +253,142 @@ static uint64_t emitThunk(const AdapterRow* row, uint64_t real)
 	const uint64_t thunk = emitThunkLocked(row, real);
 	__sync_lock_release(&sThunkLock);
 	return thunk;
+}
+
+// ------------------------------------------------------------------------------------------ the call thunk's work
+
+// The mirror of a global block: its literal can be read-only, so plain code gets a copy with the invoke authenticated.
+// Global blocks are never freed, so the mirrors are kept, one per block address, and refreshed on every use.
+struct Mirror { const BlockLiteral* original; BlockLiteral* copy; };
+static Mirror sMirrors[256];
+static size_t sMirrorCount;
+static volatile int sMirrorLock;
+
+static BlockLiteral* mirrorOfGlobalBlock(const BlockLiteral* block, uint64_t plainInvoke)
+{
+	while ( __sync_lock_test_and_set(&sMirrorLock, 1) ) { }
+	BlockLiteral* copy = nullptr;
+	for (size_t i = 0; i != sMirrorCount; ++i) {
+		if ( sMirrors[i].original == block ) {
+			copy = sMirrors[i].copy;
+			break;
+		}
+	}
+	if ( copy == nullptr ) {
+		if ( sMirrorCount == sizeof(sMirrors) / sizeof(sMirrors[0]) ) {
+			dyld::warn("arm64e adapters: more than %lu distinct global blocks passed to plain code\n", (unsigned long)(sizeof(sMirrors) / sizeof(sMirrors[0])));
+			__builtin_trap();
+		}
+		copy = (BlockLiteral*)malloc(sizeof(BlockLiteral));
+		sMirrors[sMirrorCount++] = { block, copy };
+	}
+	*copy = *block;
+	copy->invoke = (void*)plainInvoke;
+	__sync_lock_release(&sMirrorLock);
+	return copy;
+}
+
+// The handler that each signal was last given through a signal or sigaction row (already authenticated, so plain code
+// has it as it is), so that signal() can sign what it hands back only when arm64e code installed it. A signal() that
+// races another one can leave a stale entry; the effect is an unsigned result, which faults when it is called.
+static const unsigned kSignalCount = 32;
+static uint64_t sInstalledHandlers[kSignalCount];
+static volatile int sHandlerLock;
+
+static void recordInstalledHandler(uint64_t signalNumber, uint64_t plainHandler)
+{
+	if ( (signalNumber == 0) || (signalNumber >= kSignalCount) || !authenticated(plainHandler) )
+		return;
+	while ( __sync_lock_test_and_set(&sHandlerLock, 1) ) { }
+	sInstalledHandlers[signalNumber] = plainHandler;
+	__sync_lock_release(&sHandlerLock);
+}
+
+static bool wasInstalledHere(uint64_t signalNumber, uint64_t handler)
+{
+	if ( (signalNumber == 0) || (signalNumber >= kSignalCount) )
+		return false;
+	while ( __sync_lock_test_and_set(&sHandlerLock, 1) ) { }
+	const bool same = (sInstalledHandlers[signalNumber] == handler);
+	__sync_lock_release(&sHandlerLock);
+	return same;
+}
+
+typedef uint64_t (*Call8)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
+static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
+{
+	uint64_t a[8];
+	memcpy(a, regs, sizeof(a));
+	for (unsigned i = 0; i != 8; ++i) {
+		if ( (row->authMask >> i) & 1 )
+			a[i] = authenticateFunction(a[i]);
+	}
+
+	// An address-diversified invoke is authenticated with the address of its own field. A stack block that the callee
+	// copies or runs before it returns gets its signature back afterwards; a heap block stays authenticated, so arm64e
+	// code that calls that same object itself later faults (not shown by the probe: L2 checks 07-09 use stack and global blocks).
+	void** restoreSlot = nullptr;
+	void* restoreValue = nullptr;
+	if ( (row->blockArg != 0) && (a[row->blockArg - 1] != 0) ) {
+		BlockLiteral* block = (BlockLiteral*)a[row->blockArg - 1];
+		const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);
+		if ( block->flags & kBlockIsGlobal ) {
+			a[row->blockArg - 1] = (uint64_t)mirrorOfGlobalBlock(block, plainInvoke);
+		}
+		else {
+			if ( (block->flags & kBlockNeedsFree) == 0 ) {
+				restoreSlot = &block->invoke;
+				restoreValue = block->invoke;
+			}
+			block->invoke = (void*)plainInvoke;
+		}
+	}
+
+	// the callee reads the struct during the call only, and the caller's can be read-only
+	uint64_t structCopy[2];
+	if ( (row->structArg != 0) && (a[row->structArg - 1] != 0) ) {
+		memcpy(structCopy, (const void*)a[row->structArg - 1], sizeof(structCopy));
+		structCopy[0] = authenticateFunction(structCopy[0]);
+		a[row->structArg - 1] = (uint64_t)structCopy;
+	}
+
+	// Block_copy: the original's signature is checked before anything is signed for the copy
+	uint64_t originalBlock = 0, originalInvoke = 0;
+	if ( (row->ret == ReturnFix::ResignCopiedBlock) && (a[0] != 0) ) {
+		const BlockLiteral* block = (const BlockLiteral*)a[0];
+		originalBlock = a[0];
+		originalInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);
+	}
+
+	// the handler that signal() replaces is looked up before this call records the new one
+	uint64_t result = ((Call8)real)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+
+	if ( restoreSlot != nullptr )
+		*restoreSlot = restoreValue;
+	if ( row->structArg != 0 ) {
+		// sigaction returned 0: the handler in act is the one installed
+		if ( ((int)result == 0) && (a[row->structArg - 1] != 0) )
+			recordInstalledHandler(a[0], structCopy[0]);
+	}
+	switch ( row->ret ) {
+		case ReturnFix::None:
+			break;
+		case ReturnFix::SignInstalledHandler:
+			if ( !isSpecialHandler(result) && wasInstalledHere(a[0], result) )
+				result = AdapterSign::signPointer(result, nullptr, false, 0, 0);
+			if ( result != ~0ULL )
+				recordInstalledHandler(a[0], a[1]);
+			break;
+		case ReturnFix::ResignCopiedBlock:
+			// a copy was made when the result is another block than the argument (a global or heap block comes back as it is, and is not written); a failed authentication signs nothing
+			if ( (originalBlock != 0) && (result != 0) && (result != originalBlock) && authenticated(originalInvoke) ) {
+				BlockLiteral* copy = (BlockLiteral*)result;
+				copy->invoke = (void*)AdapterSign::signPointer(originalInvoke, &copy->invoke, true, 0, 0);
+			}
+			break;
+	}
+	return result;
 }
 
 // ------------------------------------------------------------------------------------------ bind time
@@ -201,6 +424,8 @@ const AdapterRow* findAdapterRow(const char*) { return nullptr; }
 const char* validateAdapterRows(const AdapterRow*, size_t) { return nullptr; }
 uint64_t adaptedTarget(const char*, uint64_t target, bool) { return target; }
 size_t emitAuthThunk(uint32_t*, uint8_t, uint64_t) { return 0; }
+size_t emitCallThunk(uint32_t*, const AdapterRow*, uint64_t) { return 0; }
+uint64_t callThunkHelperAddress() { return 0; }
 
 #endif
 
