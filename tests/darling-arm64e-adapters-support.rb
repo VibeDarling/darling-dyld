@@ -34,15 +34,17 @@ module AdapterSupport
     RbConfig::CONFIG['host_cpu'] =~ /aarch64|arm64/ && (hwcap & HWCAP_PACA) != 0 && system('clang++', '--version', out: File::NULL, err: File::NULL)
   end
 
-  # Builds `driver` (a .cpp path) with the module. adapters_text and rows_text replace the module source for a mutant.
+  # Builds `driver` (a .cpp path) with the module. adapters_text, rows_text and reverse_rows_text replace the module source or a
+  # table for a mutant.
   # Returns [executable or nil, compiler messages].
-  def self.build(root, dir, name, driver, adapters_text: nil, rows_text: nil)
+  def self.build(root, dir, name, driver, adapters_text: nil, rows_text: nil, reverse_rows_text: nil)
     work = File.join(dir, name)
     FileUtils.mkdir_p(File.join(work, 'mach'))
     File.write(File.join(work, 'MachOLoaded.h'), SHIM_LOADED)
     File.write(File.join(work, 'mach', 'machine.h'), SHIM_MACHINE)
     FileUtils.cp(File.join(root, 'dyld3/DarlingArm64eAdapters.h'), work)
     File.write(File.join(work, 'DarlingArm64eAdapterRows.inc'), rows_text || File.read(File.join(root, 'dyld3/DarlingArm64eAdapterRows.inc')))
+    File.write(File.join(work, 'DarlingArm64eReverseRows.inc'), reverse_rows_text || File.read(File.join(root, 'dyld3/DarlingArm64eReverseRows.inc')))
     File.write(File.join(work, 'DarlingArm64eAdapters.cpp'), adapters_text || File.read(File.join(root, 'dyld3/DarlingArm64eAdapters.cpp')))
     File.write(File.join(work, 'sign.cpp'), "#include <stdint.h>\n#include <assert.h>\n#include \"MachOLoaded.h\"\nusing namespace dyld3;\n#{extract_sign_pointer(File.read(File.join(root, 'dyld3/MachOLoaded.cpp')))}")
     exe = File.join(work, 'host')

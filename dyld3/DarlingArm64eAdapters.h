@@ -78,6 +78,65 @@ const char* validateAdapterRows(const AdapterRow* rows, size_t count);
 // is the raw function and is not interposed by an arm64e interposer (not tested under a guest). Safe to call from several threads (the thunk cache has its own lock).
 uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e);
 
+// ------------------------------------------------------------------------------------------ the opposite direction
+//
+// A PLAIN importer (Darling's libobjc, any non-arm64e image) binding an export of an ARM64E image (the shared cache's
+// libc++ and libc++abi). The arm64e callee authenticates or re-signs the function pointers it is given (key IA, discriminator
+// 0: the schema of a C function pointer, which the open-source libc++abi's re-sign into its __ptrauth fields authenticates its
+// source with) and hands handlers back signed; plain code signs nothing and calls what it gets with a plain BLR. libobjc's
+// std::set_terminate(&_objc_terminate) at init stored an unsigned pointer that __cxa_init_primary_exception then failed to
+// authenticate, so every throw trapped. Only these binds get a thunk (the hooks in ImageLoaderMachOCompressed.cpp check that the
+// importer is plain and the exporter arm64e; an arm64e importer binds the arm64e export directly, and an interposer's own
+// address is never wrapped). It is on in the same cases as the forward direction: DYLD_DARLING_ARM64E_ADAPTERS=off turns it
+// off and report names the exports with no row, and that variable is honoured only where the other loader environment
+// variables that choose the shared cache are (dyld2.cpp).
+//
+// Result: a handler that comes back is AUTHENTICATED (IA, 0) and handed to plain code raw. One that does not authenticate stops
+// the process with a message naming the symbol; 0, 1 and -1 pass. A signature is never stripped without being authenticated.
+//
+// Argument: a code pointer is signed (IA, 0) only when the predicate says it is a function entry of a loaded PLAIN image, or it
+// is exactly a handler this module handed back before (a round trip: set_terminate(get_terminate())). 0, an address in an arm64e
+// or cache image, a mid-function address, data and a value that already carries a signature are passed as they are, so the
+// arm64e callee fails to authenticate them. An image with no function-starts table signs nothing.
+//
+// Residual trust. (1) A plain caller of a bound thunk can get any function entry of a plain image installed as a handler (a
+// terminate handler, a destructor of a thrown object): it could call that entry itself, so this gives it no new reach, but the
+// thunk is not a check that the entry is a sensible handler. (2) The entry check reads the image's mapped LINKEDIT without
+// dyld's lock, like dladdr: a dlclose of that image during the call is a race. The lock is not taken: dladdr, which reads the
+// same image list and LINKEDIT, takes none, and a thunk is called from arbitrary library code, where taking dyld's lock could
+// deadlock a thread that already holds it.
+//
+// Not covered by a register thunk, and so not by this table: (a) vtables and typeinfo of plain code handed to the arm64e
+// libc++abi (a plain image throwing a class through the cache's __cxa_throw: the cache's catch matching calls through plain,
+// unsigned vtables; that needs a design decision, not a row); (b) plain code reading or writing the handler data exports
+// (___cxa_terminate_handler, ___cxa_unexpected_handler, ___cxa_new_handler) directly; (c) dlsym by a plain caller, which returns
+// the raw address; (d) arguments beyond register 8 or on the stack; (e) struct arguments: no row in this table copies a struct
+// (money_get::__do_get, whose deleter lives in one, is an unsupported row).
+struct ReverseRow {
+	const char*		symbol;			// Mach-O name, with the leading underscore
+	uint8_t			signMask;		// bit i: argument i is a code pointer to sign (IA, discriminator 0)
+	bool			authReturn;		// the result is a handler: authenticate it (IA, 0) and hand plain code the raw pointer
+	uint8_t			argCount;		// register arguments up to the last one the row touches, at most 8; 0 for a getter
+	AdapterStatus	status;			// Probed, ShapeOnly or Unsupported (HandledElsewhere does not exist in this direction)
+	const char*		evidence;		// never empty
+};
+
+// true when `address` may be signed for an arm64e callee: a function entry of a loaded plain image
+typedef bool (*FunctionEntryPredicate)(uint64_t address);
+
+const ReverseRow* reverseRows(size_t* count);
+const ReverseRow* findReverseRow(const char* symbol);
+const char* validateReverseRows(const ReverseRow* rows, size_t count);
+
+// Whether `offset` (from the mach header of the image) is one of the function starts in an LC_FUNCTION_STARTS blob (ULEB128
+// deltas from 0, ended by a zero delta). A malformed or truncated blob never matches what it does not plainly list.
+bool functionStartsContain(const uint8_t* blob, size_t size, uint64_t offset);
+
+// What a plain importer should bind for `symbol` when the resolved target is at `target` and the exporter is arm64e or not: a
+// thunk when there is a supported row, otherwise `target` (an Unsupported row warns). isEntry is the predicate that the thunks
+// consult; the loader passes the same one on every call.
+uint64_t reverseAdaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e, FunctionEntryPredicate isEntry);
+
 // DYLD_DARLING_ARM64E_ADAPTERS: off binds the raw targets, as before the adapters existed. report also warns, once per
 // symbol, for every plain function an arm64e image binds that has no row at all (the way to find a callback-taking import
 // that the table does not know; a symbol with a row never warns here).
@@ -88,9 +147,10 @@ void setAdapterMode(AdapterMode mode);
 // Thunk pages are only ever writable before this and never after it.
 bool sealExecutablePage(void* page, size_t length);
 
-// The thunk bytes, exposed so a test can compare them with an assembler. Both return the number of words written.
+// The thunk bytes, exposed so a test can compare them with an assembler. All return the number of words written.
 size_t emitAuthThunk(uint32_t* words, uint8_t authMask, uint64_t real);
 size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real);
+size_t emitReverseThunk(uint32_t* words, const ReverseRow* row, uint64_t real);
 uint64_t callThunkHelperAddress();
 
 } // namespace darling
