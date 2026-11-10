@@ -219,6 +219,10 @@ REPLAY = <<~'CPP'
     CHECK(hook4(&plainImporter, BIND_TYPE_POINTER, setT, 0, 0x9000, &calleeImage) == 0x9000, "an interposer's address, outside the exporter, was thunked");
     CHECK(hook4(&plainImporter, BIND_TYPE_POINTER, setT, 0, callee, noImage) == callee, "a bind with no target image was thunked");
     CHECK(hook4(&plainImporter, BIND_TYPE_THREADED_REBASE, setT, 0, 0, nullptr) == 0, "a threaded rebase was changed");
+    // an image of the shared cache keeps its GOT in cache memory: no thunk address may be written there
+    ImageLoader cacheImporter = { { 0 }, 0x2000, 0x3000 };
+    cacheImporter.shared = true;
+    CHECK(hook4(&cacheImporter, BIND_TYPE_POINTER, setT, 0, callee, &calleeImage) == callee, "an importer in the shared cache was thunked");
     // through the thunk, with the real predicate: an entry of the plain image is signed, nothing else is
     Fn8 reverse = (Fn8)viaBindAt;
     const uint64_t args[] = { P + 0x1040, P + 0x1044, A + 0x1000, C + 0x1000, 0, 0x1234 };
@@ -319,6 +323,7 @@ Dir.mktmpdir('darling-arm64e-adapters-hooks-') do |dir|
     'a plain importer of an arm64e export gets no thunk from the dyld-info binds' => [:loader, 'symbolAddress = darlingPlainImportTarget(image, symbolName, symbolAddress, addend, targetImage);', ';'],
     'an arm64e importer is adapted in the reverse direction' => [:loader, "\tif ( dyld3::darling::cpusubtypeIsArm64e(importer->machHeader()->cpusubtype) )\n\t\treturn symbolAddress;\n", ''],
     'the reverse hook thunks a bind with an addend' => [:loader, '(addend != 0) || ', ''],
+    'the reverse hook thunks an importer in the shared cache' => [:loader, '(exporter == NULL) || importer->inSharedCache() || ', '(exporter == NULL) || '],
     'the reverse hook does not look at the exporter' => [:loader, '(exporter == NULL) || ', ''],
     'the reverse hook thunks an interposed address' => [:loader, ' || !exporter->containsAddress((void*)symbolAddress)', ''],
     'the reverse hook ignores the exporter\'s cpu subtype' => [:loader, 'dyld3::darling::cpusubtypeIsArm64e(exporter->machHeader()->cpusubtype), &darling', 'true, &darling'],

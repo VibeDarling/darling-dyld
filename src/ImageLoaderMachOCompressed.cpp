@@ -897,12 +897,12 @@ static bool darlingAddressIsPlainFunctionEntry(uint64_t address)
 
 // What a plain image binds for an import of an export of an arm64e image: a thunk that signs the code pointers the plain image
 // passes and authenticates the handlers it receives (DarlingArm64eAdapters.h). Anything else binds as it was resolved: an
-// arm64e importer, a bind with an addend, a target that is not in the exporting image (an interposer's address, a missing
-// weak import).
+// arm64e importer, an importer of the shared cache (its GOT is cache memory, which nothing may write a thunk address into), a
+// bind with an addend, a target that is not in the exporting image (an interposer's address, a missing weak import).
 static uintptr_t darlingPlainImportTarget(const ImageLoader* importer, const char* symbolName, uintptr_t symbolAddress,
 										  intptr_t addend, const ImageLoader* exporter)
 {
-	if ( (exporter == NULL) || (addend != 0) || !exporter->containsAddress((void*)symbolAddress) )
+	if ( (exporter == NULL) || importer->inSharedCache() || (addend != 0) || !exporter->containsAddress((void*)symbolAddress) )
 		return symbolAddress;
 	if ( dyld3::darling::cpusubtypeIsArm64e(importer->machHeader()->cpusubtype) )
 		return symbolAddress;
