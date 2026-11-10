@@ -131,6 +131,65 @@ Dir.mktmpdir('l4-policy-') do |dir|
   check "handler policy probes killed: #{policy_killed} of #{policy_probes.size}", policy_killed == policy_probes.size
 end
 
+# ---------------------------------------------------------------- the driver's adapter-warning filter
+# dyld prints about a hundred "arm64e adapters: ... has no adapter" warnings at the start of every child when the cache is
+# served; the driver drops them from what it judges, so that the OKMARK still fits. Run natively on text shaped like a child's.
+def warning_filter_ok(harness, dir)
+  fn = harness[/^static int drop_adapter_warnings\(char \*out\) \{.*?^\}/m] or return [false, 'drop_adapter_warnings missing']
+  File.write(File.join(dir, 'filter.c'), <<~C)
+    #include <stdio.h>
+    #include <string.h>
+    #{fn}
+    static int bad;
+    static void run(const char *in, const char *want, int want_dropped) {
+      char buf[2048]; strcpy(buf, in);
+      int dropped = drop_adapter_warnings(buf);
+      if (strcmp(buf, want) || dropped != want_dropped) { printf("input [%s] gave [%s] dropped %d\\n", in, buf, dropped); bad++; }
+    }
+    #define W "dyld: warning, arm64e adapters: _x is imported by an arm64e image and has no adapter (r); calls with a signed pointer fault"
+    int main(void) {
+      run("", "", 0);
+      run("OKMARK 03\\n", "OKMARK 03\\n", 0);
+      run(W "\\n" W "\\n" "OKMARK 03\\n", "OKMARK 03\\n", 2);
+      run("a\\n" W "\\nb\\n", "a\\nb\\n", 1);
+      run(W, "", 1);                                          /* the last line has no newline */
+      run("a\\n" W, "a\\n", 1);
+      run("a\\nb", "a\\nb", 0);                                /* a kept last line without a newline stays without one */
+      run("x " W "\\n", "x " W "\\n", 0);                      /* only a line that starts with the tag is dyld's */
+      run("dyld: warning, something else\\n", "dyld: warning, something else\\n", 0);
+      run("dyld: warning, arm64e adapters\\n", "dyld: warning, arm64e adapters\\n", 0);   /* a prefix of the tag */
+      run("\\n\\n", "\\n\\n", 0);
+      return bad;
+    }
+  C
+  _o, e, st = Open3.capture3('clang', '-O1', '-Wall', File.join(dir, 'filter.c'), '-o', File.join(dir, 'filter'))
+  return [false, e[0, 300]] unless st.success?
+  o, st = Open3.capture2e(File.join(dir, 'filter'))
+  [st.success?, o]
+end
+
+Dir.mktmpdir('l4-filter-') do |dir|
+  ok, why = warning_filter_ok(HARNESS, dir)
+  check 'the driver drops dyld\'s adapter warnings from a child\'s output, counts them and keeps every other line', ok, why
+  check 'the driver\'s output buffer is far larger than the warnings of one child', HARNESS[/static char out\[1 << (\d+)\]/, 1].to_i >= 16
+  filter_probes = [
+    ['the warnings are not dropped', 'if (match) dropped++;', 'if (0) dropped++;'],
+    ['the dropped lines are not counted', 'if (match) dropped++;', 'if (match) {}'],
+    ['a line is matched anywhere, not at its start', 'if (r + i >= e || r[i] != tag[i])', 'if (r + i >= e)'],
+    ['the tag is only a prefix of itself', 'dyld: warning, arm64e adapters:', 'dyld: warning, arm64e'],
+    ['the last line without a newline is lost', 'if (*e == \'\\n\') *w++ = \'\\n\';', '*w++ = \'\\n\';'],
+    ['the text after the dropped lines is lost', 'r = *e ? e + 1 : e;', 'r = *e ? e + 1 : e; if (match) break;']
+  ]
+  filter_killed = filter_probes.each_with_index.count do |(desc, old, new), i|
+    mdir = File.join(dir, "m#{i}")
+    Dir.mkdir(mdir)
+    ok = HARNESS.scan(old).size == 1 && !warning_filter_ok(HARNESS.sub(old) { new }, mdir)[0]
+    check "filter probe #{i + 1} killed: #{desc}", ok
+    ok
+  end
+  check "adapter-warning filter probes killed: #{filter_killed} of #{filter_probes.size}", filter_killed == filter_probes.size
+end
+
 # ---------------------------------------------------------------- native build and run
 def run_native(exe, config, *args)
   o, e, st = Open3.capture3({ 'PROBE_CONFIG' => config }, exe, *args)

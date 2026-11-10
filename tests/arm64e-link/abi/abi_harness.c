@@ -362,8 +362,27 @@ static void print_prefixed(const char *buf) {
     }
 }
 
+// With the cache served, dyld prints one "arm64e adapters: X ... has no adapter" warning per import of an arm64e
+// image that has no adapter row (about a hundred lines) at the start of every child, which filled the old 8 KB
+// buffer before the first OKMARK. They are not the child's output: the driver counts and drops those lines from
+// the text it judges and prints, and the buffer holds the rest.
+static int drop_adapter_warnings(char *out) {
+    static const char tag[] = "dyld: warning, arm64e adapters:";
+    char *w = out; int dropped = 0;
+    for (char *r = out; *r; ) {
+        char *e = r; while (*e && *e != '\n') e++;
+        int match = 1;
+        for (int i = 0; tag[i]; i++) if (r + i >= e || r[i] != tag[i]) { match = 0; break; }
+        if (match) dropped++;
+        else { for (char *c = r; c < e; c++) *w++ = *c; if (*e == '\n') *w++ = '\n'; }
+        r = *e ? e + 1 : e;
+    }
+    *w = 0;
+    return dropped;
+}
+
 static int driver(const char *self, const struct set *set, int mutate) {
-    static char out[8192];
+    static char out[1 << 19];
     int counts[4] = {0, 0, 0, 0};   // ok faulted hung failed
     int mismatches = 0, expecting = 0;
     put("ABI-PROBE arch="); put(ARCH); put(" set="); put(set->name); put(" mutate="); putdec(mutate);
@@ -375,7 +394,9 @@ static int driver(const char *self, const struct set *set, int mutate) {
         if (run_one(self, set->name, n, mutate, out, sizeof out, &status, &hung, &truncated)) {
             out[0] = 0; status = 0; hung = 0; truncated = 0;
         }
+        int dropped = drop_adapter_warnings(out);
         print_prefixed(out);
+        if (dropped) { put("  | ADAPTER-WARNINGS-DROPPED "); putdec(dropped); nl(); }
         int sig = status & 0x7f, code = (status >> 8) & 0xff;
         char mark[16] = "OKMARK ";
         int mi = 7;
