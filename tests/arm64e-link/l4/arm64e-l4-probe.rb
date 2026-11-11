@@ -222,7 +222,7 @@ MATRIX = File.read(File.join(HERE, 'run_matrix.sh'))
 def matrix_commands(script, dir, env)
   FileUtils.mkdir_p([File.join(dir, 'l4'), File.join(dir, 'abi'), File.join(dir, 'probe'), File.join(dir, 'cache')])
   File.write(File.join(dir, 'l4', 'run_matrix.sh'), script)
-  File.write(File.join(dir, 'abi', 'run_guest.sh'), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GUEST_LOG\"\n")
+  File.write(File.join(dir, 'abi', 'run_guest.sh'), "#!/bin/sh\nprintf '[%s][%s] %s\\n' \"${DYLD_SHARED_CACHE_SPLIT_DIR:-}\" \"${DYLD_SHARED_CACHE_SPLIT_POLICY:-}\" \"$*\" >> \"$GUEST_LOG\"\n")
   FileUtils.chmod(0o755, [File.join(dir, 'l4', 'run_matrix.sh'), File.join(dir, 'abi', 'run_guest.sh')])
   File.write(File.join(dir, 'policy.txt'), "x\n")
   log = File.join(dir, 'guest.log')
@@ -239,17 +239,39 @@ def matrix_policy_ok(script, root)
   off = matrix_commands(script, root, 'L4_CONFIGS' => 'c3')
   both = matrix_commands(script, root, 'L4_CONFIGS' => 'c2 c3', 'L4_POLICY' => File.join(root, 'policy.txt'))
   c3_part = both[/PROBE_CONFIG=c3[^;]*/].to_s
+  cache = File.realpath(File.join(root, 'cache'))
+  policy_file = File.realpath(File.join(root, 'policy.txt'))
   on.scan('DYLD_SHARED_CACHE_SPLIT_POLICY=').size == 1 && on.include?(" DYLD_SHARED_CACHE_SPLIT_POLICY=#{policy} ") &&
     on.include?('DYLD_SHARED_CACHE_SPLIT_DIR=') && !off.include?('POLICY') && off.include?('PROBE_CONFIG=c3 DYLD_SHARED_CACHE_SPLIT_DIR=') &&
-    c3_part.include?(policy) && !both[/PROBE_CONFIG=c2[^;]*/].to_s.include?('POLICY')
+    c3_part.include?(policy) && !both[/PROBE_CONFIG=c2[^;]*/].to_s.include?('POLICY') &&
+    launcher_env_clean?(on) && launcher_env_clean?(off) && launcher_env_clean?(both) &&
+    matrix_records_ok(on, root, [['l4_probe_arm64e', 'c3', cache, policy_file]]) &&
+    matrix_records_ok(off, root, [['l4_probe_arm64e', 'c3', cache, '']]) &&
+    matrix_records_ok(both, root, [['l4_probe_arm64e', 'c2', '', ''], ['l4_probe_arm64e', 'c3', cache, policy_file]])
 end
 
-# The command that reaches the guest is also executed here against two stubs that record their basename
-# and PROBE_CONFIG: the log text cannot tell `C=x` from `C[0]=`, `C+=`, `${C:=}`, `printf -v C` or `read C`.
-def matrix_records_ok(log, root)
+# The command that reaches the guest is also executed here against two stubs that record their basename,
+# PROBE_CONFIG and the two cache variables: the log text cannot tell `C=x` from `C[0]=`, `C+=`,
+# `${C:=}`, `printf -v C` or `read C`, and neither can it show a variable exported under an indirect name.
+def matrix_default_records(root)
+  cache = File.realpath(File.join(root, 'cache'))
+  [%w[l4_probe_arm64 c1] + ['', ''], %w[l4_probe_arm64e c2] + ['', ''],
+   ['l4_probe_arm64e', 'c3', cache, ''], ['l4_probe_arm64e', '', '', ''], ['l4_probe_arm64', '', '', '']]
+end
+
+# run_guest.sh is launched with the caller's environment, so both variables must stay empty on every
+# invocation: setting them on the launcher makes launchd load the cache itself (run_matrix.sh:8-10).
+def launcher_env_clean?(log)
+  log.lines.all? do |l|
+    m = l.match(/\A\[([^\]]*)\]\[([^\]]*)\] /)
+    m && m[1].empty? && m[2].empty?
+  end
+end
+
+def matrix_records_ok(log, root, expected)
   records = File.join(root, 'records.txt')
   FileUtils.rm_f(records)
-  stub = "#!/bin/sh\nprintf '%s|%s\\n' \"$(basename \"$0\")\" \"${PROBE_CONFIG:-}\" >> \"$RECORDS\"\n"
+  stub = "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$(basename \"$0\")\" \"${PROBE_CONFIG:-}\" \"${DYLD_SHARED_CACHE_SPLIT_DIR:-}\" \"${DYLD_SHARED_CACHE_SPLIT_POLICY:-}\" >> \"$RECORDS\"\n"
   probe_dir = File.realpath(File.join(root, 'probe'))
   %w[l4_probe_arm64 l4_probe_arm64e].each do |name|
     path = File.join(probe_dir, name)
@@ -257,13 +279,13 @@ def matrix_records_ok(log, root)
     FileUtils.chmod(0o755, path)
   end
   return false unless log.lines.size == 1
+  return false if log.include?("\r")
+  return false unless log.scan('/bin/bash -c ').size == 1
   line = log[%r{/bin/bash -c (.*)}, 1].to_s
   return false if line.empty?
   _o, _e, st = Open3.capture3({ 'RECORDS' => records }, '/bin/bash', '-c', line.gsub('/Volumes/SystemRoot', ''))
   return false unless st.success? && File.exist?(records)
-  File.readlines(records).map { |l| l.chomp.split('|', -1) } ==
-    [%w[l4_probe_arm64 c1], %w[l4_probe_arm64e c2], %w[l4_probe_arm64e c3],
-     ['l4_probe_arm64e', ''], ['l4_probe_arm64', '']]
+  File.readlines(records).map { |l| l.chomp.split('|', -1) } == expected
 end
 
 # the assignment itself: c1 is the plain control, c2 and c3 the arm64e probe, the cache directory on
@@ -285,7 +307,7 @@ def matrix_assignments_ok(script, root)
     log[/PROBE_CONFIG=c2[^;]*/].to_s == 'PROBE_CONFIG=c2 $E' &&
     log[/PROBE_CONFIG=c3[^;]*/].to_s == "PROBE_CONFIG=c3 DYLD_SHARED_CACHE_SPLIT_DIR=#{cache} $E" &&
     log.include?('$E selftest; $C selftest')
-  static_ok && matrix_records_ok(log, root)
+  static_ok && launcher_env_clean?(log) && matrix_records_ok(log, root, matrix_default_records(root))
 end
 
 Dir.mktmpdir('l4-matrix-') do |dir|
@@ -295,8 +317,12 @@ Dir.mktmpdir('l4-matrix-') do |dir|
         matrix_assignments_ok(MATRIX, File.join(dir, 'assign'))
   mroot = File.join(dir, 'multiline')
   mlog = matrix_commands(MATRIX, mroot, {})
-  check 'run_matrix log extraction accepts one line and rejects a log with more lines',
-        matrix_records_ok(mlog, mroot) && !matrix_records_ok(mlog + "# noise\n", mroot)
+  mrecords = matrix_default_records(mroot)
+  check 'run_matrix log extraction rejects more than one line, a CR, or a second launcher',
+        matrix_records_ok(mlog, mroot, mrecords) &&
+        !matrix_records_ok(mlog + "# noise\n", mroot, mrecords) &&
+        !matrix_records_ok(mlog.sub("\n", "\r\n"), mroot, mrecords) &&
+        !matrix_records_ok(mlog.chomp + " /bin/bash -c true\n", mroot, mrecords)
   matrix_probes = [
     ['the policy is never set', '$policy \\$E', ' \\$E'],
     ['the policy is set on every command', 'PROBE_CONFIG=c2 \\$E', 'PROBE_CONFIG=c2 DYLD_SHARED_CACHE_SPLIT_POLICY=/x \\$E'],
@@ -331,7 +357,15 @@ Dir.mktmpdir('l4-matrix-') do |dir|
     ['the control variable is set through printf -v', 'PROBE_CONFIG=c1 \\$C',
      'printf -v C $g/l4_probe_arm64e; PROBE_CONFIG=c1 \\$C'],
     ['the cache directory is exported on the host side', "set -u\n",
-     "set -u\nexport DYLD_SHARED_CACHE_SPLIT_DIR=/x\n"]
+     "set -u\nexport DYLD_SHARED_CACHE_SPLIT_DIR=/x\n"],
+    ['the cache directory is exported indirectly on the launcher', "set -u\n",
+     "set -u\nV=DYLD_SHARED_CACHE_SPLIT_DIR; export \"\$V=/x\"\n"],
+    ['the cache directory is exported indirectly inside the guest', 'PROBE_CONFIG=c1 \\$C',
+     'V=DYLD_SHARED_CACHE_SPLIT_DIR; export \"\\$V=/x\"; PROBE_CONFIG=c1 \\$C'],
+    ['the policy is exported indirectly on the launcher', "set -u\n",
+     "set -u\nV=DYLD_SHARED_CACHE_SPLIT_POLICY; export \"\$V=/x\"\n"],
+    ['the policy is set indirectly inside the guest on c2', 'PROBE_CONFIG=c2 \\$E',
+     'V=DYLD_SHARED_CACHE_SPLIT_POLICY; export \"\\$V=/x\"; PROBE_CONFIG=c2 \\$E']
   ]
   assignment_killed = assignment_probes.each_with_index.count do |(desc, old, new), i|
     ok = MATRIX.scan(old).size == 1 && !matrix_assignments_ok(MATRIX.sub(old) { new }, File.join(dir, "a#{i}"))
