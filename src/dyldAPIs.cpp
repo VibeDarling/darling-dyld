@@ -54,6 +54,8 @@
 #include "dyld2.h"
 #include "dyldLibSystemInterface.h"
 #include "DyldSharedCache.h"
+#include "objc-shared-cache.h"
+#include "ObjCSectionInfo.h"
 #include "MachOFile.h"
 #ifdef DARLING
 #include "DarlingArm64eAdapters.h"
@@ -241,6 +243,10 @@ static const struct dyld_func dyld_funcs[] = {
     {"__dyld_get_image_header_containing_address",		(void*)dyld_image_header_containing_address },
     {"__dyld_is_memory_immutable",						(void*)_dyld_is_memory_immutable },
     {"__dyld_objc_notify_register",						(void*)_dyld_objc_notify_register },
+    {"__dyld_for_objc_header_opt_ro",					(void*)_dyld_for_objc_header_opt_ro },
+    {"__dyld_for_objc_header_opt_rw",					(void*)_dyld_for_objc_header_opt_rw },
+    {"__dyld_objc_class_count",							(void*)_dyld_objc_class_count },
+    {"__dyld_lookup_section_info",						(void*)_dyld_lookup_section_info },
     {"__dyld_get_shared_cache_uuid",					(void*)_dyld_get_shared_cache_uuid },
     {"__dyld_get_shared_cache_range",					(void*)_dyld_get_shared_cache_range },
     {"__dyld_images_for_addresses",						(void*)_dyld_images_for_addresses },
@@ -2271,6 +2277,51 @@ const void* _dyld_get_shared_cache_range(size_t* length)
         return cache;
     }
 	return nullptr;
+}
+
+// The dyld executable has no dyld3/APIs.cpp, so it needs its own copies of these four; libdyld's live in
+// dyld3/APIs.cpp. Both answer from the cache the same way.
+static const objc_opt::objc_opt_t* inMemoryObjCOpt()
+{
+	const DyldSharedCache* cache = (const DyldSharedCache*)dyld::imMemorySharedCacheHeader();
+	return (cache != nullptr) ? cache->objcOpt() : nullptr;
+}
+
+const void* _dyld_for_objc_header_opt_ro(void)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s()\n", __func__);
+	const objc_opt::objc_opt_t* opt = inMemoryObjCOpt();
+	return (opt != nullptr) ? opt->headeropt_ro() : nullptr;
+}
+
+void* _dyld_for_objc_header_opt_rw(void)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s()\n", __func__);
+	const objc_opt::objc_opt_t* opt = inMemoryObjCOpt();
+	return (opt != nullptr) ? opt->headeropt_rw() : nullptr;
+}
+
+uint32_t _dyld_objc_class_count(void)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s()\n", __func__);
+	const objc_opt::objc_opt_t* opt = inMemoryObjCOpt();
+	if ( opt == nullptr )
+		return 0;
+	const objc::ClassHashTable* classes = opt->classOpt();
+	return (classes != nullptr) ? classes->classCount() : 0;
+}
+
+struct _dyld_section_info_result _dyld_lookup_section_info(const struct mach_header* mh,
+														   _dyld_section_location_info_t locationHandle,
+														   enum _dyld_section_location_kind kind)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s()\n", __func__);
+	(void)locationHandle;
+	return lookupObjCSectionInfo(mh, kind);
 }
 
 void _dyld_images_for_addresses(unsigned count, const void* addresses[], struct dyld_image_uuid_offset infos[])

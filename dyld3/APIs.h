@@ -191,6 +191,14 @@ void _dyld_missing_symbol_abort() TEMP_HIDDEN;
 
 const char* _dyld_get_objc_selector(const char* selName) TEMP_HIDDEN;
 
+const void* _dyld_for_objc_header_opt_ro() TEMP_HIDDEN;
+void* _dyld_for_objc_header_opt_rw() TEMP_HIDDEN;
+uint32_t _dyld_objc_class_count() TEMP_HIDDEN;
+
+struct _dyld_section_info_result _dyld_lookup_section_info(const struct mach_header* mh,
+                                                           _dyld_section_location_info_t locationHandle,
+                                                           enum _dyld_section_location_kind kind) TEMP_HIDDEN;
+
 void _dyld_for_each_objc_class(const char* className,
                                void (^callback)(void* classPtr, bool isLoaded, bool* stop)) TEMP_HIDDEN;
 

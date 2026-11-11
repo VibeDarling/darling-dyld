@@ -948,6 +948,59 @@ extern void _dyld_for_each_objc_protocol(const char* protocolName,
                                          void (^callback)(void* protocolPtr, bool isLoaded, bool* stop));
 
 
+// dyld4 SPIs the shared cache's libobjc imports. This copy of the header predates them, so they are
+// declared here with dyld-1378's shapes. The kind order is part of the interface: dyld's
+// SectionLocations::version bumps when it changes.
+typedef struct _dyld_section_location_info_s* _dyld_section_location_info_t;
+
+enum _dyld_section_location_kind {
+    // TEXT:
+    _dyld_section_location_text_swift5_protos                  = 0x0,
+    _dyld_section_location_text_swift5_proto,
+    _dyld_section_location_text_swift5_types,
+    _dyld_section_location_text_swift5_replace,
+    _dyld_section_location_text_swift5_replace2,
+    _dyld_section_location_text_swift5_ac_funcs,
+
+    // DATA*:
+    _dyld_section_location_objc_image_info,
+    _dyld_section_location_data_sel_refs,
+    _dyld_section_location_data_msg_refs,
+    _dyld_section_location_data_class_refs,
+    _dyld_section_location_data_super_refs,
+    _dyld_section_location_data_protocol_refs,
+    _dyld_section_location_data_class_list,
+    _dyld_section_location_data_non_lazy_class_list,
+    _dyld_section_location_data_stub_list,
+    _dyld_section_location_data_category_list,
+    _dyld_section_location_data_category_list2,
+    _dyld_section_location_data_non_lazy_category_list,
+    _dyld_section_location_data_protocol_list,
+    _dyld_section_location_data_objc_fork_ok,
+    _dyld_section_location_data_raw_isa,
+
+    // Note, always add new entries before this
+    _dyld_section_location_count,
+};
+
+// found a section: { start_address_of_section, section_size }
+// unknown section: { nullptr, -1 }
+// not in dylib   : { nullptr, 0 }
+struct _dyld_section_info_result {
+    void*   buffer;
+    size_t  bufferSize;
+};
+
+extern struct _dyld_section_info_result _dyld_lookup_section_info(const struct mach_header* mh,
+                                                                  _dyld_section_location_info_t locationHandle,
+                                                                  enum _dyld_section_location_kind kind);
+
+// The cache's pre-optimized objc tables, null when the cache does not carry libobjc.
+extern const void* _dyld_for_objc_header_opt_ro(void);
+extern void* _dyld_for_objc_header_opt_rw(void);
+extern uint32_t _dyld_objc_class_count(void);
+
+
 // called by exit() before it calls cxa_finalize() so that thread_local
 // objects are destroyed before global objects.
 extern void _tlv_exit(void);

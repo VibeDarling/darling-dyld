@@ -133,6 +133,7 @@ public:
 #endif
 
     const char*                 getObjCSelector(const char* selName) const;
+    const objc_opt::objc_opt_t* dyldCacheObjCOpt() const { return _dyldCacheObjCOpt; }
     void                        forEachObjCClass(const char* className,
                                                  void (^callback)(void* classPtr, bool isLoaded, bool* stop)) const;
     void                        forEachObjCProtocol(const char* protocolName,

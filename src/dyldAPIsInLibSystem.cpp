@@ -2284,6 +2284,42 @@ const char* _dyld_get_objc_selector(const char* selName)
     return nullptr;
 }
 
+const void* _dyld_for_objc_header_opt_ro(void)
+{
+    if ( gUseDyld3 )
+        return dyld3::_dyld_for_objc_header_opt_ro();
+
+    return (gObjCOpt != nullptr) ? gObjCOpt->headeropt_ro() : nullptr;
+}
+
+void* _dyld_for_objc_header_opt_rw(void)
+{
+    if ( gUseDyld3 )
+        return dyld3::_dyld_for_objc_header_opt_rw();
+
+    return (gObjCOpt != nullptr) ? gObjCOpt->headeropt_rw() : nullptr;
+}
+
+uint32_t _dyld_objc_class_count(void)
+{
+    if ( gUseDyld3 )
+        return dyld3::_dyld_objc_class_count();
+
+    const objc_opt::objc_opt_t* opt = gObjCOpt;
+    if ( opt == nullptr )
+        return 0;
+    const objc::ClassHashTable* classes = opt->classOpt();
+    return (classes != nullptr) ? classes->classCount() : 0;
+}
+
+struct _dyld_section_info_result _dyld_lookup_section_info(const struct mach_header* mh,
+                                                            _dyld_section_location_info_t locationHandle,
+                                                            enum _dyld_section_location_kind kind)
+{
+    // The image's own section list answers both loaders; the handle only saves that walk in dyld4.
+    return dyld3::_dyld_lookup_section_info(mh, locationHandle, kind);
+}
+
 // This dyld2 loader does not allocate a separate protected dyld stack.
 extern "C" void _dyld_stack_range(const void** stackBottom, const void** stackTop)
 {

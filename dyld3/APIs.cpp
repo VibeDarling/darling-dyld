@@ -47,6 +47,8 @@
 #include "Logging.h"
 #include "Diagnostics.h"
 #include "DyldSharedCache.h"
+#include "objc-shared-cache.h"
+#include "ObjCSectionInfo.h"
 #include "PathOverrides.h"
 #include "APIs.h"
 #include "Closure.h"
@@ -1531,6 +1533,41 @@ const char* _dyld_get_objc_selector(const char* selName)
 {
     log_apis("dyld_get_objc_selector()\n");
     return gAllImages.getObjCSelector(selName);
+}
+
+const void* _dyld_for_objc_header_opt_ro()
+{
+    log_apis("_dyld_for_objc_header_opt_ro()\n");
+    const objc_opt::objc_opt_t* opt = gAllImages.dyldCacheObjCOpt();
+    return (opt != nullptr) ? opt->headeropt_ro() : nullptr;
+}
+
+void* _dyld_for_objc_header_opt_rw()
+{
+    log_apis("_dyld_for_objc_header_opt_rw()\n");
+    const objc_opt::objc_opt_t* opt = gAllImages.dyldCacheObjCOpt();
+    return (opt != nullptr) ? opt->headeropt_rw() : nullptr;
+}
+
+uint32_t _dyld_objc_class_count()
+{
+    log_apis("_dyld_objc_class_count()\n");
+    const objc_opt::objc_opt_t* opt = gAllImages.dyldCacheObjCOpt();
+    if ( opt == nullptr )
+        return 0;
+    const objc::ClassHashTable* classes = opt->classOpt();
+    return (classes != nullptr) ? classes->classCount() : 0;
+}
+
+struct _dyld_section_info_result _dyld_lookup_section_info(const struct mach_header* mh,
+                                                           _dyld_section_location_info_t locationHandle,
+                                                           enum _dyld_section_location_kind kind)
+{
+    log_apis("_dyld_lookup_section_info()\n");
+    // A null or foreign handle is answered from the image's own section list, the fallback dyld4 takes.
+    // No caller in this dyld hands out section-location metadata yet.
+    (void)locationHandle;
+    return lookupObjCSectionInfo(mh, kind);
 }
 
 void _dyld_for_each_objc_class(const char* className,
