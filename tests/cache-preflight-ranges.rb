@@ -10,14 +10,14 @@ if ENV['CACHE_SOURCE_REF']
                                 "#{ENV.fetch('CACHE_SOURCE_REF')}:dyld3/SharedCacheRuntime.cpp")
   abort 'source unavailable' unless status.success?
 end
-helper = source[/static bool cacheRangeContains\(.*?^\}/m] || ''
-block = source[/    if \( \(cache->header.mappingCount < 3\).*?(?=    \/\/ register code signature)/m]
+helper = source[/static bool cacheRangeContains\(.*?(?=^static bool preflightCacheFile)/m] || ''
+block = source[/    if \( \(cache->header.mappingCount < (?:3\)|\(dyld_cache_header_is_split).*?(?=    \/\/ register code signature)/m]
 abort 'mapping validation missing' unless block
 header = File.read("#{root}/dyld3/shared-cache/dyld_cache_format.h")
 max_mappings = File.read("#{root}/dyld3/shared-cache/DyldSharedCache.h")[/MaxMappings = (\d+)/, 1] or abort 'mapping limit missing'
-structs = %w[dyld_cache_header dyld_cache_mapping_info dyld_cache_mapping_and_slide_info].map do |name|
+structs = %w[dyld_cache_header dyld_cache_mapping_info dyld_cache_mapping_and_slide_info dyld_cache_image_info].map do |name|
   header[/struct #{name}\s*\{.*?^\};/m] or abort "missing #{name}"
-end.join("\n")
+end.join("\n") + "\n" + header.scan(/static inline bool dyld_cache_\w+\(.*?^\}/m).join("\n").to_s
 Dir.mktmpdir('cache-preflight-ranges-') do |dir|
   File.write("#{dir}/test.cpp", <<~CPP)
     #include <stdint.h>
