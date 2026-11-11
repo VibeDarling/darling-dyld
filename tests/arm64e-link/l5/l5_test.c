@@ -152,7 +152,7 @@ static void l5_objc_scan(const char *out, const char *exe, struct l5_objc_seen *
 // was reported cache-served (bit 1) and this disk-served executable was reported with bit 0.
 static const char *l5_objc_verdict(const struct l5_objc_seen *s) {
     if (s->registers != 1)
-        return "the loader did not log exactly one objc register_callbacks line";
+        return "the loader did not log exactly one objc register_callbacks line (DYLD_PRINT_OBJC_NOTIFICATIONS=1 set?)";
     if (s->version != 4)
         return "libobjc did not register version 4 callbacks";
     if (s->repeats)

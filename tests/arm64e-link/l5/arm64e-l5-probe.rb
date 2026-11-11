@@ -80,6 +80,31 @@ check 'no home path or user name in the l5 sources',
 check 'the driver takes check 01\'s policy from the loader line, not from a file',
       SRC.include?('cache load source /usr/lib/libobjc.A.dylib: policy=') && !SRC.match?(/policy.*File|fopen.*policy/)
 
+# ---------------------------------------------------------------- the guest runner
+Dir.mktmpdir('l5-runner-') do |dir|
+  FileUtils.mkdir_p([File.join(dir, 'l5'), File.join(dir, 'abi'), File.join(dir, 'probe'), File.join(dir, 'cache')])
+  FileUtils.cp(File.join(HERE, 'run_l5.sh'), File.join(dir, 'l5', 'run_l5.sh'))
+  stub = File.join(dir, 'abi', 'run_guest.sh')
+  File.write(stub, "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$STUB_OUT\"\nenv >> \"$STUB_OUT.env\"\n")
+  File.chmod(0o755, stub)
+  env = { 'DARLING_GUEST_BUILD' => 'x', 'PROBE_DIR' => File.join(dir, 'probe'), 'CACHE_DIR' => File.join(dir, 'cache'),
+          'STUB_OUT' => File.join(dir, 'stub.out') }
+  _o, e, st = Open3.capture3(env, 'bash', File.join(dir, 'l5', 'run_l5.sh'), 'l5-', '1', '1')
+  guest = File.exist?(env['STUB_OUT']) ? File.read(env['STUB_OUT']) : ''
+  launcher_env = File.exist?(env['STUB_OUT'] + '.env') ? File.read(env['STUB_OUT'] + '.env') : ''
+  check 'run_l5.sh runs against a stub launcher (Darling is not booted)', st.success? && !guest.empty?, e[0, 200]
+  c3 = guest[/CONFIG c3; (.*?)"\$E"/m, 1].to_s
+  check 'the c3 guest command sets the cache variable and DYLD_PRINT_OBJC_NOTIFICATIONS=1',
+        c3.include?('DYLD_PRINT_OBJC_NOTIFICATIONS=1') && c3.include?('DYLD_SHARED_CACHE_SPLIT_DIR='), c3
+  c1 = guest[/CONFIG c1; (.*?); echo CONFIG selftest/m, 1]
+  st = guest[/CONFIG selftest; (.*)/m, 1]
+  check 'the c1 and selftest commands are present and set neither variable',
+        !c1.nil? && !st.nil? && !c1.include?('DYLD_') && !st.include?('DYLD_') && !guest.split('CONFIG c3').first.include?('DYLD_'),
+        [c1, st].inspect
+  check 'neither variable reaches the launcher environment', !launcher_env.include?('DYLD_PRINT_OBJC_NOTIFICATIONS') &&
+        !launcher_env.include?('DYLD_SHARED_CACHE_SPLIT_DIR'), launcher_env.lines.grep(/DYLD_/).inspect
+end
+
 # ---------------------------------------------------------------- the native harness
 Dir.mktmpdir('l5-native-') do |dir|
   bin = File.join(dir, 'l5_native')

@@ -42,6 +42,10 @@ dyld: objc mapped <path> refs_optimized=<0|1>      per image handed to the mappe
 dyld: objc init <path> refs_optimized=<0|1>        per image handed to the init callback
 ```
 
+dyld prints these only when `DYLD_PRINT_OBJC_NOTIFICATIONS=1` is set, so `run_l5.sh` sets it on the c3
+command inside the guest (never on the launcher); a run without it fails check 07 with that hint. c1 does
+not set it: its check 07 fails anyway because libobjc is not cache-served.
+
 The test executable carries an empty `__objc_imageinfo` section (the build asserts it sits in a `__DATA*` segment, which is what dyld2 keys on), so
 the loader reports it to the runtime; it is arm64e and disk-served, hence bit 0 beside libobjc's bit 1.
 The executable path in the mapped line must equal the child's `dladdr` name (no spaces in it).
