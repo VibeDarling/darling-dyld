@@ -1,7 +1,12 @@
-# The dyld4 objc surface in dyld: the wiring of _dyld_objc_register_callbacks and _dyld_get_dlopen_image_header
-# in both images, and a replay of _dyld_get_dlopen_image_header: the loader's dispatch, the libdyld wrapper and
-# the cache table's two functions are cut out of the tracked sources and driven with sentinel, forged-cache and
-# invalid handles. Mutants of the replay must each fail (--probes).
+# The dyld4 objc callback interface (dyld3/DarlingObjCCallbacks.h): libobjc's v2-v4 callback structs, translated
+# to the old-shape notifiers. The struct text is cut out of the tracked dyld_priv.h and the real header is
+# compiled against it, so this exercises the code the dyld build uses. A v4 callback signed the way libobjc
+# signs it must authenticate at its own field address, a forged one must be refused, the mark-image-mutable
+# block's invoke must be signed where libobjc reads it, and a call through the unauthenticated invoke must
+# fault on a CPU with pointer authentication. _dyld_get_dlopen_image_header is replayed the same way: the
+# loader's dispatch, the libdyld wrapper and the cache table's two functions are cut out of the tracked
+# sources and driven with sentinel, forged-cache and invalid handles. Mutants of either replay must each
+# fail (--probes).
 # Usage: ruby tests/dyld-objc-callbacks.rb [checkout] [--probes]
 require 'tmpdir'
 require 'fileutils'
@@ -55,6 +60,348 @@ check('both images register the old-shape thunks',
       APIS.include?('dyld::registerObjCNotifiers(dyld3::darling::objcMappedThunk, dyld3::darling::objcInitThunk, dyld3::darling::objcUnmappedThunk);'))
 check('libdyld answers RTLD_SELF before dispatching to the loader',
       WRAPPERS.match?(/if \( handle == RTLD_SELF \)\s*\n\s*return _dyld_get_image_header_containing_address\(__builtin_return_address\(0\)\);/))
+
+# --- the structs the host driver declares the callbacks with --------------------------------------
+BLOCK_START = '// >>> Darling dyld4 objc callbacks'
+BLOCK_STOP = '// <<< Darling dyld4 objc callbacks'
+def callbacks_block(text)
+  from = text.index(BLOCK_START) or abort 'the dyld4 objc callbacks block not found'
+  to = text.index(BLOCK_STOP, from) or abort 'the end of the dyld4 objc callbacks block not found'
+  text[from...to]
+end
+
+SHIM = <<~'CPP'
+  #pragma once
+  #include <stdint.h>
+  struct mach_header {
+      uint32_t magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags;
+  };
+  typedef void (*_dyld_objc_notify_unmapped)(const char* path, const struct mach_header* mh);
+  typedef struct _dyld_section_location_info_s* _dyld_section_location_info_t;
+CPP
+
+DRIVER = <<~'CPP'
+  #include <stdint.h>
+  #include <stddef.h>
+  #include <stdio.h>
+  #include <string.h>
+  #include <unistd.h>
+  #include <sys/wait.h>
+  #include "DarlingObjCCallbacks.h"
+
+  using namespace dyld3::darling;
+
+  static int failures;
+  static void expect(const char* what, bool ok)
+  {
+      if ( ok ) { printf("ok %s\n", what); return; }
+      ++failures;
+      printf("FAIL %s\n", what);
+  }
+
+  // A CPU that implements pointer authentication makes xpaci clear the top 16 bits; elsewhere it is a HINT.
+  static bool pacHost()
+  {
+      const uint64_t probe = 0x12340000FFFFFFFFull;
+      return stripSignedPointer(probe) != probe;
+  }
+
+  // The discriminators and the modifier shape are the interface facts our clang emits for the string
+  // discriminators in dyld_priv.h; pinned here rather than read from the header under test, so a wrong
+  // constant or a wrong modifier in that header fails this test instead of agreeing with itself.
+  static const uint16_t kMappedDisc = 0xd15a, kInitDisc = 0x4b12, kUnmappedDisc = 0x4840, kPatchDisc = 0x318c;
+
+  static uint64_t modifier(uint64_t field, uint16_t disc)
+  {
+      return (field & 0x0000FFFFFFFFFFFFull) | ((uint64_t)disc << 48);
+  }
+
+  // The versioned structs share only their leading version word; libobjc passes them as the base struct.
+  template <typename T>
+  static const struct _dyld_objc_callbacks* asCallbacks(const T* callbacks)
+  {
+      return reinterpret_cast<const struct _dyld_objc_callbacks*>(callbacks);
+  }
+
+  // PACIB, the key libobjc signs its callback fields with.
+  static uint64_t signCallbackIB(uint64_t pointer, uint64_t mod)
+  {
+      uint64_t result;
+      __asm__("mov x17, %1\n\tmov x16, %2\n\t.inst 0xDAC10611\n\tmov %0, x17" : "=r"(result) : "r"(pointer), "r"(mod) : "x16", "x17");
+      return result;
+  }
+
+  // AUTIA, the key libclosure uses for a block's invoke field.
+  static uint64_t authInvokeIA(uint64_t invoke, uint64_t field)
+  {
+      uint64_t result;
+      __asm__("mov x17, %1\n\tmov x16, %2\n\t.inst 0xDAC11211\n\tmov %0, x17" : "=r"(result) : "r"(invoke), "r"(field) : "x16", "x17");
+      return result;
+  }
+
+  static bool canonical(uint64_t pointer) { return (pointer & 0xFFFF000000000000ull) == 0; }
+
+  static const struct mach_header* recordedMhs[256];
+  static const char* recordedPaths[256];
+  static unsigned recordedRefs[256];
+  static unsigned recordedCount;
+  static unsigned mappedCalls, initCalls, unmappedCalls, patchCalls;
+  static bool metadataAlwaysNull = true;
+  static unsigned chunkCounts, chunkSizes[8];
+  static const ObjCBlockLayout* blockSeen;
+  static uint64_t blockInvokeField, blockInvokeAuth;
+  static unsigned mutableCalls;
+  static uint32_t mutableLastIndex;
+  static void* mutableBlock;
+
+  static void resetRecorder()
+  {
+      recordedCount = mappedCalls = initCalls = unmappedCalls = patchCalls = chunkCounts = 0;
+      metadataAlwaysNull = true;
+      blockSeen = nullptr;
+      blockInvokeField = blockInvokeAuth = 0;
+  }
+
+  static void recordInfo(const struct _dyld_objc_notify_mapped_info* info)
+  {
+      if ( recordedCount < 256 ) {
+          recordedMhs[recordedCount] = info->mh;
+          recordedPaths[recordedCount] = info->path;
+          recordedRefs[recordedCount] = info->dyldObjCRefsOptimized;
+          ++recordedCount;
+      }
+      if ( info->sectionLocationMetadata != nullptr )
+          metadataAlwaysNull = false;
+  }
+
+  static void onMapped2(unsigned count, const struct _dyld_objc_notify_mapped_info infos[])
+  {
+      ++mappedCalls;
+      if ( chunkCounts < 8 ) chunkSizes[chunkCounts++] = count;
+      for ( unsigned i = 0; i < count; ++i ) recordInfo(&infos[i]);
+  }
+
+  static void onMapped3(unsigned count, const struct _dyld_objc_notify_mapped_info infos[],
+                        _dyld_objc_mark_image_mutable callback)
+  {
+      ++mappedCalls;
+      for ( unsigned i = 0; i < count; ++i ) recordInfo(&infos[i]);
+      blockSeen = (const ObjCBlockLayout*)callback;
+      blockInvokeField = blockSeen->invoke;
+      blockInvokeAuth = authInvokeIA(blockSeen->invoke, (uint64_t)(uintptr_t)&blockSeen->invoke);
+  }
+
+  static void onInit2(const struct _dyld_objc_notify_mapped_info* info)
+  {
+      ++initCalls;
+      recordInfo(info);
+  }
+
+  static void onUnmapped(const char*, const struct mach_header*) { ++unmappedCalls; }
+  static void onPatch(const struct mach_header*, void*, const struct mach_header*, const void*) { ++patchCalls; }
+
+  static void recordMutable(void* block, uint32_t objcImageIndex)
+  {
+      ++mutableCalls;
+      mutableLastIndex = objcImageIndex;
+      mutableBlock = block;
+  }
+
+  int main()
+  {
+      const bool pac = pacHost();
+      printf("pointer authentication: %s\n", pac ? "present" : "absent");
+
+      _dyld_objc_callbacks_v2 v2 = { 2, onMapped2, onInit2, onUnmapped, onPatch };
+      _dyld_objc_callbacks_v2 nullV2 = { 2, nullptr, nullptr, nullptr, nullptr };
+      _dyld_objc_callbacks_v3 v3 = { 3, onMapped3, onInit2, onUnmapped, onPatch };
+      struct mach_header cacheMh = {};
+      struct mach_header diskMh = {};
+      cacheMh.flags = MH_DYLIB_IN_CACHE;
+      const char* paths[2] = { "cache/libobjc.A.dylib", "disk/libfoo.dylib" };
+      const struct mach_header* mhs[2] = { &cacheMh, &diskMh };
+
+      {
+          ObjCCallbackState s;
+          expect("null callbacks refused", !s.registerCallbacks(nullptr));
+          expect("null callbacks name the failure", s.error != nullptr && strstr(s.error, "null") != nullptr);
+      }
+      {
+          struct _dyld_objc_callbacks bad = { 5 };
+          ObjCCallbackState s;
+          expect("version 5 refused", !s.registerCallbacks(&bad));
+          expect("version 5 names the failure", s.error != nullptr && strstr(s.error, "unsupported") != nullptr);
+      }
+      {
+          struct _dyld_objc_callbacks bad = { 1 };
+          ObjCCallbackState s;
+          expect("version 1 refused", !s.registerCallbacks(&bad));
+      }
+      {
+          ObjCCallbackState s;
+          expect("v2 registers", s.registerCallbacks(asCallbacks(&v2)));
+          expect("v2 version", s.version == 2);
+          expect("v2 mapped", s.mapped2 == onMapped2);
+          expect("v2 init", s.init2 == onInit2);
+          expect("v2 unmapped", s.unmapped == onUnmapped);
+          expect("v2 patches", s.patches == onPatch);
+          expect("v2 leaves mapped3 null", s.mapped3 == nullptr);
+      }
+      {
+          ObjCCallbackState s;
+          expect("v3 registers", s.registerCallbacks(asCallbacks(&v3)));
+          expect("v3 version", s.version == 3);
+          expect("v3 mapped", s.mapped3 == onMapped3);
+      }
+      {
+          _dyld_objc_callbacks_v4 v4;
+          v4.version = 4;
+          v4.mapped = reinterpret_cast<_dyld_objc_notify_mapped3>(signCallbackIB((uint64_t)(uintptr_t)onMapped3, modifier((uint64_t)(uintptr_t)&v4.mapped, kMappedDisc)));
+          v4.init = reinterpret_cast<_dyld_objc_notify_init2>(signCallbackIB((uint64_t)(uintptr_t)onInit2, modifier((uint64_t)(uintptr_t)&v4.init, kInitDisc)));
+          v4.unmapped = reinterpret_cast<_dyld_objc_notify_unmapped>(signCallbackIB((uint64_t)(uintptr_t)onUnmapped, modifier((uint64_t)(uintptr_t)&v4.unmapped, kUnmappedDisc)));
+          v4.patches = reinterpret_cast<_dyld_objc_notify_patch_class>(signCallbackIB((uint64_t)(uintptr_t)onPatch, modifier((uint64_t)(uintptr_t)&v4.patches, kPatchDisc)));
+          ObjCCallbackState s;
+          expect("v4 signed callbacks register", s.registerCallbacks(asCallbacks(&v4)));
+          expect("v4 version", s.version == 4);
+          expect("v4 stores the plain mapped", s.mapped3 == onMapped3);
+          expect("v4 stores the plain init", s.init2 == onInit2);
+          expect("v4 stores the plain unmapped", s.unmapped == onUnmapped);
+          expect("v4 stores the plain patches", s.patches == onPatch);
+      }
+      if ( pac ) {
+          _dyld_objc_callbacks_v4 v4;
+          v4.version = 4;
+          v4.mapped = reinterpret_cast<_dyld_objc_notify_mapped3>(signCallbackIB((uint64_t)(uintptr_t)onMapped3, modifier((uint64_t)(uintptr_t)&v4.mapped, kMappedDisc)));
+          v4.init = reinterpret_cast<_dyld_objc_notify_init2>(signCallbackIB((uint64_t)(uintptr_t)onInit2, modifier((uint64_t)(uintptr_t)&v4.init, kInitDisc)));
+          v4.unmapped = reinterpret_cast<_dyld_objc_notify_unmapped>(signCallbackIB((uint64_t)(uintptr_t)onUnmapped, modifier((uint64_t)(uintptr_t)&v4.unmapped, kUnmappedDisc)));
+          v4.patches = reinterpret_cast<_dyld_objc_notify_patch_class>(signCallbackIB((uint64_t)(uintptr_t)onPatch, modifier((uint64_t)(uintptr_t)&v4.patches, kPatchDisc)) ^ (1ull << 63));
+          ObjCCallbackState s;
+          expect("a v4 field with a corrupted signature is refused", !s.registerCallbacks(asCallbacks(&v4)));
+          expect("a corrupted signature names the failure", s.error != nullptr && strstr(s.error, "authenticate") != nullptr);
+
+          v4 = _dyld_objc_callbacks_v4();
+          v4.version = 4;
+          v4.mapped = reinterpret_cast<_dyld_objc_notify_mapped3>(signCallbackIB((uint64_t)(uintptr_t)onMapped3, modifier((uint64_t)(uintptr_t)&v4.mapped, kMappedDisc)));
+          v4.init = reinterpret_cast<_dyld_objc_notify_init2>(signCallbackIB((uint64_t)(uintptr_t)onInit2, modifier((uint64_t)(uintptr_t)&v4.init, kMappedDisc)));
+          v4.unmapped = reinterpret_cast<_dyld_objc_notify_unmapped>(signCallbackIB((uint64_t)(uintptr_t)onUnmapped, modifier((uint64_t)(uintptr_t)&v4.unmapped, kUnmappedDisc)));
+          v4.patches = reinterpret_cast<_dyld_objc_notify_patch_class>(signCallbackIB((uint64_t)(uintptr_t)onPatch, modifier((uint64_t)(uintptr_t)&v4.patches, kPatchDisc)));
+          ObjCCallbackState s2;
+          expect("a field signed for another callback is refused", !s2.registerCallbacks(asCallbacks(&v4)));
+      } else {
+          printf("skip v4 field authentication (no pointer authentication)\n");
+      }
+      {
+          _dyld_objc_callbacks_v4 v4;
+          v4.version = 4;
+          v4.mapped = reinterpret_cast<_dyld_objc_notify_mapped3>(signCallbackIB((uint64_t)(uintptr_t)onMapped3, modifier((uint64_t)(uintptr_t)&v4.mapped, kMappedDisc)));
+          v4.init = reinterpret_cast<_dyld_objc_notify_init2>(signCallbackIB((uint64_t)(uintptr_t)onInit2, modifier((uint64_t)(uintptr_t)&v4.init, kInitDisc)));
+          v4.unmapped = reinterpret_cast<_dyld_objc_notify_unmapped>(signCallbackIB((uint64_t)(uintptr_t)onUnmapped, modifier((uint64_t)(uintptr_t)&v4.unmapped, kUnmappedDisc)));
+          v4.patches = nullptr;
+          ObjCCallbackState s;
+          expect("a v4 field the runtime left null is accepted", s.registerCallbacks(asCallbacks(&v4)));
+          expect("a null v4 field stays null", s.patches == nullptr);
+      }
+      {
+          ObjCCallbackState s;
+          expect("v2 with null callbacks registers", s.registerCallbacks(asCallbacks(&nullV2)));
+          resetRecorder();
+          s.notifyMapped(2, paths, mhs);
+          s.notifyInit(paths[0], &cacheMh);
+          s.notifyUnmapped(paths[0], &cacheMh);
+          expect("absent callbacks are not called", mappedCalls == 0 && initCalls == 0 && unmappedCalls == 0);
+      }
+      {
+          ObjCCallbackState s;
+          s.registerCallbacks(asCallbacks(&v2));
+          resetRecorder();
+          s.notifyMapped(2, paths, mhs);
+          expect("the mapped batch reaches the callback", mappedCalls == 1 && recordedCount == 2);
+          expect("a cache image is refs-optimized", recordedRefs[0] == 1);
+          expect("a disk image is not", recordedRefs[1] == 0);
+          expect("the batch carries the paths", recordedPaths[0] == paths[0] && recordedPaths[1] == paths[1]);
+          expect("the batch carries the headers", recordedMhs[0] == &cacheMh && recordedMhs[1] == &diskMh);
+          expect("no section metadata", metadataAlwaysNull);
+          resetRecorder();
+          s.notifyMapped(0, paths, mhs);
+          expect("an empty batch is not delivered", mappedCalls == 0);
+          s.notifyInit(paths[0], &cacheMh);
+          expect("init carries the cache bit", initCalls == 1 && recordedRefs[0] == 1 && recordedMhs[0] == &cacheMh);
+          s.notifyUnmapped(paths[0], &cacheMh);
+          expect("unmapped forwards the path", unmappedCalls == 1);
+      }
+      {
+          static const struct mach_header* many[130];
+          static const char* manyPaths[130];
+          static struct mach_header manyMh[130];
+          for ( unsigned i = 0; i < 130; ++i ) {
+              manyMh[i].flags = (i % 2) ? 0 : MH_DYLIB_IN_CACHE;
+              many[i] = &manyMh[i];
+              manyPaths[i] = "p";
+          }
+          ObjCCallbackState s;
+          s.registerCallbacks(asCallbacks(&v2));
+          resetRecorder();
+          s.notifyMapped(130, manyPaths, many);
+          expect("a large batch is chunked at 64", chunkCounts == 3 && chunkSizes[0] == 64 && chunkSizes[1] == 64 && chunkSizes[2] == 2);
+          expect("the chunks carry the whole batch", recordedCount == 130 && recordedMhs[129] == many[129]);
+          expect("the cache bit follows each image", recordedRefs[0] == 1 && recordedRefs[1] == 0 && recordedRefs[128] == 1 && recordedRefs[129] == 0);
+      }
+      {
+          ObjCCallbackState s;
+          s.markImageMutableInvoke = recordMutable;
+          s.registerCallbacks(asCallbacks(&v3));
+          resetRecorder();
+          mutableCalls = 0;
+          s.notifyMapped(1, paths, mhs);
+          expect("mapped3 receives the block", blockSeen != nullptr);
+          if ( pac ) {
+              expect("the invoke is signed", blockInvokeField != (uint64_t)(uintptr_t)recordMutable);
+              expect("the invoke is not a plain pointer", !canonical(blockInvokeField));
+              expect("the invoke authenticates at its field", blockInvokeAuth == (uint64_t)(uintptr_t)recordMutable);
+          } else {
+              printf("skip invoke signing (no pointer authentication)\n");
+              expect("the invoke is the plain pointer", blockInvokeField == (uint64_t)(uintptr_t)recordMutable);
+          }
+          reinterpret_cast<ObjCBlockInvoke>(blockInvokeAuth)(const_cast<ObjCBlockLayout*>(blockSeen), 7);
+          expect("the authenticated invoke calls the implementation", mutableCalls == 1 && mutableLastIndex == 7);
+          expect("the block is the one handed over", mutableBlock == (void*)blockSeen);
+      }
+      {
+          ObjCCallbackState& state = objcCallbackState();
+          state.registerCallbacks(asCallbacks(&v2));
+          resetRecorder();
+          objcMappedThunk(1, paths, mhs);
+          expect("the mapped thunk forwards", mappedCalls == 1 && recordedCount == 1 && recordedMhs[0] == &cacheMh);
+          objcInitThunk(paths[0], &cacheMh);
+          expect("the init thunk forwards", initCalls == 1 && recordedMhs[0] == &cacheMh);
+          objcUnmappedThunk(paths[0], &cacheMh);
+          expect("the unmapped thunk forwards", unmappedCalls == 1);
+      }
+      {
+          fflush(stdout);
+          pid_t pid = fork();
+          if ( pid == 0 ) {
+              ObjCCallbackState s;
+              s.markImageMutableInvoke = recordMutable;
+              if ( !s.registerCallbacks(asCallbacks(&v3)) ) _exit(10);
+              s.notifyMapped(1, paths, mhs);
+              reinterpret_cast<ObjCBlockInvoke>(blockInvokeField)(const_cast<ObjCBlockLayout*>(blockSeen), 7);
+              _exit(0);
+          }
+          int status = 0;
+          waitpid(pid, &status, 0);
+          if ( pac )
+              expect("an unauthenticated invoke faults", WIFSIGNALED(status));
+          else
+              expect("an unauthenticated invoke runs without PAC", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+      }
+
+      if ( failures != 0 )
+          return 1;
+      printf("all objc callback cases pass\n");
+      return 0;
+  }
+CPP
 
 # --- _dyld_get_dlopen_image_header: the loader's handle dispatch and libdyld's wrapper, replayed ----
 # Both functions are cut out of the tracked sources and compiled against stubs of the loader state they
@@ -306,6 +653,13 @@ def build_and_run(dir, callbacks_text, block_text)
 end
 
 Dir.mktmpdir('dyld-objc-callbacks-') do |dir|
+  block = callbacks_block(DYLDPRIV)
+  ok, out = build_and_run(dir, CALLBACKS, block)
+  puts out
+  check('objc callback replay', ok, out)
+  check('the runtime PAC probe agrees with the auxv check',
+        PAC_HOST == out.include?('pointer authentication: present'))
+  check('the PAC checks ran where PAC is present', !PAC_HOST || !out.include?('skip '))
 
   handle = handle_source
   ok, out = build_handle(dir, handle)
@@ -314,6 +668,25 @@ Dir.mktmpdir('dyld-objc-callbacks-') do |dir|
   next unless RUN_PROBES
 
   probes = [
+    ['cache images are refs-optimized',
+     'dyldObjCRefsOptimized = (mhs[base + i]->flags & MH_DYLIB_IN_CACHE) ? 1 : 0',
+     'dyldObjCRefsOptimized = 0', false, :callbacks],
+    ['init notices carry the cache bit',
+     'dyldObjCRefsOptimized = (mh->flags & MH_DYLIB_IN_CACHE) ? 1 : 0',
+     'dyldObjCRefsOptimized = 0', false, :callbacks],
+    ['a field authenticates at its own address',
+     'authenticateField(reinterpret_cast<uintptr_t>(v4->mapped), &v4->mapped,',
+     'authenticateField(reinterpret_cast<uintptr_t>(v4->mapped), &v4->init,', true, :callbacks],
+    ['an authenticated field is stored stripped',
+     'stored = stripSignedPointer(authenticated);', 'stored = signedValue;', true, :callbacks],
+    ['mapped signs with the mapped discriminator', '0xd15a', '0xd15b', true, :callbacks],
+    ['the invoke is signed against its field',
+     'markImageMutable.invoke = signBlockInvoke((uint64_t)(uintptr_t)markImageMutableInvoke, (uint64_t)(uintptr_t)&markImageMutable.invoke);',
+     'markImageMutable.invoke = (uint64_t)(uintptr_t)markImageMutableInvoke;', true, :callbacks],
+    ['the invoke is signed with key IA', '.inst 0xDAC10211', '.inst 0xDAC11211', true, :callbacks],
+    ['batches are chunked at 64', 'kMaxBatch = 64', 'kMaxBatch = 65', false, :callbacks],
+    ['version 2 is the v2 struct', 'callbacksVersion == 2', 'callbacksVersion == 1', false, :callbacks],
+    ['a null unmapped callback is not called', 'if ( unmapped != nullptr )', 'if ( true )', false, :callbacks],
     ['RTLD_MAIN_ONLY answers the main executable',
      'return dyld::mainExecutable()->machHeader();', 'return NULL;', false, :handle],
     ['a handle has its mode bits cleared', '& (-4)', '& (-1)', false, :handle],
@@ -324,13 +697,14 @@ Dir.mktmpdir('dyld-objc-callbacks-') do |dir|
     ['libdyld dispatches to dyld3 first', 'if ( gUseDyld3 )', 'if ( gUseDyld3 && false )', false, :handle],
     ['cacheImageMachHeader asks the cache', 'return sAllCacheImagesProxy->machHeaderForIndex(index);', 'return nullptr;', false, :handle],
   ]
-  probes.each do |name, from, to, pac_only|
+  probes.each do |name, from, to, pac_only, kind|
     if pac_only && !PAC_HOST
       puts "skip probe #{name} (no pointer authentication on this host)"
       next
     end
-    abort "probe text not found: #{name}" unless handle.include?(from)
-    ok, out = build_handle(dir, handle.sub(from, to))
+    source = kind == :handle ? handle : CALLBACKS
+    abort "probe text not found: #{name}" unless source.include?(from)
+    ok, out = kind == :handle ? build_handle(dir, source.sub(from, to)) : build_and_run(dir, source.sub(from, to), block)
     if out.start_with?('build failed')
       abort "probe does not compile: #{name}\n#{out}"
     elsif ok
