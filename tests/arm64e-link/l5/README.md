@@ -10,7 +10,7 @@ arm64 dyld2 must load it and the six dyld4 objc SPIs must answer from the cache.
 - `l5_test.c`: the probe. It reuses `../abi/abi_harness.c` (put, `run_one`'s fork plus 12 s watchdog,
   image capture) with its `main` renamed, and adds the driver, ten selftests and checks 01-08.
 - `l5_decl.h`: the runtime and SPI declarations plus the callback and section-info layouts.
-- `l5_imports.txt`: the ten `objc_*` names the test imports from libobjc. The build fails if the test
+- `l5_imports.txt`: the runtime names (`objc_*`, `class_*`, `object_*`, `sel_*`) the test imports from libobjc. The build fails if the test
   gains an import that is neither an SDK libSystem export nor listed here, or if a listed name goes
   unused, so the stub and the link cannot drift.
 - `build_l5.py`: builds the test with `../arm64e_link.py` (the shared arm64e recipe) against a
@@ -24,7 +24,7 @@ arm64 dyld2 must load it and the six dyld4 objc SPIs must answer from the cache.
 | # | Prints one OKMARK line proving |
 |---|--------------------------------|
 | 01 | the image behind `objc_getClass` lies inside the shared cache range (and reports whether a disk copy exists); the driver pairs this with the loader's own `policy=` line for libobjc |
-| 02 | `objc_getClass("NSObject")` returns a class whose name and isa are in the cache, and the measured `rw_loaded=` bit count |
+| 02 | `objc_getClass("NSObject")` returns a class whose name and isa (read with `object_getClass`, not a raw load: arm64e isas are signed or packed) are in the cache, and the measured `rw_loaded=` bit count |
 | 03 | `objc_allocateClassPair`/`class_createInstance` produce a live instance |
 | 04 | `objc_msgSend` answers `-hash` with the object itself and agrees with `isEqual:` |
 | 05 | a registered subclass with `class_addMethod` answers 42 and reports NSObject as its superclass |
@@ -49,7 +49,7 @@ LD64=... SDKROOT=... [PREFIX=...] ruby arm64e-l5-probe.rb
 prints exactly one OKMARK line and fails before it; the native stubs fail rather than pass; the
 selftests cover every verdict class; a wrong expected verdict (`selftest-wrong`) and a wrong expected
 hash (`--hash-skew 1`) make the driver exit 1; the built executable is arm64e and the build derives
-exactly the ten listed libobjc imports; the arm64e build hands `sigaction` the compiler-signed fault handler in every config (checked on the compiled assembly: `paciza`, no `xpaci`; a stripped-handler mutation is rejected), and no link-only stub is installed in the prefix, including
+exactly the listed libobjc imports; the arm64e build hands `sigaction` the compiler-signed fault handler in every config (checked on the compiled assembly: `paciza`, no `xpaci`; a stripped-handler mutation is rejected), and no link-only stub is installed in the prefix, including
 one renamed to `libobjc.A.dylib` (the scan finds stubs by structure, not by name).
 
 ## Guest run (T10)

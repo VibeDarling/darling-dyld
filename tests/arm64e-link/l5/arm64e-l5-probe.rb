@@ -48,6 +48,12 @@ rows.each_with_index do |(name, fn), i|
   check "check #{n} has a native stub that fails instead of passing", SRC.include?(
     "static int #{fn}(void) { return l5_fail(\"guest-only check\"); }")
 end
+%w[check02_getclass check03_createinstance].each do |name|
+  fn = "l5_check#{name[/\d+/]}"
+  body = SRC[/^static int #{fn}\(void\) \{.*?^\}/m].to_s
+  check "#{name} reads the isa with object_getClass and never dereferences the object (arm64e isas are not plain Class pointers)",
+        body.include?('object_getClass(') && !body.match?(/\*\(void \*\*\)/), body.scan(/\*\(void \*\*\)\w+/).inspect
+end
 selftests = SRC[/const struct check l5_selftests\[\] = \{(.*?)\n\};/m, 1].to_s
 st = selftests.scan(/\{"(l5_selftest_\w+)", (l5_st_\w+), "(\w+)"\}/).map { |n, _f, e| [n, e] }
 expected_st = [%w[l5_selftest_ok ok], %w[l5_selftest_failed failed],
@@ -192,8 +198,8 @@ else
     check 'the probe builds and its structural checks pass', st.success?, (e + _o)[0, 400]
     next unless st.success?
     exe = File.join(outdir, 'l5_probe')
-    check 'the build derives exactly the ten declared libobjc imports from the test\'s own undefined names',
-          _o.match?(/imports: \d+ libSystem, 10 libobjc/), _o.lines.last
+    check 'the build derives exactly the declared libobjc imports from the test\'s own undefined names',
+          _o.match?(/imports: \d+ libSystem, #{IMPORTS.size} libobjc/), _o.lines.last
     subtype = File.binread(exe, 12)[8, 4].unpack1('V') & 0x00ffffff
     check 'the executable is arm64e (cpusubtype 2)', subtype == 2, format('0x%x', subtype)
     _o, _e, st = py(BUILD, 'check', exe, env: { 'LD64' => LD64, 'SDKROOT' => SDKROOT })

@@ -11,4 +11,5 @@ objc_getClass
 objc_msgSend
 objc_registerClassPair
 object_dispose
+object_getClass
 sel_registerName

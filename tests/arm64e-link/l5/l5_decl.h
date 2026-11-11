@@ -141,6 +141,7 @@ struct l5_objc_callbacks_v4 {
 typedef void (*l5_imp)(void);
 extern void *objc_getClass(const char *name);
 extern const char *class_getName(void *cls);
+extern void *object_getClass(void *obj);
 extern void *class_createInstance(void *cls, size_t extraBytes);
 extern void *objc_allocateClassPair(void *superclass, const char *name, size_t extraBytes);
 extern void objc_registerClassPair(void *cls);

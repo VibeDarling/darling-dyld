@@ -44,7 +44,7 @@ REQUIRED_IMPORTS = {
                 "__dyld_lookup_section_info", "__dyld_objc_register_callbacks",
                 "__dyld_get_shared_cache_range", "_dladdr"],
     OBJC: ["_objc_getClass", "_objc_msgSend", "_objc_allocateClassPair", "_class_addMethod",
-           "_object_dispose", "_sel_registerName"],
+           "_object_dispose", "_object_getClass", "_sel_registerName"],
 }
 
 

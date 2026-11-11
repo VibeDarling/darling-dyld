@@ -397,10 +397,13 @@ static int l5_check02(void) {
     if (!cls)
         return l5_fail("objc_getClass(NSObject) returned null");
     const char *name = class_getName(cls);
-    void *isa = *(void **)cls;
+    // object_getClass, not a raw load: an arm64e class's isa field is a signed pointer.
+    void *isa = object_getClass(cls);
     const char *isaName = isa ? class_getName(isa) : 0;
     if (!name || !streq(name, "NSObject"))
         return l5_fail("class name is not NSObject");
+    if (isa == cls)
+        return l5_fail("the class's isa is the class itself, not its metaclass");
     if (!isaName || !streq(isaName, "NSObject"))
         return l5_fail("the class's isa is not NSObject");
     size_t len = 0;
@@ -423,7 +426,11 @@ static int l5_check03(void) {
     void *obj = class_createInstance(cls, 0);
     if (!obj)
         return l5_fail("class_createInstance returned null");
-    const char *isaName = class_getName(*(void **)obj);
+    // object_getClass, not a raw load: an instance's isa is a non-pointer isa (packed bits), not a Class.
+    void *isa = object_getClass(obj);
+    const char *isaName = isa ? class_getName(isa) : 0;
+    if (isa != cls)
+        return l5_fail("the instance's class is not the class it was created from");
     if (!isaName || !streq(isaName, "NSObject"))
         return l5_fail("the instance's isa is not NSObject");
     put("OKMARK 03 createinstance obj="); puthex((uintptr_t)obj); put(" isa="); put(isaName); nl();
