@@ -107,6 +107,69 @@ Source is http://burtleburtle.net/bob/c/perfect.c
 #define S32(x) x = little_endian ? OSSwapHostToLittleInt32(x) : OSSwapHostToBigInt32(x)
 #define S64(x) x = little_endian ? OSSwapHostToLittleInt64(x) : OSSwapHostToBigInt64(x)
 
+namespace objc {
+// The version-16 class/protocol tables (dyld-1376.6 common/OptimizerObjC.h). dyld reads these out of
+// the cache and never builds one, so only what classCount() needs is named here. The arrays follow
+// the fixed part; tab[] is where the variable-length layout begins.
+class StringHashTable {
+protected:
+    typedef uint8_t CheckByteType;
+    typedef int32_t StringOffset;
+
+    uint32_t version;    // never written
+    uint32_t capacity;
+    uint32_t occupied;
+    uint32_t shift;
+    uint32_t mask;
+    uint64_t salt;
+
+    uint32_t scramble[256];
+    uint8_t  tab[0];     // tab[mask+1], then checkbytes[capacity], then offsets[capacity]
+
+    const CheckByteType* checkbytes() const {
+        return (const CheckByteType*)&tab[mask + 1];
+    }
+    const StringOffset* offsets() const {
+        return (const StringOffset*)&checkbytes()[capacity];
+    }
+};
+
+class ObjectHashTable : public StringHashTable {
+protected:
+    struct ObjectData {
+        struct Object {
+            uint64_t isDuplicate       : 1,    // == 0
+                     objectCacheOffset : 47,
+                     dylibObjCIndex    : 16;
+        };
+        struct Duplicate {
+            uint64_t isDuplicate : 1,          // == 1
+                     index       : 47,
+                     count       : 16;
+        };
+        union {
+            Object    object;
+            Duplicate duplicate;
+            uint64_t  raw;
+        };
+    };
+
+    // objectOffsets[capacity], then the uint32_t duplicate count, then duplicateOffsets[]
+    const ObjectData* objectOffsets() const { return (const ObjectData*)&offsets()[capacity]; }
+    const uint32_t& duplicateCount() const {
+        return *(const uint32_t*)&objectOffsets()[capacity];
+    }
+};
+
+class ClassHashTable : public ObjectHashTable {
+public:
+    uint32_t classCount() const { return occupied + duplicateCount(); }
+};
+
+class ProtocolHashTable;
+} // namespace objc
+
+// Top-level optimization structure.
 namespace objc_opt {
 
 typedef int32_t objc_stringhash_offset_t;
@@ -740,7 +803,7 @@ struct objc_clsopt_t;
 
 // Edit objc-sel-table.s if you change this value.
 // lldb and Symbolication read these structures. Inform them of any changes.
-enum { VERSION = 15 };
+enum { VERSION = 16 };
 
 // Values for objc_opt_t::flags
 enum : uint32_t {
@@ -759,6 +822,10 @@ struct alignas(alignof(void*)) objc_opt_t {
     int32_t unused_protocolopt_offset; // This is now 0 as we've moved to the new protocolopt_offset
     int32_t headeropt_rw_offset;
     int32_t protocolopt_offset;
+
+    int32_t largeSharedCachesClassOffset;               // v16: the class table
+    int32_t largeSharedCachesProtocolOffset;            // v16: the protocol table
+    int64_t relativeMethodSelectorBaseAddressOffset;    // v16: relative method lists
 
     const objc_selopt_t* selopt() const {
         if (selopt_offset == 0) return NULL;
@@ -792,6 +859,21 @@ struct alignas(alignof(void*)) objc_opt_t {
     struct objc_headeropt_rw_t* headeropt_rw() const {
         if (headeropt_rw_offset == 0) return NULL;
         return (struct objc_headeropt_rw_t *)((uint8_t *)this + headeropt_rw_offset);
+    }
+
+    const objc::ClassHashTable* classOpt() const {
+        if (largeSharedCachesClassOffset == 0) return NULL;
+        return (const objc::ClassHashTable *)((const uint8_t *)this + largeSharedCachesClassOffset);
+    }
+
+    const objc::ProtocolHashTable* protocolOpt() const {
+        if (largeSharedCachesProtocolOffset == 0) return NULL;
+        return (const objc::ProtocolHashTable *)((const uint8_t *)this + largeSharedCachesProtocolOffset);
+    }
+
+    const void* relativeMethodListsBaseAddress() const {
+        if (relativeMethodSelectorBaseAddressOffset == 0) return NULL;
+        return (const void *)((const uint8_t *)this + relativeMethodSelectorBaseAddressOffset);
     }
 };
 
