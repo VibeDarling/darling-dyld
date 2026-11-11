@@ -222,7 +222,7 @@ MATRIX = File.read(File.join(HERE, 'run_matrix.sh'))
 def matrix_commands(script, dir, env)
   FileUtils.mkdir_p([File.join(dir, 'l4'), File.join(dir, 'abi'), File.join(dir, 'probe'), File.join(dir, 'cache')])
   File.write(File.join(dir, 'l4', 'run_matrix.sh'), script)
-  File.write(File.join(dir, 'abi', 'run_guest.sh'), "#!/bin/sh\nprintf '[%s][%s] %s\\n' \"${DYLD_SHARED_CACHE_SPLIT_DIR:-}\" \"${DYLD_SHARED_CACHE_SPLIT_POLICY:-}\" \"$*\" >> \"$GUEST_LOG\"\n")
+  File.write(File.join(dir, 'abi', 'run_guest.sh'), "#!/bin/sh\nprintf '%s.%s. %s\\n' \"${#DYLD_SHARED_CACHE_SPLIT_DIR}\" \"${#DYLD_SHARED_CACHE_SPLIT_POLICY}\" \"$*\" >> \"$GUEST_LOG\"\n")
   FileUtils.chmod(0o755, [File.join(dir, 'l4', 'run_matrix.sh'), File.join(dir, 'abi', 'run_guest.sh')])
   File.write(File.join(dir, 'policy.txt'), "x\n")
   log = File.join(dir, 'guest.log')
@@ -261,11 +261,10 @@ end
 
 # run_guest.sh is launched with the caller's environment, so both variables must stay empty on every
 # invocation: setting them on the launcher makes launchd load the cache itself (run_matrix.sh:8-10).
+# The stub records the values' lengths, not the values: a value containing the delimiter could
+# otherwise forge two empty fields.
 def launcher_env_clean?(log)
-  log.lines.all? do |l|
-    m = l.match(/\A\[([^\]]*)\]\[([^\]]*)\] /)
-    m && m[1].empty? && m[2].empty?
-  end
+  log.lines.all? { |l| l.match?(/\A0\.0\. /) }
 end
 
 def matrix_records_ok(log, root, expected)
@@ -365,7 +364,11 @@ Dir.mktmpdir('l4-matrix-') do |dir|
     ['the policy is exported indirectly on the launcher', "set -u\n",
      "set -u\nV=DYLD_SHARED_CACHE_SPLIT_POLICY; export \"\$V=/x\"\n"],
     ['the policy is set indirectly inside the guest on c2', 'PROBE_CONFIG=c2 \\$E',
-     'V=DYLD_SHARED_CACHE_SPLIT_POLICY; export \"\\$V=/x\"; PROBE_CONFIG=c2 \\$E']
+     'V=DYLD_SHARED_CACHE_SPLIT_POLICY; export \"\\$V=/x\"; PROBE_CONFIG=c2 \\$E'],
+    ['the cache directory is exported with a delimiter value on the launcher', "set -u\n",
+     "set -u\nexport DYLD_SHARED_CACHE_SPLIT_DIR='] '\n"],
+    ['the policy is exported with a delimiter value on the launcher', "set -u\n",
+     "set -u\nexport DYLD_SHARED_CACHE_SPLIT_POLICY='] '\n"]
   ]
   assignment_killed = assignment_probes.each_with_index.count do |(desc, old, new), i|
     ok = MATRIX.scan(old).size == 1 && !matrix_assignments_ok(MATRIX.sub(old) { new }, File.join(dir, "a#{i}"))
