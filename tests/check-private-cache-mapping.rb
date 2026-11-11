@@ -4,7 +4,7 @@ require 'tmpdir'
 require 'open3'
 root=File.realpath(ARGV.fetch(0, File.expand_path('..', __dir__)))
 source=File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
-helper=source[/class DarlingCacheReservation \{.*?^\};/m] or abort 'helper missing'
+helper=source[/static int mmapProtection\(.*?^\}/m].to_s + "\n" + (source[/class DarlingCacheReservation \{.*?^\};/m] or abort 'helper missing')
 if ENV['BASELINE_MAPPER_REF']
   source,ok=Open3.capture2('git','-C',root,'show',"#{ENV.fetch('BASELINE_MAPPER_REF')}:dyld3/SharedCacheRuntime.cpp")
   abort 'baseline source unavailable' unless ok.success?

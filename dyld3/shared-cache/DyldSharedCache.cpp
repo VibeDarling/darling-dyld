@@ -231,8 +231,74 @@ const T DyldSharedCache::getAddrField(uint64_t addr) const {
 
 uint64_t DyldSharedCache::getCodeSignAddress() const
 {
+    // The main file lists only its own mappings; the address after the last sub-cache is the end of the region.
+    if ( dyld_cache_header_is_split(header) )
+        return header.sharedRegionStart + header.sharedRegionSize;
     auto mappings = (const dyld_cache_mapping_info*)((uint8_t*)this + header.mappingOffset);
     return mappings[header.mappingCount-1].address + mappings[header.mappingCount-1].size;
+}
+
+// The mapping tables of the main file and every sub-cache file of a split cache, read where the mapper put
+// the files' headers (the main header at the cache address, a sub-cache's at its cacheVMOffset). Every table
+// has to lie inside its header's first mapping, which has to start at the header: if any does not, there is
+// no usable answer and false is returned.
+static const uint32_t kMaxSplitSubCaches = 32;       // as in the mapper
+static const uint32_t kMaxSplitFileMappings = 20;
+static const uint64_t kMinMappingSize = 0x1000;      // a header's first table entry is read before its size is known
+
+static bool splitFileMappingTable(const dyld_cache_header* header, uint64_t firstAddress,
+                                  const dyld_cache_mapping_and_slide_info** table, uint32_t* count)
+{
+    const uint64_t offset = header->mappingWithSlideOffset;
+    *count = header->mappingWithSlideCount;
+    if ( (*count == 0) || (*count > kMaxSplitFileMappings) || (offset % alignof(dyld_cache_mapping_and_slide_info) != 0)
+      || !dyld_cache_range_contains(0, kMinMappingSize, offset, sizeof(dyld_cache_mapping_and_slide_info)) )
+        return false;
+    *table = (const dyld_cache_mapping_and_slide_info*)((const char*)header + offset);
+    return ((*table)[0].address == firstAddress) && ((*table)[0].fileOffset == 0)
+        && dyld_cache_range_contains(0, (*table)[0].size, offset, uint64_t(*count) * sizeof(dyld_cache_mapping_and_slide_info));
+}
+
+static bool splitCacheTables(const DyldSharedCache* cache, const dyld_cache_mapping_and_slide_info* tables[],
+                             uint32_t counts[], uint32_t* files)
+{
+    const dyld_cache_header& main = cache->header;
+    const uint32_t subCaches = main.subCacheArrayCount;
+    if ( !splitFileMappingTable(&main, main.sharedRegionStart, &tables[0], &counts[0]) || (subCaches > kMaxSplitSubCaches)
+      || (main.subCacheArrayOffset % alignof(dyld_subcache_entry) != 0)
+      || !dyld_cache_range_contains(0, tables[0][0].size, main.subCacheArrayOffset, uint64_t(subCaches) * sizeof(dyld_subcache_entry)) )
+        return false;
+    const dyld_subcache_entry* entries = (const dyld_subcache_entry*)((const char*)cache + main.subCacheArrayOffset);
+    for (uint32_t i = 0; i != subCaches; ++i) {
+        if ( !dyld_cache_range_contains(0, main.sharedRegionSize, entries[i].cacheVMOffset, kMinMappingSize) )
+            return false;
+        const dyld_cache_header* header = (const dyld_cache_header*)((const char*)cache + entries[i].cacheVMOffset);
+        if ( !splitFileMappingTable(header, main.sharedRegionStart + entries[i].cacheVMOffset, &tables[i + 1], &counts[i + 1]) )
+            return false;
+    }
+    *files = subCaches + 1;
+    return true;
+}
+
+// A split cache lists its images in the main file at imagesOffsetSplit; the legacy table is empty then.
+static const dyld_cache_image_info* cacheImageTable(const dyld_cache_header& header, const void* cacheBase, uint32_t& count)
+{
+    if ( dyld_cache_header_is_split(header) ) {
+        count = header.imagesCountSplit;
+        return (const dyld_cache_image_info*)((const char*)cacheBase + header.imagesOffsetSplit);
+    }
+    count = header.imagesCount;
+    return (const dyld_cache_image_info*)((const char*)cacheBase + header.imagesOffset);
+}
+
+const dyld_cache_image_info* DyldSharedCache::imageTable(uint32_t& count) const
+{
+    return cacheImageTable(header, this, count);
+}
+
+bool DyldSharedCache::isSplitCache() const
+{
+    return dyld_cache_header_is_split(header);
 }
 
 void DyldSharedCache::forEachRegion(void (^handler)(const void* content, uint64_t vmAddr, uint64_t size,
@@ -252,6 +318,21 @@ void DyldSharedCache::forEachRegion(void (^handler)(const void* content, uint64_
             handler((char*)this + m->fileOffset, m->address, m->size, m->initProt, m->maxProt, 0);
         }
     } else {
+        if ( dyld_cache_header_is_split(header) ) {
+            // Sub-cache files are mapped at their VM address, so their content is found there, not at a file offset.
+            const dyld_cache_mapping_and_slide_info* tables[kMaxSplitSubCaches + 1];
+            uint32_t counts[kMaxSplitSubCaches + 1];
+            uint32_t files;
+            if ( !splitCacheTables(this, tables, counts, &files) )
+                return;
+            for (uint32_t f = 0; f != files; ++f) {
+                for (uint32_t i = 0; i != counts[f]; ++i) {
+                    const dyld_cache_mapping_and_slide_info* m = &tables[f][i];
+                    handler((const char*)this + (m->address - tables[0][0].address), m->address, m->size, m->initProt, m->maxProt, m->flags);
+                }
+            }
+            return;
+        }
         const dyld_cache_mapping_and_slide_info* mappings = (const dyld_cache_mapping_and_slide_info*)((char*)this + header.mappingWithSlideOffset);
         const dyld_cache_mapping_and_slide_info* mappingsEnd = &mappings[header.mappingCount];
         for (const dyld_cache_mapping_and_slide_info* m=mappings; m < mappingsEnd; ++m) {
@@ -297,19 +378,20 @@ bool DyldSharedCache::isAlias(const char* path) const {
 
 void DyldSharedCache::forEachImage(void (^handler)(const mach_header* mh, const char* installName)) const
 {
-    const dyld_cache_image_info*   dylibs   = (dyld_cache_image_info*)((char*)this + header.imagesOffset);
+    uint32_t imagesCount;
+    const dyld_cache_image_info*   dylibs   = cacheImageTable(header, this, imagesCount);
     const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
     if ( mappings[0].fileOffset != 0 )
         return;
     uint64_t firstImageOffset = 0;
     uint64_t firstRegionAddress = mappings[0].address;
-    for (uint32_t i=0; i < header.imagesCount; ++i) {
+    for (uint32_t i=0; i < imagesCount; ++i) {
         const char* dylibPath  = (char*)this + dylibs[i].pathFileOffset;
         uint64_t offset = dylibs[i].address - firstRegionAddress;
         if ( firstImageOffset == 0 )
             firstImageOffset = offset;
-        // skip over aliases
-        if ( dylibs[i].pathFileOffset < firstImageOffset)
+        // skip over aliases (a split cache's table has none, and all its paths are in the main file's header area)
+        if ( !dyld_cache_header_is_split(header) && (dylibs[i].pathFileOffset < firstImageOffset) )
             continue;
         const mach_header* mh = (mach_header*)((char*)this + offset);
         handler(mh, dylibPath);
@@ -318,19 +400,20 @@ void DyldSharedCache::forEachImage(void (^handler)(const mach_header* mh, const 
 
 void DyldSharedCache::forEachImageEntry(void (^handler)(const char* path, uint64_t mTime, uint64_t inode)) const
 {
-    const dyld_cache_image_info*   dylibs   = (dyld_cache_image_info*)((char*)this + header.imagesOffset);
+    uint32_t imagesCount;
+    const dyld_cache_image_info*   dylibs   = cacheImageTable(header, this, imagesCount);
     const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
     if ( mappings[0].fileOffset != 0 )
         return;
     uint64_t firstImageOffset = 0;
     uint64_t firstRegionAddress = mappings[0].address;
-    for (uint32_t i=0; i < header.imagesCount; ++i) {
+    for (uint32_t i=0; i < imagesCount; ++i) {
         const char* dylibPath  = (char*)this + dylibs[i].pathFileOffset;
         uint64_t offset = dylibs[i].address - firstRegionAddress;
         if ( firstImageOffset == 0 )
             firstImageOffset = offset;
-        // skip over aliases
-        if ( dylibs[i].pathFileOffset < firstImageOffset)
+        // skip over aliases (a split cache's table has none, and all its paths are in the main file's header area)
+        if ( !dyld_cache_header_is_split(header) && (dylibs[i].pathFileOffset < firstImageOffset) )
             continue;
         handler(dylibPath, dylibs[i].modTime, dylibs[i].inode);
     }
@@ -394,7 +477,8 @@ const uint32_t DyldSharedCache::getLocalStringsSize() const
 
 const mach_header* DyldSharedCache::getIndexedImageEntry(uint32_t index, uint64_t& mTime, uint64_t& inode) const
 {
-    const dyld_cache_image_info*   dylibs   = (dyld_cache_image_info*)((char*)this + header.imagesOffset);
+    uint32_t imagesCount;
+    const dyld_cache_image_info*   dylibs   = cacheImageTable(header, this, imagesCount);
     const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
     mTime = dylibs[index].modTime;
     inode = dylibs[index].inode;
@@ -404,7 +488,8 @@ const mach_header* DyldSharedCache::getIndexedImageEntry(uint32_t index, uint64_
 
  const char* DyldSharedCache::getIndexedImagePath(uint32_t index) const
 {
-    auto dylibs = (const dyld_cache_image_info*)((char*)this + header.imagesOffset);
+    uint32_t imagesCount;
+    auto dylibs = cacheImageTable(header, this, imagesCount);
     return (char*)this + dylibs[index].pathFileOffset;
 }
 
@@ -514,6 +599,9 @@ void DyldSharedCache::getUUID(uuid_t uuid) const
 
 uint64_t DyldSharedCache::mappedSize() const
 {
+    // The main file lists only its own mappings, but the sub-cache files fill the rest of the region.
+    if ( dyld_cache_header_is_split(header) )
+        return header.sharedRegionSize;
     __block uint64_t startAddr = 0;
     __block uint64_t endAddr = 0;
     forEachRegion(^(const void* content, uint64_t vmAddr, uint64_t size,
@@ -532,8 +620,9 @@ bool DyldSharedCache::findMachHeaderImageIndex(const mach_header* mh, uint32_t& 
     const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
     uintptr_t slide = (uintptr_t)this - (uintptr_t)(mappings[0].address);
     uint64_t unslidMh = (uintptr_t)mh - slide;
-    const dyld_cache_image_info* dylibs = (dyld_cache_image_info*)((char*)this + header.imagesOffset);
-    for (uint32_t i=0; i < header.imagesCount; ++i) {
+    uint32_t imagesCount;
+    const dyld_cache_image_info* dylibs = cacheImageTable(header, this, imagesCount);
+    for (uint32_t i=0; i < imagesCount; ++i) {
         if ( dylibs[i].address == unslidMh ) {
             imageIndex = i;
             return true;
@@ -547,7 +636,7 @@ bool DyldSharedCache::hasImagePath(const char* dylibPath, uint32_t& imageIndex) 
     const dyld_cache_mapping_info* mappings = (dyld_cache_mapping_info*)((char*)this + header.mappingOffset);
     if ( mappings[0].fileOffset != 0 )
         return false;
-    if ( header.mappingOffset >= 0x118 ) {
+    if ( (header.mappingOffset >= 0x118) && !(dyld_cache_header_is_split(header) && (header.dylibsTrieSize == 0)) ) {
         uintptr_t      slide           = (uintptr_t)this - (uintptr_t)(mappings[0].address);
         const uint8_t* dylibTrieStart  = (uint8_t*)(this->header.dylibsTrieAddr + slide);
         const uint8_t* dylibTrieEnd    = dylibTrieStart + this->header.dylibsTrieSize;
@@ -560,10 +649,11 @@ bool DyldSharedCache::hasImagePath(const char* dylibPath, uint32_t& imageIndex) 
         }
     }
     else {
-        const dyld_cache_image_info* dylibs = (dyld_cache_image_info*)((char*)this + header.imagesOffset);
+        uint32_t imagesCount;
+        const dyld_cache_image_info* dylibs = cacheImageTable(header, this, imagesCount);
         uint64_t firstImageOffset = 0;
         uint64_t firstRegionAddress = mappings[0].address;
-        for (uint32_t i=0; i < header.imagesCount; ++i) {
+        for (uint32_t i=0; i < imagesCount; ++i) {
             const char* aPath  = (char*)this + dylibs[i].pathFileOffset;
             if ( strcmp(aPath, dylibPath) == 0 ) {
                 imageIndex = i;
@@ -848,6 +938,517 @@ DyldSharedCache::DataConstScopedWriter::DataConstScopedWriter(const DyldSharedCa
     : writer(cache, machTask, logFunc) {
     writer.makeWriteable();
 }
+
+// ---- version 4 patch info of a split cache (reader) ----
+// A real cache has an 88 MB patch info that comes from a file, so nothing is read before its extent is checked.
+// The header and the array extents are checked on every use (nine comparisons), the slices of one exporter when
+// that exporter is used, and the whole table only by checkPatchInfoV4(), which is for tools and tests.
+namespace {
+
+struct PatchMapping {
+    uint64_t    address;
+    uint64_t    size;
+    uint64_t    flags;
+    uint32_t    initProt;
+    bool        hasSlideInfo;
+};
+
+struct PatchMappings {
+    PatchMapping    all[(kMaxSplitSubCaches + 1) * kMaxSplitFileMappings];
+    uint32_t        count = 0;
+};
+
+struct PatchTablesV4 {
+    dyld_cache_patch_info_v4                    info;
+    const dyld_cache_image_patches_v4*          patches;
+    const dyld_cache_patchable_export_v4*       exports;
+    const dyld_cache_patch_client_v4*           clients;
+    const dyld_cache_patch_client_export_v4*    clientExports;
+    const dyld_cache_patchable_location_v4*     locations;
+    const dyld_cache_image_got_clients_v4*      gotClients;
+    const dyld_cache_got_client_export_v4*      gotExports;
+    const dyld_cache_patchable_got_location_v4* gotLocations;
+    const char*                                 names;
+    const dyld_cache_image_info*                images;
+    uint32_t                                    imageCount;
+    uint64_t                                    unslidBase;     // the cache offsets of the GOT table are relative to this
+    uint64_t                                    slide;
+};
+
+// Where the slices of one image start, so that the slices of successive images can be checked to tile their arrays.
+// UINT64_MAX means "adopt the first slice's start" (a lazily checked exporter has no predecessor to compare with).
+struct PatchCursors {
+    uint64_t    clients, exports, clientExports, locations, gotExports, gotLocations;
+    explicit PatchCursors(uint64_t start) : clients(start), exports(start), clientExports(start), locations(start), gotExports(start), gotLocations(start) {}
+};
+
+}
+
+static const char* const kPatchErrNotMapped      = "patch info lies outside the cache mappings";
+static const char* const kPatchErrVersion        = "patch info is not version 4 with patch location version 0";
+static const char* const kPatchErrBounds[9]      = {
+    "patch info patchTable array lies outside the patch info", "patch info imageExports array lies outside the patch info",
+    "patch info clients array lies outside the patch info", "patch info clientExports array lies outside the patch info",
+    "patch info locations array lies outside the patch info", "patch info exportNames lies outside the patch info",
+    "patch info gotClients array lies outside the patch info", "patch info gotClientExports array lies outside the patch info",
+    "patch info gotLocations array lies outside the patch info" };
+static const char* const kPatchErrOverlap        = "patch info arrays overlap";
+static const char* const kPatchErrAlign          = "patch info array is not 4-byte aligned";
+static const char* const kPatchErrTableCount     = "patch info per-image tables do not match the image count";
+static const char* const kPatchErrImage          = "patch info image index lies outside the cache";
+static const char* const kPatchErrClientsTile    = "patch info client slices do not tile the clients array";
+static const char* const kPatchErrExportsTile    = "patch info export slices do not tile the exports array";
+static const char* const kPatchErrClientImage    = "patch info client names an image outside the cache";
+static const char* const kPatchErrCExportsTile   = "patch info client export slices do not tile the clientExports array";
+static const char* const kPatchErrExportIndex    = "patch info client export lies outside its exporter's exports";
+static const char* const kPatchErrLocationsTile  = "patch info location slices do not tile the locations array";
+static const char* const kPatchErrExportName     = "patch info export name lies outside the names or is not terminated";
+static const char* const kPatchErrLocation       = "patch info location lies outside the mappings that carry slide info";
+static const char* const kPatchErrGotTile        = "patch info GOT client slices do not tile the gotClientExports array";
+static const char* const kPatchErrGotExportIndex = "patch info GOT export lies outside its exporter's exports";
+static const char* const kPatchErrGotLocsTile    = "patch info GOT location slices do not tile the gotLocations array";
+static const char* const kPatchErrGotLocation    = "patch info GOT location lies outside the mappings that carry slide info";
+static const char* const kPatchErrGotReserved    = "patch info GOT location has a nonzero reserved word";
+
+static bool patchMappings(const DyldSharedCache* cache, PatchMappings* maps)
+{
+    const dyld_cache_mapping_and_slide_info* tables[kMaxSplitSubCaches + 1];
+    uint32_t counts[kMaxSplitSubCaches + 1];
+    uint32_t files;
+    if ( !splitCacheTables(cache, tables, counts, &files) )
+        return false;
+    maps->count = 0;
+    for (uint32_t f = 0; f != files; ++f) {
+        for (uint32_t i = 0; i != counts[f]; ++i) {
+            const dyld_cache_mapping_and_slide_info& m = tables[f][i];
+            maps->all[maps->count++] = { m.address, m.size, m.flags, m.initProt, m.slideInfoFileSize != 0 };
+        }
+    }
+    return true;
+}
+
+// [address, address + size) lies inside one mapping; with needSlideInfo, inside one that carries slide info
+static const PatchMapping* patchMappingContaining(const PatchMappings& maps, uint64_t address, uint64_t size, bool needSlideInfo)
+{
+    for (uint32_t i = 0; i != maps.count; ++i) {
+        if ( (!needSlideInfo || maps.all[i].hasSlideInfo) && dyld_cache_range_contains(maps.all[i].address, maps.all[i].size, address, size) )
+            return &maps.all[i];
+    }
+    return nullptr;
+}
+
+static bool patchSliceInside(uint64_t start, uint64_t count, uint64_t total)
+{
+    return start <= total && count <= total - start;
+}
+
+// The next slice has to begin where the previous one ended, and has to lie inside its array.
+static bool patchTile(uint64_t* cursor, uint64_t start, uint64_t count, uint64_t total)
+{
+    if ( *cursor == UINT64_MAX )
+        *cursor = start;
+    if ( (start != *cursor) || !patchSliceInside(start, count, total) )
+        return false;
+    *cursor = start + count;
+    return true;
+}
+
+static bool patchNameOk(const PatchTablesV4& t, uint32_t nameKind)
+{
+    const uint64_t offset = nameKind & 0x0fffffffu;
+    return offset < t.info.exportNamesSize && memchr(t.names + offset, 0, t.info.exportNamesSize - offset) != nullptr;
+}
+
+static const char* openPatchTablesV4(const DyldSharedCache* cache, const PatchMappings& maps, PatchTablesV4* t)
+{
+    const dyld_cache_header& h = cache->header;
+    if ( !cache->isSplitCache() || (h.patchInfoAddr == 0) || (h.patchInfoSize < sizeof(dyld_cache_patch_info_v4))
+      || (patchMappingContaining(maps, h.patchInfoAddr, h.patchInfoSize, false) == nullptr) )
+        return kPatchErrNotMapped;
+    t->unslidBase = cache->unslidLoadAddress();
+    t->slide = (uint64_t)(uintptr_t)cache - t->unslidBase;
+    memcpy(&t->info, (const void*)(uintptr_t)(h.patchInfoAddr + t->slide), sizeof(t->info));
+    const dyld_cache_patch_info_v4& info = t->info;
+    if ( (info.patchTableVersion != 4) || (info.patchLocationVersion != 0) )
+        return kPatchErrVersion;
+
+    struct Array { uint64_t address, count, stride; };
+    const Array arrays[9] = {
+        { info.patchTableArrayAddr, info.patchTableArrayCount, sizeof(dyld_cache_image_patches_v4) },
+        { info.imageExportsArrayAddr, info.imageExportsArrayCount, sizeof(dyld_cache_patchable_export_v4) },
+        { info.clientsArrayAddr, info.clientsArrayCount, sizeof(dyld_cache_patch_client_v4) },
+        { info.clientExportsArrayAddr, info.clientExportsArrayCount, sizeof(dyld_cache_patch_client_export_v4) },
+        { info.locationArrayAddr, info.locationArrayCount, sizeof(dyld_cache_patchable_location_v4) },
+        { info.exportNamesAddr, info.exportNamesSize, 1 },
+        { info.gotClientsArrayAddr, info.gotClientsArrayCount, sizeof(dyld_cache_image_got_clients_v4) },
+        { info.gotClientExportsArrayAddr, info.gotClientExportsArrayCount, sizeof(dyld_cache_got_client_export_v4) },
+        { info.gotLocationArrayAddr, info.gotLocationArrayCount, sizeof(dyld_cache_patchable_got_location_v4) },
+    };
+    uint64_t lengths[9];
+    for (unsigned i = 0; i != 9; ++i) {
+        if ( arrays[i].count > UINT64_MAX / arrays[i].stride )
+            return kPatchErrBounds[i];
+        lengths[i] = arrays[i].count * arrays[i].stride;
+        // arrays follow the header inside the patch info
+        if ( !dyld_cache_range_contains(h.patchInfoAddr + sizeof(info), h.patchInfoSize - sizeof(info), arrays[i].address, lengths[i]) )
+            return kPatchErrBounds[i];
+        if ( arrays[i].address % 4 != 0 )
+            return kPatchErrAlign;
+    }
+    for (unsigned i = 0; i != 9; ++i) {
+        for (unsigned j = i + 1; j != 9; ++j) {
+            if ( (lengths[i] != 0) && (lengths[j] != 0)
+              && (arrays[i].address < arrays[j].address + lengths[j]) && (arrays[j].address < arrays[i].address + lengths[i]) )
+                return kPatchErrOverlap;
+        }
+    }
+    const uint64_t slide = t->slide;
+    t->patches       = (const dyld_cache_image_patches_v4*)(uintptr_t)(info.patchTableArrayAddr + slide);
+    t->exports       = (const dyld_cache_patchable_export_v4*)(uintptr_t)(info.imageExportsArrayAddr + slide);
+    t->clients       = (const dyld_cache_patch_client_v4*)(uintptr_t)(info.clientsArrayAddr + slide);
+    t->clientExports = (const dyld_cache_patch_client_export_v4*)(uintptr_t)(info.clientExportsArrayAddr + slide);
+    t->locations     = (const dyld_cache_patchable_location_v4*)(uintptr_t)(info.locationArrayAddr + slide);
+    t->names         = (const char*)(uintptr_t)(info.exportNamesAddr + slide);
+    t->gotClients    = (const dyld_cache_image_got_clients_v4*)(uintptr_t)(info.gotClientsArrayAddr + slide);
+    t->gotExports    = (const dyld_cache_got_client_export_v4*)(uintptr_t)(info.gotClientExportsArrayAddr + slide);
+    t->gotLocations  = (const dyld_cache_patchable_got_location_v4*)(uintptr_t)(info.gotLocationArrayAddr + slide);
+    t->images        = cache->imageTable(t->imageCount);
+    if ( (info.patchTableArrayCount != t->imageCount) || (info.gotClientsArrayCount != t->imageCount) )
+        return kPatchErrTableCount;
+    return nullptr;
+}
+
+// One exporter's slices. The GOT part and the exports are always checked; the plain (client) part only when asked,
+// because libobjc alone has 765,442 plain locations. With cursors that start at UINT64_MAX the slices are only
+// checked to be contiguous among themselves; the whole-table pass starts them at 0 and so checks the tiling too.
+static const char* checkPatchExporterV4(const PatchTablesV4& t, const PatchMappings& maps, uint32_t image, bool includePlain,
+                                        PatchCursors* c)
+{
+    if ( image >= t.imageCount )
+        return kPatchErrImage;
+    const dyld_cache_image_patches_v4& p = t.patches[image];
+    if ( !patchTile(&c->exports, p.exportsStartIndex, p.exportsCount, t.info.imageExportsArrayCount) )
+        return kPatchErrExportsTile;
+    if ( !patchTile(&c->clients, p.clientsStartIndex, p.clientsCount, t.info.clientsArrayCount) )
+        return kPatchErrClientsTile;
+    for (uint64_t i = p.exportsStartIndex; i != (uint64_t)p.exportsStartIndex + p.exportsCount; ++i) {
+        if ( !patchNameOk(t, t.exports[i].nameKind) )
+            return kPatchErrExportName;
+    }
+    if ( includePlain ) {
+        for (uint64_t i = p.clientsStartIndex; i != (uint64_t)p.clientsStartIndex + p.clientsCount; ++i) {
+            const dyld_cache_patch_client_v4& client = t.clients[i];
+            if ( client.clientDylibIndex >= t.imageCount )
+                return kPatchErrClientImage;
+            if ( !patchTile(&c->clientExports, client.exportsStartIndex, client.exportsCount, t.info.clientExportsArrayCount) )
+                return kPatchErrCExportsTile;
+            for (uint64_t j = client.exportsStartIndex; j != (uint64_t)client.exportsStartIndex + client.exportsCount; ++j) {
+                const dyld_cache_patch_client_export_v4& e = t.clientExports[j];
+                if ( (e.imageExportIndex < p.exportsStartIndex) || (e.imageExportIndex - p.exportsStartIndex >= p.exportsCount) )
+                    return kPatchErrExportIndex;
+                if ( !patchTile(&c->locations, e.locationsStartIndex, e.locationsCount, t.info.locationArrayCount) )
+                    return kPatchErrLocationsTile;
+                const uint64_t imageAddress = t.images[client.clientDylibIndex].address;
+                for (uint64_t k = e.locationsStartIndex; k != (uint64_t)e.locationsStartIndex + e.locationsCount; ++k) {
+                    const uint32_t offset = t.locations[k].dylibOffsetOfUse;
+                    if ( (offset > UINT64_MAX - imageAddress) || (patchMappingContaining(maps, imageAddress + offset, sizeof(uint64_t), true) == nullptr) )
+                        return kPatchErrLocation;
+                }
+            }
+        }
+    }
+    const dyld_cache_image_got_clients_v4& g = t.gotClients[image];
+    if ( !patchTile(&c->gotExports, g.exportsStartIndex, g.exportsCount, t.info.gotClientExportsArrayCount) )
+        return kPatchErrGotTile;
+    for (uint64_t i = g.exportsStartIndex; i != (uint64_t)g.exportsStartIndex + g.exportsCount; ++i) {
+        const dyld_cache_got_client_export_v4& e = t.gotExports[i];
+        if ( (e.imageExportIndex < p.exportsStartIndex) || (e.imageExportIndex - p.exportsStartIndex >= p.exportsCount) )
+            return kPatchErrGotExportIndex;
+        if ( !patchTile(&c->gotLocations, e.locationsStartIndex, e.locationsCount, t.info.gotLocationArrayCount) )
+            return kPatchErrGotLocsTile;
+        for (uint64_t k = e.locationsStartIndex; k != (uint64_t)e.locationsStartIndex + e.locationsCount; ++k) {
+            const dyld_cache_patchable_got_location_v4& l = t.gotLocations[k];
+            const uint64_t offset = ((uint64_t)l.cacheOffsetHi << 32) | l.cacheOffsetLo;
+            if ( (offset > UINT64_MAX - t.unslidBase) || (patchMappingContaining(maps, t.unslidBase + offset, sizeof(uint64_t), true) == nullptr) )
+                return kPatchErrGotLocation;
+            if ( l.reserved != 0 )
+                return kPatchErrGotReserved;
+        }
+    }
+    return nullptr;
+}
+
+bool DyldSharedCache::hasPatchInfoV4() const
+{
+    if ( !isSplitCache() || (header.patchInfoAddr == 0) || (header.patchInfoSize < sizeof(dyld_cache_patch_info_v4)) )
+        return false;
+    PatchMappings maps;
+    if ( !patchMappings(this, &maps) || (patchMappingContaining(maps, header.patchInfoAddr, header.patchInfoSize, false) == nullptr) )
+        return false;
+    uint32_t version;
+    memcpy(&version, (const void*)(uintptr_t)(header.patchInfoAddr + ((uint64_t)(uintptr_t)this - unslidLoadAddress())), sizeof(version));
+    return version == 4;
+}
+
+#if !BUILDING_DYLD
+// Checks and enumeration for tools and tests: dyld itself only needs hasPatchInfoV4() and the override.
+const char* DyldSharedCache::checkPatchInfoV4Headers() const
+{
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    return openPatchTablesV4(this, maps, &t);
+}
+
+const char* DyldSharedCache::checkPatchInfoV4Exporter(uint32_t imageIndex) const
+{
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    if ( const char* error = openPatchTablesV4(this, maps, &t) )
+        return error;
+    PatchCursors cursors(UINT64_MAX);
+    return checkPatchExporterV4(t, maps, imageIndex, false, &cursors);
+}
+
+const char* DyldSharedCache::checkPatchInfoV4(PatchInfoV4Counts* counts) const
+{
+    memset(counts, 0, sizeof(*counts));
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    if ( const char* error = openPatchTablesV4(this, maps, &t) )
+        return error;
+    PatchCursors cursors(0);
+    for (uint32_t i = 0; i != t.imageCount; ++i) {
+        if ( const char* error = checkPatchExporterV4(t, maps, i, true, &cursors) )
+            return error;
+    }
+    const dyld_cache_patch_info_v4& info = t.info;
+    if ( cursors.exports != info.imageExportsArrayCount )
+        return kPatchErrExportsTile;
+    if ( cursors.clients != info.clientsArrayCount )
+        return kPatchErrClientsTile;
+    if ( cursors.clientExports != info.clientExportsArrayCount )
+        return kPatchErrCExportsTile;
+    if ( cursors.locations != info.locationArrayCount )
+        return kPatchErrLocationsTile;
+    if ( cursors.gotExports != info.gotClientExportsArrayCount )
+        return kPatchErrGotTile;
+    if ( cursors.gotLocations != info.gotLocationArrayCount )
+        return kPatchErrGotLocsTile;
+    counts->images = t.imageCount;
+    counts->exports = info.imageExportsArrayCount;
+    counts->clients = info.clientsArrayCount;
+    counts->plainLocations = info.locationArrayCount;
+    counts->gotExports = info.gotClientExportsArrayCount;
+    counts->gotLocations = info.gotLocationArrayCount;
+    return nullptr;
+}
+
+#endif
+
+static DyldSharedCache::PatchLocationV4 patchLocation(const PatchTablesV4& t, uint32_t exportIndex, uint64_t slotUnslid, uint32_t flags)
+{
+    DyldSharedCache::PatchLocationV4 loc;
+    loc.symbol      = t.names + (t.exports[exportIndex].nameKind & 0x0fffffffu);
+    loc.exportIndex = exportIndex;
+    loc.kind        = t.exports[exportIndex].nameKind >> 28;
+    loc.implOffset  = t.exports[exportIndex].dylibOffsetOfImpl;
+    loc.slot        = (uint64_t*)(uintptr_t)(slotUnslid + t.slide);
+    loc.flags       = flags;
+    loc.explained   = decodeCachePatchFlagsV4(flags, &loc.encoding);
+    return loc;
+}
+
+#if !BUILDING_DYLD
+// Checks and enumeration for tools and tests: dyld itself only needs hasPatchInfoV4() and the override.
+const char* DyldSharedCache::forEachPatchGotLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location)) const
+{
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    if ( const char* error = openPatchTablesV4(this, maps, &t) )
+        return error;
+    PatchCursors cursors(UINT64_MAX);
+    if ( const char* error = checkPatchExporterV4(t, maps, imageIndex, false, &cursors) )
+        return error;
+    const dyld_cache_image_got_clients_v4& g = t.gotClients[imageIndex];
+    for (uint64_t i = g.exportsStartIndex; i != (uint64_t)g.exportsStartIndex + g.exportsCount; ++i) {
+        const dyld_cache_got_client_export_v4& e = t.gotExports[i];
+        for (uint64_t k = e.locationsStartIndex; k != (uint64_t)e.locationsStartIndex + e.locationsCount; ++k) {
+            const dyld_cache_patchable_got_location_v4& l = t.gotLocations[k];
+            handler(patchLocation(t, e.imageExportIndex, t.unslidBase + (((uint64_t)l.cacheOffsetHi << 32) | l.cacheOffsetLo), l.flags));
+        }
+    }
+    return nullptr;
+}
+
+const char* DyldSharedCache::forEachPatchPlainLocation(uint32_t imageIndex,
+                                                       void (^handler)(const PatchLocationV4& location, uint32_t clientIndex)) const
+{
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    if ( const char* error = openPatchTablesV4(this, maps, &t) )
+        return error;
+    // the plain part is only checked for this exporter, which for libobjc is most of the table
+    PatchCursors cursors(UINT64_MAX);
+    if ( const char* error = checkPatchExporterV4(t, maps, imageIndex, true, &cursors) )
+        return error;
+    const dyld_cache_image_patches_v4& p = t.patches[imageIndex];
+    for (uint64_t i = p.clientsStartIndex; i != (uint64_t)p.clientsStartIndex + p.clientsCount; ++i) {
+        const dyld_cache_patch_client_v4& client = t.clients[i];
+        for (uint64_t j = client.exportsStartIndex; j != (uint64_t)client.exportsStartIndex + client.exportsCount; ++j) {
+            const dyld_cache_patch_client_export_v4& e = t.clientExports[j];
+            for (uint64_t k = e.locationsStartIndex; k != (uint64_t)e.locationsStartIndex + e.locationsCount; ++k) {
+                handler(patchLocation(t, e.imageExportIndex, t.images[client.clientDylibIndex].address + t.locations[k].dylibOffsetOfUse,
+                                      t.locations[k].flags), client.clientDylibIndex);
+            }
+        }
+    }
+    return nullptr;
+}
+
+#endif
+
+// ---- override of the coalesced GOT slots of an exporter that the process provides itself ----
+static const char* const kPatchErrSign     = "patch override: the address of an exported symbol does not fit a pointer of the slot's kind";
+static const char* const kPatchErrSlot     = "patch override: a GOT slot is misaligned or lies in a mapping that cannot be made writable";
+static const char* const kPatchErrProtect  = "patch override: could not make a DATA_CONST mapping writable";
+static const char* const kPatchErrRestore  = "patch override: could not make a DATA_CONST mapping read-only again";
+
+namespace {
+// Makes the read-only DATA_CONST mappings that a slot is written into writable, each on its first write, and puts them
+// back with restore() (the destructor does it too, for the early exits). A mapping that is already writable is never
+// touched, so it cannot come back read-only; mappings without a write are never touched either.
+struct PatchWriter {
+    const PatchMappings&                maps;
+    uint64_t                            slide;
+    DyldSharedCache::DataConstLogFunc   logFunc;
+    bool                                writable[(kMaxSplitSubCaches + 1) * kMaxSplitFileMappings] = {};
+
+    PatchWriter(const PatchMappings& m, uint64_t s, DyldSharedCache::DataConstLogFunc log) : maps(m), slide(s), logFunc(log) { }
+    ~PatchWriter() { restore(); }
+    // false when a mapping could not be made read-only again
+    bool restore() {
+        bool ok = true;
+        for (uint32_t i = 0; i != maps.count; ++i) {
+            if ( !writable[i] )
+                continue;
+            writable[i] = false;
+            if ( vm_protect(mach_task_self(), (vm_address_t)(maps.all[i].address + slide), (vm_size_t)maps.all[i].size, false, VM_PROT_READ) != KERN_SUCCESS ) {
+                ok = false;
+                if ( logFunc != nullptr )
+                    logFunc("dyld: failed to make the shared cache GOT read-only again\n");
+            }
+        }
+        return ok;
+    }
+    // A mapping that is not DATA_CONST, is writable already, or that this process keeps writable (gEnableSharedCacheDataConst is false), needs nothing.
+    bool prepare(const PatchMapping* m) {
+        const uint32_t index = (uint32_t)(m - maps.all);
+        if ( writable[index] || ((m->flags & DYLD_CACHE_MAPPING_CONST_DATA) == 0) || ((m->initProt & VM_PROT_WRITE) != 0) || !gEnableSharedCacheDataConst )
+            return true;
+        if ( vm_protect(mach_task_self(), (vm_address_t)(m->address + slide), (vm_size_t)m->size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS )
+            return false;
+        writable[index] = true;
+        return true;
+    }
+};
+}
+
+// This file is also built into libdyld, which has no C++ library: a bitmap of the exporters done, for the one cache of the process.
+static const uint32_t kMaxPatchableImages = 8192;
+static uint64_t sPatchedExporters[kMaxPatchableImages / 64];
+static const DyldSharedCache* sPatchedCache;
+
+const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, uint64_t* address),
+                                                    DataConstLogFunc logFunc, PatchOverrideStats* stats) const
+{
+    memset(stats, 0, sizeof(*stats));
+    if ( imageIndex >= kMaxPatchableImages )
+        return kPatchErrImage;
+    if ( sPatchedCache != this ) {
+        memset(sPatchedExporters, 0, sizeof(sPatchedExporters));
+        sPatchedCache = this;
+    }
+    if ( (sPatchedExporters[imageIndex / 64] & (1ULL << (imageIndex % 64))) != 0 ) {
+        stats->alreadyApplied = true;
+        return nullptr;
+    }
+    PatchMappings maps;
+    PatchTablesV4 t;
+    if ( !patchMappings(this, &maps) )
+        return kPatchErrNotMapped;
+    if ( const char* error = openPatchTablesV4(this, maps, &t) )
+        return error;
+    PatchCursors cursors(UINT64_MAX);
+    if ( const char* error = checkPatchExporterV4(t, maps, imageIndex, false, &cursors) )
+        return error;
+
+    PatchWriter writer(maps, t.slide, logFunc);
+    const dyld_cache_image_got_clients_v4& g = t.gotClients[imageIndex];
+    for (uint64_t i = g.exportsStartIndex; i != (uint64_t)g.exportsStartIndex + g.exportsCount; ++i) {
+        const dyld_cache_got_client_export_v4& e = t.gotExports[i];
+        const char* symbol = t.names + (t.exports[e.imageExportIndex].nameKind & 0x0fffffffu);
+        uint64_t address = 0;
+        ++stats->exports;
+        stats->slots += e.locationsCount;
+        // the kind bits of the name word are not understood (the cache's other images treat some exports specially): leave those alone
+        if ( (t.exports[e.imageExportIndex].nameKind >> 28) != 0 ) {
+            stats->unexplained += e.locationsCount;
+            if ( logFunc != nullptr )
+                logFunc("dyld: GOT slots of '%s' have an export kind that is not understood, left as the cache's pointers\n", symbol);
+            continue;
+        }
+        if ( !resolve(symbol, &address) ) {
+            ++stats->missingExports;
+            stats->missingSlots += e.locationsCount;
+            continue;
+        }
+        for (uint64_t k = e.locationsStartIndex; k != (uint64_t)e.locationsStartIndex + e.locationsCount; ++k) {
+            const dyld_cache_patchable_got_location_v4& l = t.gotLocations[k];
+            const uint64_t slotUnslid = t.unslidBase + (((uint64_t)l.cacheOffsetHi << 32) | l.cacheOffsetLo);
+            const PatchLocationV4 loc = patchLocation(t, e.imageExportIndex, slotUnslid, l.flags);
+            if ( !loc.explained ) {
+                ++stats->unexplained;
+                if ( logFunc != nullptr )
+                    logFunc("dyld: GOT slot of '%s' has an encoding that cannot be explained (flags 0x%x), left as the cache's pointer\n", symbol, l.flags);
+                continue;
+            }
+            // the signer only has the 48-bit pointer field of an authenticated pointer, and an unauthenticated one keeps its top byte for high7
+            if ( (address >> (loc.encoding.authenticated ? 48 : 56)) != 0 )
+                return kPatchErrSign;
+            const uint64_t target = address + loc.encoding.addend;
+            const PatchMapping* mapping = patchMappingContaining(maps, slotUnslid, sizeof(uint64_t), true);
+            if ( (slotUnslid % sizeof(uint64_t) != 0) || (mapping == nullptr)
+              || (((mapping->flags & DYLD_CACHE_MAPPING_CONST_DATA) == 0) && ((mapping->initProt & VM_PROT_WRITE) == 0)) )
+                return kPatchErrSlot;
+            if ( !writer.prepare(mapping) )
+                return kPatchErrProtect;
+            if ( loc.encoding.authenticated ) {
+                // signPointer() numbers the keys IA, IB, DA, DB
+                *loc.slot = dyld3::MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(target, loc.slot, loc.encoding.usesAddressDiversity,
+                                loc.encoding.discriminator, loc.encoding.keyIsData ? 2 : 0);
+            }
+            else {
+                *loc.slot = target | ((uint64_t)loc.encoding.high7 << 57);
+            }
+            ++stats->patched;
+        }
+    }
+    if ( !writer.restore() )
+        return kPatchErrRestore;
+    sPatchedExporters[imageIndex / 64] |= 1ULL << (imageIndex % 64);
+    return nullptr;
+}
+// ---- end of the patch info reader and override ----
 #endif
 
 #if !(BUILDING_LIBDYLD || BUILDING_DYLD)
@@ -986,6 +1587,10 @@ const uint8_t* DyldSharedCache::legacyCacheDataRegionBuffer() const
 
 #if !BUILDING_LIBDSC
 const objc_opt::objc_opt_t* DyldSharedCache::objcOpt() const {
+    // A split cache has no dyld3 image array to find libobjc through, and libdyld asks every mapped cache.
+    if ( isSplitCache() )
+        return nullptr;
+
     // Find the objc image
     const dyld3::MachOAnalyzer* objcMA = nullptr;
 
@@ -1058,6 +1663,9 @@ const void* DyldSharedCache::objcOptPtrs() const {
 #endif
 
 std::pair<const void*, uint64_t> DyldSharedCache::getObjCConstantRange() const {
+    if ( isSplitCache() )
+        return { nullptr, 0 };
+
     const dyld3::MachOAnalyzer* libDyldMA = nullptr;
     uint32_t imageIndex;
     if ( hasImagePath("/usr/lib/system/libdyld.dylib", imageIndex) ) {

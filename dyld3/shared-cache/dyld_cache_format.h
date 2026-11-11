@@ -79,7 +79,73 @@ struct dyld_cache_header
     uint64_t    otherTrieSize;          // size of trie of dylibs and bundles with dlopen closures
     uint32_t    mappingWithSlideOffset; // file offset to first dyld_cache_mapping_and_slide_info
     uint32_t    mappingWithSlideCount;  // number of dyld_cache_mapping_and_slide_info entries
+    // Split-cache generation (main file plus sub-cache files). Only the offsets asserted below the
+    // struct were verified against a real cache; the other names follow Apple's published layout.
+    uint64_t    dylibsPBLStateArrayAddrUnused;
+    uint64_t    dylibsPBLSetAddr;
+    uint64_t    programsPBLSetPoolAddr;
+    uint64_t    programsPBLSetPoolSize;
+    uint64_t    programTrieAddr;
+    uint32_t    programTrieSize;
+    uint32_t    osVersion;
+    uint32_t    altPlatform;
+    uint32_t    altOsVersion;
+    uint64_t    swiftOptsOffset;
+    uint64_t    swiftOptsSize;
+    uint32_t    subCacheArrayOffset;    // file offset to first dyld_subcache_entry (main file only)
+    uint32_t    subCacheArrayCount;     // number of dyld_subcache_entry entries
+    uint8_t     symbolFileUUID[16];
+    uint64_t    rosettaReadOnlyAddr;
+    uint64_t    rosettaReadOnlySize;
+    uint64_t    rosettaReadWriteAddr;
+    uint64_t    rosettaReadWriteSize;
+    uint32_t    imagesOffsetSplit;      // split caches: file offset (in the main file) of the dyld_cache_image_info table;
+    uint32_t    imagesCountSplit;       // imagesOffset/imagesCount above are then zero
+    uint32_t    cacheSubType;
+    uint32_t    padding2;
+    uint64_t    objcOptsOffset;
+    uint64_t    objcOptsSize;
+    uint64_t    cacheAtlasOffset;
+    uint64_t    cacheAtlasSize;
+    uint64_t    dynamicDataOffset;
+    uint64_t    dynamicDataMaxSize;
+    uint32_t    tproMappingsOffset;
+    uint32_t    tproMappingsCount;
+    uint64_t    functionVariantInfoAddr;
+    uint64_t    functionVariantInfoSize;
+    uint64_t    prewarmingDataOffset;
+    uint64_t    prewarmingDataSize;
 };
+
+#ifdef __cplusplus
+#include <stddef.h>
+static_assert(offsetof(dyld_cache_header, uuid) == 0x58, "dyld_cache_header::uuid");
+static_assert(offsetof(dyld_cache_header, patchInfoAddr) == 0x98, "dyld_cache_header::patchInfoAddr");
+static_assert(offsetof(dyld_cache_header, sharedRegionStart) == 0xe0, "dyld_cache_header::sharedRegionStart");
+static_assert(offsetof(dyld_cache_header, sharedRegionSize) == 0xe8, "dyld_cache_header::sharedRegionSize");
+static_assert(offsetof(dyld_cache_header, mappingWithSlideOffset) == 0x138, "dyld_cache_header::mappingWithSlideOffset");
+static_assert(offsetof(dyld_cache_header, mappingWithSlideCount) == 0x13c, "dyld_cache_header::mappingWithSlideCount");
+static_assert(offsetof(dyld_cache_header, subCacheArrayOffset) == 0x188, "dyld_cache_header::subCacheArrayOffset");
+static_assert(offsetof(dyld_cache_header, subCacheArrayCount) == 0x18c, "dyld_cache_header::subCacheArrayCount");
+static_assert(offsetof(dyld_cache_header, imagesOffsetSplit) == 0x1c0, "dyld_cache_header::imagesOffsetSplit");
+static_assert(offsetof(dyld_cache_header, imagesCountSplit) == 0x1c4, "dyld_cache_header::imagesCountSplit");
+static_assert(sizeof(dyld_cache_header) == 0x228, "dyld_cache_header size");
+
+// [address, address + size) lies inside [start, start + length), without any of the sums wrapping.
+static inline bool dyld_cache_range_contains(uint64_t start, uint64_t length, uint64_t address, uint64_t size)
+{
+    return length <= UINT64_MAX - start && address >= start
+        && address - start <= length && size <= length - (address - start);
+}
+
+// The main file of a split cache: its header has the split fields and lists the images there (a legacy
+// header with a grown mappingOffset has zeros in them). Such a file holds anywhere from one mapping up.
+static inline bool dyld_cache_header_is_split(const dyld_cache_header& header)
+{
+    return header.mappingOffset >= offsetof(dyld_cache_header, imagesCountSplit) + sizeof(header.imagesCountSplit)
+        && header.imagesCountSplit != 0;
+}
+#endif
 
 // Uncomment this and check the build errors for the current mapping offset to check against when adding new fields.
 // template<size_t size> class A { int x[-size]; }; A<sizeof(dyld_cache_header)> a;
@@ -110,6 +176,28 @@ struct dyld_cache_mapping_and_slide_info {
     uint32_t    maxProt;
     uint32_t    initProt;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(dyld_cache_mapping_and_slide_info) == 56, "dyld_cache_mapping_and_slide_info size");
+static_assert(offsetof(dyld_cache_mapping_and_slide_info, slideInfoFileOffset) == 24, "slideInfoFileOffset");
+static_assert(offsetof(dyld_cache_mapping_and_slide_info, flags) == 40, "mapping flags");
+static_assert(offsetof(dyld_cache_mapping_and_slide_info, maxProt) == 48, "mapping maxProt");
+#endif
+
+// One entry per sub-cache file in the array at dyld_cache_header::subCacheArrayOffset.
+// The file name is the main file's name plus fileSuffix.
+struct dyld_subcache_entry
+{
+    uint8_t     uuid[16];               // must equal the uuid in the sub-cache file's own header
+    uint64_t    cacheVMOffset;          // vm address of the sub-cache's first mapping minus sharedRegionStart
+    char        fileSuffix[32];         // e.g. ".01", ".02.dylddata"
+};
+
+#ifdef __cplusplus
+static_assert(sizeof(dyld_subcache_entry) == 56, "dyld_subcache_entry size");
+static_assert(offsetof(dyld_subcache_entry, cacheVMOffset) == 16, "cacheVMOffset");
+static_assert(offsetof(dyld_subcache_entry, fileSuffix) == 24, "fileSuffix");
+#endif
 
 struct dyld_cache_image_info
 {
@@ -447,7 +535,49 @@ struct dyld_cache_slide_info4
 #define DYLD_CACHE_SLIDE4_PAGE_EXTRA_END           0x8000  // last chain entry for page
 
 
+// The version 5 of the slide info is used by split caches (arm64e, macOS 13 and later). Each mapping that
+// needs rebasing has one table. A page's chain starts at page_starts[page] (a byte offset into the page,
+// 8-byte aligned) and each entry's "next" field is the distance to the following entry in 8-byte units
+// (0 ends the chain). The slide is zero for a private mapping at the preferred address, so a plain entry
+// becomes (value_add + runtimeOffset) | (high8 << 56). An authenticated entry has the same target and
+// additionally carries the key, address-diversity bit and 16-bit diversity to sign it with.
+struct dyld_cache_slide_info5
+{
+    uint32_t    version;            // currently 5
+    uint32_t    page_size;          // currently 16384
+    uint32_t    page_starts_count;
+    uint64_t    value_add;
+    uint16_t    page_starts[/* page_starts_count */];
+};
 
+#define DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE    0xFFFF    // page has no rebasing
+
+union dyld_cache_slide_pointer5
+{
+    uint64_t  raw;
+    struct {
+        uint64_t    runtimeOffset : 34,   // offset from the shared region start
+                    high8         :  8,   // top byte of the final pointer
+                    unused        : 10,
+                    next          : 11,   // 8-byte strides to the next entry
+                    auth          :  1;   // = 0
+    }         regular;
+
+    struct {
+        uint64_t    runtimeOffset : 34,
+                    diversity     : 16,
+                    addrDiv       :  1,
+                    keyIsData     :  1,   // 0 = IA, 1 = DA
+                    next          : 11,
+                    auth          :  1;   // = 1
+    }         auth;
+};
+
+#ifdef __cplusplus
+static_assert(offsetof(dyld_cache_slide_info5, value_add) == 16, "slide info 5 value_add");
+static_assert(offsetof(dyld_cache_slide_info5, page_starts) == 24, "slide info 5 page_starts");
+static_assert(sizeof(dyld_cache_slide_pointer5) == 8, "slide pointer 5 size");
+#endif
 
 struct dyld_cache_local_symbols_info
 {
@@ -502,6 +632,134 @@ struct dyld_cache_patchable_location
                 key                     : 2,
                 discriminator           : 16;
 };
+
+// Version 4 patch info of a split macOS cache (patchInfoAddr points at dyld_cache_patch_info_v4, whose first word
+// is the version; the version 1 struct above has no version word). The layout was derived from a real macOS 26
+// arm64e cache, not from an Apple header, so every reader must validate it (DyldSharedCache::checkPatchInfoV4*).
+// Tables are per EXPORTING image (the index of the cache's image table). The GOT tables describe the cache's
+// coalesced GOT: one slot per bound symbol shared by all images, listed under the exporter, naming no client.
+struct dyld_cache_patch_info_v4
+{
+    uint32_t    patchTableVersion;          // 4
+    uint32_t    patchLocationVersion;       // 0
+    uint64_t    patchTableArrayAddr;        // (unslid) dyld_cache_image_patches_v4 per image
+    uint64_t    patchTableArrayCount;
+    uint64_t    imageExportsArrayAddr;      // dyld_cache_patchable_export_v4
+    uint64_t    imageExportsArrayCount;
+    uint64_t    clientsArrayAddr;           // dyld_cache_patch_client_v4
+    uint64_t    clientsArrayCount;
+    uint64_t    clientExportsArrayAddr;     // dyld_cache_patch_client_export_v4
+    uint64_t    clientExportsArrayCount;
+    uint64_t    locationArrayAddr;          // dyld_cache_patchable_location_v4
+    uint64_t    locationArrayCount;
+    uint64_t    exportNamesAddr;            // NUL-terminated strings
+    uint64_t    exportNamesSize;
+    uint64_t    gotClientsArrayAddr;        // dyld_cache_image_got_clients_v4 per image
+    uint64_t    gotClientsArrayCount;
+    uint64_t    gotClientExportsArrayAddr;  // dyld_cache_got_client_export_v4
+    uint64_t    gotClientExportsArrayCount;
+    uint64_t    gotLocationArrayAddr;       // dyld_cache_patchable_got_location_v4
+    uint64_t    gotLocationArrayCount;
+};
+
+struct dyld_cache_image_patches_v4              // slices tile their arrays in image order
+{
+    uint32_t    clientsStartIndex;
+    uint32_t    clientsCount;
+    uint32_t    exportsStartIndex;
+    uint32_t    exportsCount;
+};
+
+struct dyld_cache_patchable_export_v4
+{
+    uint32_t    dylibOffsetOfImpl;          // from the exporting image's mach header
+    uint32_t    nameKind;                   // bits 0-27 offset into the names, bits 28-31 kind (not interpreted)
+};
+
+struct dyld_cache_patch_client_v4
+{
+    uint32_t    clientDylibIndex;
+    uint32_t    exportsStartIndex;          // slice of clientExports
+    uint32_t    exportsCount;
+};
+
+struct dyld_cache_patch_client_export_v4
+{
+    uint32_t    imageExportIndex;           // absolute index into imageExports, inside the exporter's slice
+    uint32_t    locationsStartIndex;        // slice of locations
+    uint32_t    locationsCount;
+};
+
+struct dyld_cache_patchable_location_v4
+{
+    uint32_t    dylibOffsetOfUse;           // from the CLIENT image's mach header
+    uint32_t    flags;                      // see decodeCachePatchFlagsV4
+};
+
+struct dyld_cache_image_got_clients_v4
+{
+    uint32_t    exportsStartIndex;          // slice of gotClientExports
+    uint32_t    exportsCount;
+};
+
+struct dyld_cache_got_client_export_v4
+{
+    uint32_t    imageExportIndex;
+    uint32_t    locationsStartIndex;        // slice of gotLocations
+    uint32_t    locationsCount;
+};
+
+struct dyld_cache_patchable_got_location_v4
+{
+    uint32_t    cacheOffsetLo;              // 64-bit offset of the slot from the cache base
+    uint32_t    cacheOffsetHi;
+    uint32_t    flags;
+    uint32_t    reserved;                   // always 0
+};
+
+#ifdef __cplusplus
+static_assert(sizeof(dyld_cache_patch_info_v4) == 152, "patch info v4 size");
+static_assert(sizeof(dyld_cache_image_patches_v4) == 16, "patch info v4 patchTable record");
+static_assert(sizeof(dyld_cache_patchable_export_v4) == 8, "patch info v4 export record");
+static_assert(sizeof(dyld_cache_patch_client_v4) == 12, "patch info v4 client record");
+static_assert(sizeof(dyld_cache_patch_client_export_v4) == 12, "patch info v4 clientExport record");
+static_assert(sizeof(dyld_cache_patchable_location_v4) == 8, "patch info v4 location record");
+static_assert(sizeof(dyld_cache_image_got_clients_v4) == 8, "patch info v4 gotClients record");
+static_assert(sizeof(dyld_cache_got_client_export_v4) == 12, "patch info v4 gotClientExport record");
+static_assert(sizeof(dyld_cache_patchable_got_location_v4) == 16, "patch info v4 gotLocation record");
+static_assert(offsetof(dyld_cache_patch_info_v4, exportNamesAddr) == 0x58, "patch info v4 exportNamesAddr");
+static_assert(offsetof(dyld_cache_patch_info_v4, gotLocationArrayCount) == 0x90, "patch info v4 gotLocationArrayCount");
+
+// The meaning of a patch location's flags word, the same for both location tables:
+//   bit 0 authenticated; bits 1-7 high7 (the top byte of an unauthenticated pointer is high7 << 1);
+//   bit 8 not understood (set on about 0.1% of locations, no effect on key, diversity, addend or target);
+//   bits 9-13 addend, bits 9-15 for an unauthenticated pointer; bit 14 address diversity; bit 15 key (1 = DA, 0 = IA);
+//   bits 16-31 discriminator. The slot holds exporter mach header + dylibOffsetOfImpl + addend.
+struct dyld_cache_patch_encoding_v4
+{
+    bool        authenticated;
+    bool        usesAddressDiversity;
+    bool        keyIsData;
+    bool        bit8;
+    uint8_t     high7;
+    uint8_t     addend;
+    uint16_t    discriminator;
+};
+
+// False when the word has a bit set that the layout above does not explain: an authenticated pointer with a
+// high7 (its top byte is the signature) or an unauthenticated pointer with a discriminator. Nobody may guess then.
+static inline bool decodeCachePatchFlagsV4(uint32_t flags, dyld_cache_patch_encoding_v4* out)
+{
+    out->authenticated        = (flags & 1) != 0;
+    out->high7                = (uint8_t)((flags >> 1) & 0x7f);
+    out->bit8                 = (flags & (1u << 8)) != 0;
+    out->addend               = (uint8_t)(out->authenticated ? (flags >> 9) & 0x1f : (flags >> 9) & 0x7f);
+    out->usesAddressDiversity = out->authenticated && ((flags >> 14) & 1);
+    out->keyIsData            = out->authenticated && ((flags >> 15) & 1);
+    out->discriminator        = (uint16_t)(out->authenticated ? flags >> 16 : 0);
+    return out->authenticated ? (out->high7 == 0) : ((flags >> 16) == 0);
+}
+#endif
 
 
 // This is the  location of the macOS shared cache on macOS 11.0 and later
