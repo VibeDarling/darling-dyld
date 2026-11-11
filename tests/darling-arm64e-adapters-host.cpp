@@ -654,18 +654,33 @@ static void checkSignalNumbers()
 }
 
 static Block gHeapResult;
+// Both target searches below succeed within a few hundred draws on a working PAC host. The bound makes
+// a host whose signatures never satisfy them fail its premise instead of hanging.
+static const unsigned kMaxTargetSearch = 4096;
+
 static void checkBlockCopy()
 {
 	Fn8 t = thunkFor("__Block_copy");
-	// an invoke that a signature made for modifier 0 cannot authenticate at the copy's address: a re-sign without address
-	// diversity is then caught on every run, not only when the two PAC fields happen to collide (about once in 128)
-	uint64_t plainTarget = codeWithSignature(0);
-	while ( oracleAuth(oracleSign(plainTarget, 0), (uint64_t)&gHeapResult.invoke) == plainTarget )
-		plainTarget = codeWithSignature(plainTarget + 0x40);
 	Block original = { nullptr, 0, 0, nullptr, nullptr };
+	// an invoke that a signature made for modifier 0 cannot authenticate at the copy's address: a re-sign without address
+	// diversity is then caught on every run, not only when the two PAC fields happen to collide (about once in 128).
+	// The same choice keeps the two signatures of the stale-signature check apart, so that check tests them on every run.
+	uint64_t plainTarget = codeWithSignature(0);
+	bool distinct = false;
+	for (unsigned tries = 0; tries < kMaxTargetSearch; ++tries) {
+		distinct = oracleAuth(oracleSign(plainTarget, 0), (uint64_t)&gHeapResult.invoke) != plainTarget
+				&& oracleSign(plainTarget, (uint64_t)&original.invoke) != oracleSign(plainTarget, (uint64_t)&gHeapResult.invoke);
+		if ( distinct )
+			break;
+		if ( tries + 1 < kMaxTargetSearch )
+			plainTarget = codeWithSignatureAfter(plainTarget + 0x40, 0);
+	}
+	CHECK(distinct, "no Block_copy target separates the two signatures in %u tries: the no-diversity or stale-signature check could not be exercised", kMaxTargetSearch);
 	original.invoke = (void*)oracleSign(plainTarget, (uint64_t)&original.invoke);
 	CHECK(oracleAuth(oracleSign(plainTarget, 0), (uint64_t)&gHeapResult.invoke) != plainTarget,
 	      "the Block_copy target verifies a signature made for modifier 0: the no-diversity mutant would survive");
+	CHECK(oracleSign(plainTarget, (uint64_t)&original.invoke) != oracleSign(plainTarget, (uint64_t)&gHeapResult.invoke),
+	      "the two Block_copy signatures coincide: the stale-signature check would be blind");
 	CHECK(oracleAuth((uint64_t)original.invoke, (uint64_t)&original.invoke) == plainTarget, "the original's invoke is not signed for its own address");
 
 	// the plain Block_copy moves the literal and leaves the stale signature in the copy
@@ -680,8 +695,27 @@ static void checkBlockCopy()
 
 	// the original's signature is checked first: a corrupted one is not turned into a valid signature for the copy
 	Block bad = original;
-	// signed for its own address and then corrupted: a signature made for another address would verify by luck about once in 128
-	bad.invoke = (void*)corrupted(oracleSign(codeWithSignature((uint64_t)&bad.invoke), (uint64_t)&bad.invoke));
+	// signed for its own address and then corrupted: a signature made for another address would verify by luck about once in
+	// 128. corrupted() clears the lowest signature bit, and a one-bit signature would come back as the plain pointer; signing a
+	// failed authentication returns exactly that pointer on this host. Pick a target whose corrupted value keeps a signature
+	// and is not what signing its failed authentication returns: the loop ends only when the mutant's write is visible.
+	uint64_t badTarget = codeWithSignature((uint64_t)&bad.invoke);
+	uint64_t badInvoke = corrupted(oracleSign(badTarget, (uint64_t)&bad.invoke));
+	bool visible = false;
+	for (unsigned tries = 0; tries < kMaxTargetSearch; ++tries) {
+		visible = (badInvoke != oracleStrip(badInvoke))
+				&& (oracleSign(oracleAuth(badInvoke, (uint64_t)&bad.invoke), (uint64_t)&gHeapResult.invoke) != badInvoke);
+		if ( visible )
+			break;
+		if ( tries + 1 < kMaxTargetSearch ) {
+			badTarget += 0x40;
+			badInvoke = corrupted(oracleSign(badTarget, (uint64_t)&bad.invoke));
+		}
+	}
+	CHECK(visible, "no corrupted Block_copy original makes the mutant's write visible in %u tries", kMaxTargetSearch);
+	bad.invoke = (void*)badInvoke;
+	CHECK(oracleSign(oracleAuth(badInvoke, (uint64_t)&bad.invoke), (uint64_t)&gHeapResult.invoke) != badInvoke,
+	      "the corrupted Block_copy original is what signing its failed authentication returns: the mutant would survive");
 	gHeapResult = bad;
 	gHeapResult.flags = kHeap;
 	t((uint64_t)&bad, 0, 0, 0, 0, 0, 0, 0);
