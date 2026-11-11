@@ -266,6 +266,7 @@ struct EnvironmentVariables {
 							//	DYLD_PRINT_DOFS					==> gLinkContext.verboseDOF
 							//	DYLD_PRINT_APIS					==> gLogAPIs
 							//	DYLD_PRINT_OBJC_NOTIFICATIONS	==> gLogObjCNotifications (Darling only)
+							//	DYLD_PRINT_CACHE_POLICY			==> gLogCachePolicy (Darling only)
 							//	DYLD_IGNORE_PREBINDING			==> gLinkContext.prebindUsage
 							//	DYLD_PREBIND_DEBUG				==> gLinkContext.verbosePrebinding
 							//	DYLD_NEW_LOCAL_SHARED_REGIONS	==> gLinkContext.sharedRegionMode
@@ -329,6 +330,7 @@ static const char*					sSharedCacheSplitPolicy;	// DYLD_SHARED_CACHE_SPLIT_POLIC
 ImageLoader::LinkContext			gLinkContext;
 bool								gLogAPIs = false;
 bool								gLogObjCNotifications = false;
+bool								gLogCachePolicy = false;
 bool								gObjCRuntimeIsSharedCache = false;
 #if SUPPORT_ACCELERATE_TABLES
 bool								gLogAppAPIs = false;
@@ -2333,6 +2335,9 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	else if ( strcmp(key, "DYLD_PRINT_OBJC_NOTIFICATIONS") == 0 ) {
 		gLogObjCNotifications = true;
 	}
+	else if ( strcmp(key, "DYLD_PRINT_CACHE_POLICY") == 0 ) {
+		gLogCachePolicy = true;
+	}
 #if SUPPORT_ACCELERATE_TABLES
 	else if ( strcmp(key, "DYLD_PRINT_APIS_APP") == 0 ) {
 		gLogAppAPIs = true;
@@ -3688,9 +3693,11 @@ static bool useCacheImageWithoutClosure(const char* path, const dyld3::SharedCac
 	const bool splitCache = sSharedCacheLoadInfo.loadAddress->isSplitCache();
 	const dyld3::SharedCacheLoadSource source = dyld3::chooseSharedCacheLoadSource(splitCache, true, existsOnDisk,
 																				  found.pathInCache, dyld3::sharedCacheAllowList());
-	const bool allowListed = dyld3::sharedCachePathIsAllowListed(found.pathInCache, dyld3::sharedCacheAllowList());
-	dyld::log("cache load source %s: policy=%s allow_list=%s\n", found.pathInCache ? found.pathInCache : path,
-			  source == dyld3::kSharedCacheLoadFromCache ? "cache" : "disk", allowListed ? "hit" : "miss");
+	if ( gLogCachePolicy ) {
+		const bool allowListed = dyld3::sharedCachePathIsAllowListed(found.pathInCache, dyld3::sharedCacheAllowList());
+		dyld::log("cache load source %s: policy=%s allow_list=%s\n", found.pathInCache ? found.pathInCache : path,
+				  source == dyld3::kSharedCacheLoadFromCache ? "cache" : "disk", allowListed ? "hit" : "miss");
+	}
 	if ( source == dyld3::kSharedCacheLoadFromDisk )
 		return false;
 	// the stat was of a disk file that the cache now shadows: its inode and mtime must not end up on the cache image

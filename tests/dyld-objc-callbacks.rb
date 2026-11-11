@@ -61,13 +61,35 @@ check('both images register the old-shape thunks',
       APIS.include?('dyld::registerObjCNotifiers(dyld3::darling::objcMappedThunk, dyld3::darling::objcInitThunk, dyld3::darling::objcUnmappedThunk);'))
 DYLD2_SRC = File.read("#{ROOT}/src/dyld2.cpp")
 DYLD2_HDR = File.read("#{ROOT}/src/dyld2.h")
-check('dyld2 parses DYLD_PRINT_OBJC_NOTIFICATIONS into gLogObjCNotifications',
-      DYLD2_SRC.match?(/else if \( strcmp\(key, "DYLD_PRINT_OBJC_NOTIFICATIONS"\) == 0 \) \{\n\t\tgLogObjCNotifications = true;\n\t\}/) &&
-      DYLD2_SRC.match?(/^bool\s+gLogObjCNotifications = false;/) && DYLD2_HDR.match?(/extern bool\s+gLogObjCNotifications;/))
-check('dyldAPIs.cpp installs the notification hooks only under the flag',
-      APIS.match?(/if \( dyld::gLogObjCNotifications \) \{\n\t\tstate\.logRegistered = logObjCRegistered;\n\t\tstate\.logDelivered = logObjCDelivered;\n\t\}\n\tif \( !state\.registerCallbacks/) &&
-      APIS.include?('dyld::log("dyld: objc register_callbacks version=%u\\n", version);') &&
-      APIS.include?('dyld::log("dyld: objc %s %s refs_optimized=%u\\n", kind, path, refsOptimized);'))
+MAN = File.read("#{ROOT}/doc/man/man1/dyld.1")
+
+# Which dyld lines are unrequested diagnostics: each static pin is a function of the sources so a probe can
+# mutate one source and prove the pin fails. name => [description, source key, lambda(source)].
+GATE_PINS = {
+  objc_parse: ['dyld2 parses DYLD_PRINT_OBJC_NOTIFICATIONS into gLogObjCNotifications', :dyld2,
+               ->(t) { t.match?(/else if \( strcmp\(key, "DYLD_PRINT_OBJC_NOTIFICATIONS"\) == 0 \) \{\n\t\tgLogObjCNotifications = true;\n\t\}/) &&
+                       t.match?(/^bool\s+gLogObjCNotifications = false;/) }],
+  objc_extern: ['dyld2.h declares gLogObjCNotifications', :hdr, ->(t) { t.match?(/extern bool\s+gLogObjCNotifications;/) }],
+  policy_parse: ['dyld2 parses DYLD_PRINT_CACHE_POLICY into gLogCachePolicy', :dyld2,
+                 ->(t) { t.match?(/else if \( strcmp\(key, "DYLD_PRINT_CACHE_POLICY"\) == 0 \) \{\n\t\tgLogCachePolicy = true;\n\t\}/) &&
+                         t.match?(/^bool\s+gLogCachePolicy = false;/) &&
+                         t.include?("//\tDYLD_PRINT_CACHE_POLICY\t\t\t==> gLogCachePolicy (Darling only)") }],
+  policy_extern: ['dyld2.h declares gLogCachePolicy', :hdr, ->(t) { t.match?(/extern bool\s+gLogCachePolicy;/) }],
+  policy_gated: ['the cache policy line is printed only under gLogCachePolicy', :dyld2,
+                 ->(t) { t.match?(/\tif \( gLogCachePolicy \) \{\n(?:[^\n]*\n){0,2}\t\tdyld::log\("cache load source %s: policy=%s allow_list=%s\\n", found\.pathInCache \? found\.pathInCache : path,\n\t\t\t\t  source == dyld3::kSharedCacheLoadFromCache \? "cache" : "disk", allowListed \? "hit" : "miss"\);\n\t\}\n/) }],
+  policy_man: ['the man page documents DYLD_PRINT_CACHE_POLICY', :man,
+               ->(t) { t.match?(/^\.B DYLD_PRINT_CACHE_POLICY$/) && t.match?(/^DYLD_PRINT_CACHE_POLICY$/) }],
+  hooks_gated: ['dyldAPIs.cpp installs the notification and skip hooks only under the flag', :apis,
+                ->(t) { t.match?(/if \( dyld::gLogObjCNotifications \) \{\n\t\tstate\.logSkip = logObjCSkip;\n\t\tstate\.logRegistered = logObjCRegistered;\n\t\tstate\.logDelivered = logObjCDelivered;\n\t\}\n\tif \( !state\.registerCallbacks/) &&
+                        !t.match?(/^\tstate\.logSkip = /) &&
+                        t.include?('dyld::log("dyld: objc register_callbacks version=%u\\n", version);') &&
+                        t.include?('dyld::log("dyld: objc %s %s refs_optimized=%u\\n", kind, path, refsOptimized);') &&
+                        t.include?('dyld::log(format, path);') }],
+  mark_gated: ['the mark_image_mutable line is printed only under the flag', :apis,
+               ->(t) { t.match?(/static void markImageMutableImpl\(void\*, uint32_t objcImageIndex\)\n\{\n\tif \( dyld::gLogObjCNotifications \)\n\t\tdyld::log\("dyld: objc mark_image_mutable index=%u\\n", objcImageIndex\);\n\}/) }],
+}.freeze
+GATE_SOURCES = { dyld2: DYLD2_SRC, hdr: DYLD2_HDR, man: MAN, apis: APIS }.freeze
+GATE_PINS.each_value { |desc, key, pin| check(desc, pin.call(GATE_SOURCES.fetch(key))) }
 check('libdyld answers RTLD_SELF before dispatching to the loader',
       WRAPPERS.match?(/if \( handle == RTLD_SELF \)\s*\n\s*return _dyld_get_image_header_containing_address\(__builtin_return_address\(0\)\);/))
 
@@ -966,6 +988,33 @@ Dir.mktmpdir('dyld-objc-callbacks-') do |dir|
     ['libdyld dispatches to dyld3 first', 'if ( gUseDyld3 )', 'if ( gUseDyld3 && false )', false, :handle],
     ['cacheImageMachHeader asks the cache', 'return sAllCacheImagesProxy->machHeaderForIndex(index);', 'return nullptr;', false, :handle],
   ]
+  gate_probes = [
+    ['the objc notification flag is parsed', :objc_parse, :dyld2, 'gLogObjCNotifications = true;', 'gLogObjCNotifications = false;'],
+    ['the cache policy flag is parsed', :policy_parse, :dyld2, 'gLogCachePolicy = true;', 'gLogCachePolicy = false;'],
+    ['the cache policy flag is declared', :policy_extern, :hdr, 'gLogCachePolicy;', 'gLogCachePolicyX;'],
+    ['the cache policy line has its gate', :policy_gated, :dyld2, "\tif ( gLogCachePolicy ) {\n\t\tconst bool allowListed", "\t{\n\t\tconst bool allowListed"],
+    ['the cache policy flag is documented', :policy_man, :man, ".B DYLD_PRINT_CACHE_POLICY\n", ".B DYLD_PRINT_CACHE\n"],
+    ['the skip hook is installed only under the flag', :hooks_gated, :apis,
+     "\t\tstate.logSkip = logObjCSkip;\n\t\tstate.logRegistered", "\t\tstate.logRegistered"],
+    ['the skip hook is not installed unconditionally', :hooks_gated, :apis,
+     "\tstate.markImageMutableInvoke = markImageMutableImpl;\n", "\tstate.markImageMutableInvoke = markImageMutableImpl;\n\tstate.logSkip = logObjCSkip;\n"],
+    ['the notification hooks keep their gate', :hooks_gated, :apis,
+     "\tif ( dyld::gLogObjCNotifications ) {\n\t\tstate.logSkip", "\t{\n\t\tstate.logSkip"],
+    ['the mark_image_mutable line has its gate', :mark_gated, :apis,
+     "\tif ( dyld::gLogObjCNotifications )\n\t\tdyld::log(\"dyld: objc mark_image_mutable", "\tdyld::log(\"dyld: objc mark_image_mutable"],
+  ]
+  gate_probes.each do |name, pin_key, source_key, from, to|
+    sources = GATE_SOURCES.dup
+    abort "probe text not found: #{name}" unless sources.fetch(source_key).include?(from)
+    sources[source_key] = sources.fetch(source_key).sub(from) { to }
+    if GATE_PINS.fetch(pin_key)[2].call(sources.fetch(GATE_PINS.fetch(pin_key)[1]))
+      $failures += 1
+      puts "SURVIVED #{name}"
+    else
+      puts "killed   #{name}"
+    end
+  end
+
   probes.each do |name, from, to, pac_only, kind|
     if pac_only && !PAC_HOST
       puts "skip probe #{name} (no pointer authentication on this host)"
