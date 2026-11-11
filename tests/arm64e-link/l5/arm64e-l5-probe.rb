@@ -99,6 +99,89 @@ Dir.mktmpdir('l5-native-') do |dir|
   end
 end
 
+# ---------------------------------------------------------------- the fault handler's signature
+# dyld's arm64e adapters wrap every plain export an arm64e image binds (with or without the cache): an
+# unsigned sigaction handler becomes a poisoned pointer and the first fault hangs. The arm64e build must
+# therefore hand sigaction the pointer exactly as the compiler signed it. Checked on the compiled
+# assembly: every place the code takes l5_on_fault's address signs it (paciza) and never strips it
+# (xpaci) before the next unrelated instruction.
+def handler_signature_problems(asm)
+  lines = asm.lines
+  sites = lines.each_index.select { |i| lines[i].match?(/adrp\s+x\d+, _l5_on_fault@PAGE/) }
+  return ['no code takes the address of l5_on_fault'] if sites.empty?
+  sites.flat_map do |i|
+    reg = lines[i][/adrp\s+(x\d+),/, 1]
+    at = "asm line #{i + 1}"
+    # the compiler emits the address and its signature back to back: adrp, add, paciza on one register
+    unless lines[i + 1].to_s.match?(/\badd\s+#{reg}, #{reg}, _l5_on_fault@PAGEOFF/) && lines[i + 2].to_s.match?(/\bpaciza\s+#{reg}\b/)
+      next ["the address of l5_on_fault is not signed right after it is formed (#{at})"]
+    end
+    problem = nil
+    stored = false
+    lines[(i + 3)..(i + 16)].to_a.each do |l|
+      if l.match?(/\bxpaci\s+#{reg}\b/)
+        problem = "the handler is stripped (xpaci #{reg}) before it is stored (#{at})"
+        break
+      elsif l.match?(/\bst[pr]\s+#{reg}\b/)
+        stored = true
+        break
+      elsif l.match?(/^\s*(?!cmp|cmn|tst|cbz|cbnz|b\.|stp|str)\w+\s+#{reg}\b/)
+        problem = "the signed handler register #{reg} is overwritten before the store (#{at}): #{l.strip}"
+        break
+      end
+    end
+    problem ||= "the signed l5_on_fault in #{reg} is never stored (#{at})" unless stored
+    [problem].compact
+  end
+end
+
+if SDKROOT.empty?
+  puts 'SKIP the fault-handler signature check: set SDKROOT'
+else
+  Dir.mktmpdir('l5-sig-') do |dir|
+    o, e, st = py('-c', "import sys; sys.path.insert(0, #{HERE.inspect}); import build_l5; " \
+                        "print('\\n'.join(build_l5.cflags(sys.argv[1])))", SDKROOT)
+    check 'the build flags are readable from build_l5.cflags', st.success? && !o.empty?, e[0, 300]
+    next unless st.success?
+    flags = o.lines.map(&:chomp)
+    asm_of = lambda do |text, name|
+      src = File.join(dir, "#{name}.c")
+      File.write(src, text)
+      out = File.join(dir, "#{name}.s")
+      _o, err, ok = Open3.capture3('clang', '--target=arm64e-apple-macos13', '-S', '-I', HERE, *flags, src, '-o', out)
+      ok.success? ? File.read(out) : (puts "FAIL compile #{name}: #{err[0, 300]}"; $failures += 1; nil)
+    end
+    good = asm_of.call(SRC, 'l5_signed')
+    if good
+      check 'the arm64e build hands sigaction the signed handler: paciza, no xpaci, at every use',
+            handler_signature_problems(good).empty?, handler_signature_problems(good).inspect
+      check 'the handler does not depend on PROBE_CONFIG', !SRC[/static void l5_install_handlers.*?^\}/m].to_s.include?('PROBE_CONFIG')
+    end
+    stripped_src = SRC.sub('sa.handler = (void *)l5_on_fault;', 'sa.handler = STRIP((void *)l5_on_fault);')
+    check 'the mutation source differs (the stripped handler is really injected)', stripped_src != SRC
+    mut = asm_of.call(stripped_src, 'l5_stripped')
+    check 'a stripped handler (the pre-fix code) is rejected by the signature check',
+          !mut.nil? && handler_signature_problems(mut).any? { |p| p.include?('xpaci') }, mut && handler_signature_problems(mut).inspect
+    if good
+      store = good.lines.index { |l| l.match?(/\bstp\s+x16, x\d+, \[sp, #8\]/) }
+      check 'the assembly has the handler store the mutations below rewrite', !store.nil?
+      if store
+        lines = good.lines
+        after = lines.dup.insert(store, "\txpaci\tx16\n").join
+        check 'a strip between the signing and the store is rejected',
+              handler_signature_problems(after).any? { |p| p.include?('xpaci') }, handler_signature_problems(after).inspect
+        sign = (0...store).to_a.reverse.find { |j| lines[j].match?(/\bpaciza\s+x16\b/) }
+        dead = lines.dup.tap { |l| l[sign] = "\tpaciza\tx17\n" if sign }.join
+        over = lines.dup.insert(store, "\tmov\tx16, x8\n").join
+        check 'overwriting the signed register before the store is rejected',
+              handler_signature_problems(over).any? { |p| p.include?('overwritten') }, handler_signature_problems(over).inspect
+        check 'a signature on another register (the stored x16 stays unsigned) is rejected',
+              handler_signature_problems(dead).any? { |p| p.include?('not signed right after') }, handler_signature_problems(dead).inspect
+      end
+    end
+  end
+end
+
 # ---------------------------------------------------------------- the built probe
 if LD64.empty? || SDKROOT.empty?
   puts 'SKIP the Mach-O part: set LD64 and SDKROOT'

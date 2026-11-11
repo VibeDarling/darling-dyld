@@ -157,15 +157,6 @@ static void l5_on_fault(int sig, siginfo_min *si, void *uc) {
     _exit(70);
 }
 
-#ifndef ABI_NATIVE
-// The guest run may have the arm64e adapters on (configs c2/c3), whose sigaction row authenticates
-// the code pointer: the handler goes over unstripped there, stripped everywhere else.
-static int l5_adapters_on(void) {
-    const char *c = getenv("PROBE_CONFIG");
-    return c && (streq(c, "c2") || streq(c, "c3"));
-}
-#endif
-
 static void l5_install_handlers(void) {
     static const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT};
 #ifdef ABI_NATIVE
@@ -175,7 +166,10 @@ static void l5_install_handlers(void) {
     sa.sa_flags = SA_SIGINFO;
 #else
     struct sigaction sa;
-    sa.handler = l5_adapters_on() ? (void *)l5_on_fault : STRIP((void *)l5_on_fault);
+    // dyld's arm64e adapters are on for every arm64e image (with or without the cache) and wrap sigaction:
+    // an unsigned handler is replaced by a poisoned pointer and the first fault hangs signal delivery.
+    // So the handler goes over exactly as the compiler signed it, in every config.
+    sa.handler = (void *)l5_on_fault;
     sa.mask = 0;
     sa.flags = SA_SIGINFO;
 #endif

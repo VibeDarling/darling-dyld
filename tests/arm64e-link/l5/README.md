@@ -49,7 +49,7 @@ LD64=... SDKROOT=... [PREFIX=...] ruby arm64e-l5-probe.rb
 prints exactly one OKMARK line and fails before it; the native stubs fail rather than pass; the
 selftests cover every verdict class; a wrong expected verdict (`selftest-wrong`) and a wrong expected
 hash (`--hash-skew 1`) make the driver exit 1; the built executable is arm64e and the build derives
-exactly the ten listed libobjc imports; and no link-only stub is installed in the prefix, including
+exactly the ten listed libobjc imports; the arm64e build hands `sigaction` the compiler-signed fault handler in every config (checked on the compiled assembly: `paciza`, no `xpaci`; a stripped-handler mutation is rejected), and no link-only stub is installed in the prefix, including
 one renamed to `libobjc.A.dylib` (the scan finds stubs by structure, not by name).
 
 ## Guest run (T10)
