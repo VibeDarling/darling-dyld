@@ -2,9 +2,12 @@
 """Turn a symbol list (one C name per line, # comments) into STUB(name) lines for libz_stub.c.
 
 Usage: python3 -I gen_stub.py SYMBOLS.txt OUT.inc
+       python3 -I gen_stub.py --objects OUT.txt OBJ...
 
 A symbol list can also come from objects: undefined_names() lists what Mach-O objects reference and
-define nowhere (the l4 test builds its libc++ and libc++abi stubs from that).
+define nowhere (the l4 test builds its libc++ and libc++abi stubs from that). The --objects form
+writes exactly that list as a symbols file, which is what the l5 test uses to turn its own imports
+into its libobjc link-only stub.
 """
 import re
 import subprocess
@@ -83,9 +86,14 @@ def write_inc(names, out):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit(__doc__)
+    argv = sys.argv[1:]
     try:
-        write_inc(read_symbols(sys.argv[1]), sys.argv[2])
+        if len(argv) >= 3 and argv[0] == "--objects":
+            write_symbols(undefined_names(argv[2:]), argv[1],
+                          "C names the objects reference and define nowhere (gen_stub --objects)")
+        elif len(argv) == 2:
+            write_inc(read_symbols(argv[0]), argv[1])
+        else:
+            sys.exit(__doc__)
     except (ValueError, OSError) as e:
         sys.exit("gen_stub: %s" % e)
