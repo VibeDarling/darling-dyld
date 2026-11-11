@@ -244,6 +244,27 @@ def matrix_policy_ok(script, root)
     c3_part.include?(policy) && !both[/PROBE_CONFIG=c2[^;]*/].to_s.include?('POLICY')
 end
 
+# The command that reaches the guest is also executed here against two stubs that record their basename
+# and PROBE_CONFIG: the log text cannot tell `C=x` from `C[0]=`, `C+=`, `${C:=}`, `printf -v C` or `read C`.
+def matrix_records_ok(log, root)
+  records = File.join(root, 'records.txt')
+  FileUtils.rm_f(records)
+  stub = "#!/bin/sh\nprintf '%s|%s\\n' \"$(basename \"$0\")\" \"${PROBE_CONFIG:-}\" >> \"$RECORDS\"\n"
+  probe_dir = File.realpath(File.join(root, 'probe'))
+  %w[l4_probe_arm64 l4_probe_arm64e].each do |name|
+    path = File.join(probe_dir, name)
+    File.write(path, stub)
+    FileUtils.chmod(0o755, path)
+  end
+  line = log[%r{/bin/bash -c (.*)}, 1].to_s
+  return false if line.empty?
+  _o, _e, st = Open3.capture3({ 'RECORDS' => records }, '/bin/bash', '-c', line.gsub('/Volumes/SystemRoot', ''))
+  return false unless st.success? && File.exist?(records)
+  File.readlines(records).map { |l| l.chomp.split('|', -1) } ==
+    [%w[l4_probe_arm64 c1], %w[l4_probe_arm64e c2], %w[l4_probe_arm64e c3],
+     ['l4_probe_arm64e', ''], ['l4_probe_arm64', '']]
+end
+
 # the assignment itself: c1 is the plain control, c2 and c3 the arm64e probe, the cache directory on
 # c3 only, and the self-test runs both builds
 def matrix_assignments_ok(script, root)
@@ -254,7 +275,7 @@ def matrix_assignments_ok(script, root)
   # the script itself must assign each variable once (an `export VAR=` outside the command would reach
   # every guest run through the launcher's environment)
   code = script.lines.reject { |l| l.lstrip.start_with?('#') }.join
-  code.scan('DYLD_SHARED_CACHE_SPLIT_DIR=').size == 1 &&
+  static_ok = code.scan('DYLD_SHARED_CACHE_SPLIT_DIR=').size == 1 &&
     code.scan(/\bE=/).size == 1 && code.scan(/\bC=/).size == 1 &&
     log.include?("E=#{probe}/l4_probe_arm64e; C=#{probe}/l4_probe_arm64") &&
     log.scan('DYLD_SHARED_CACHE_SPLIT_DIR=').size == 1 &&
@@ -263,6 +284,7 @@ def matrix_assignments_ok(script, root)
     log[/PROBE_CONFIG=c2[^;]*/].to_s == 'PROBE_CONFIG=c2 $E' &&
     log[/PROBE_CONFIG=c3[^;]*/].to_s == "PROBE_CONFIG=c3 DYLD_SHARED_CACHE_SPLIT_DIR=#{cache} $E" &&
     log.include?('$E selftest; $C selftest')
+  static_ok && matrix_records_ok(log, root)
 end
 
 Dir.mktmpdir('l4-matrix-') do |dir|
