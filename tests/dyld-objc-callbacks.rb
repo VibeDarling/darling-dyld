@@ -59,6 +59,15 @@ check('both images include the shared callbacks header',
 check('both images register the old-shape thunks',
       D3APIS.include?('gAllImages.setObjCNotifiers(darling::objcMappedThunk, darling::objcInitThunk, darling::objcUnmappedThunk);') &&
       APIS.include?('dyld::registerObjCNotifiers(dyld3::darling::objcMappedThunk, dyld3::darling::objcInitThunk, dyld3::darling::objcUnmappedThunk);'))
+DYLD2_SRC = File.read("#{ROOT}/src/dyld2.cpp")
+DYLD2_HDR = File.read("#{ROOT}/src/dyld2.h")
+check('dyld2 parses DYLD_PRINT_OBJC_NOTIFICATIONS into gLogObjCNotifications',
+      DYLD2_SRC.match?(/else if \( strcmp\(key, "DYLD_PRINT_OBJC_NOTIFICATIONS"\) == 0 \) \{\n\t\tgLogObjCNotifications = true;\n\t\}/) &&
+      DYLD2_SRC.match?(/^bool\s+gLogObjCNotifications = false;/) && DYLD2_HDR.match?(/extern bool\s+gLogObjCNotifications;/))
+check('dyldAPIs.cpp installs the notification hooks only under the flag',
+      APIS.match?(/if \( dyld::gLogObjCNotifications \) \{\n\t\tstate\.logRegistered = logObjCRegistered;\n\t\tstate\.logDelivered = logObjCDelivered;\n\t\}\n\tif \( !state\.registerCallbacks/) &&
+      APIS.include?('dyld::log("dyld: objc register_callbacks version=%u\\n", version);') &&
+      APIS.include?('dyld::log("dyld: objc %s %s refs_optimized=%u\\n", kind, path, refsOptimized);'))
 check('libdyld answers RTLD_SELF before dispatching to the loader',
       WRAPPERS.match?(/if \( handle == RTLD_SELF \)\s*\n\s*return _dyld_get_image_header_containing_address\(__builtin_return_address\(0\)\);/))
 
@@ -241,6 +250,18 @@ DRIVER = <<~'CPP'
       v4.patches = reinterpret_cast<_dyld_objc_notify_patch_class>(signCallbackIB((uint64_t)(uintptr_t)onPatch, modifier((uint64_t)(uintptr_t)&v4.patches, kPatchDisc)));
       return s.registerCallbacks(asCallbacks(&v4));
   }
+
+  // DYLD_PRINT_OBJC_NOTIFICATIONS: the hooks append the lines src/dyldAPIs.cpp's wrappers print.
+  static char noteText[2048];
+  static void noteRegistered(unsigned version)
+  {
+      snprintf(noteText + strlen(noteText), sizeof noteText - strlen(noteText), "dyld: objc register_callbacks version=%u\n", version);
+  }
+  static void noteDelivered(const char* kind, const char* path, unsigned refsOptimized)
+  {
+      snprintf(noteText + strlen(noteText), sizeof noteText - strlen(noteText), "dyld: objc %s %s refs_optimized=%u\n", kind, path, refsOptimized);
+  }
+  static bool noted(const char* expected) { return strcmp(noteText, expected) == 0; }
 
   static void recordMutable(void* block, uint32_t objcImageIndex)
   {
@@ -534,6 +555,73 @@ DRIVER = <<~'CPP'
         s3.notifyMapped(1, &plainPath, plainMhs);
         s3.notifyInit(plainPath, &plain);
         expect("v3 still receives plain images", mappedCalls == 1 && recordedCount == 2 && initCalls == 1 && loggedLines == 0);
+    }
+    {
+        struct mach_header cacheArm64e = {};
+        cacheArm64e.cputype = 0x0100000c;
+        cacheArm64e.cpusubtype = 0x81000002;
+        cacheArm64e.flags = MH_DYLIB_IN_CACHE;
+        struct mach_header diskArm64e = {};
+        diskArm64e.cputype = 0x0100000c;
+        diskArm64e.cpusubtype = 0x00000002;
+        struct mach_header plain = {};
+        plain.cputype = 0x0100000c;
+        const char* notePaths[3] = { "disk/libplain.dylib", "cache/libobjc.A.dylib", "disk/libarm64e.dylib" };
+        const struct mach_header* noteMhs[3] = { &plain, &cacheArm64e, &diskArm64e };
+
+        ObjCCallbackState s;
+        s.logRegistered = noteRegistered;
+        s.logDelivered = noteDelivered;
+        noteText[0] = 0;
+        registerV4(s);
+        expect("v4 registration prints exactly one version line", noted("dyld: objc register_callbacks version=4\n"));
+        noteText[0] = 0;
+        s.notifyMapped(3, notePaths, noteMhs);
+        expect("mapped lines name the delivered images with their bits, in order",
+               noted("dyld: objc mapped cache/libobjc.A.dylib refs_optimized=1\ndyld: objc mapped disk/libarm64e.dylib refs_optimized=0\n"));
+        noteText[0] = 0;
+        s.notifyInit(notePaths[0], &plain);
+        expect("init prints nothing for a plain image", noted(""));
+        s.notifyInit(notePaths[1], &cacheArm64e);
+        s.notifyInit(notePaths[2], &diskArm64e);
+        expect("init prints one line per delivered init",
+               noted("dyld: objc init cache/libobjc.A.dylib refs_optimized=1\ndyld: objc init disk/libarm64e.dylib refs_optimized=0\n"));
+
+        ObjCCallbackState quiet;
+        noteText[0] = 0;
+        registerV4(quiet);
+        quiet.notifyMapped(3, notePaths, noteMhs);
+        quiet.notifyInit(notePaths[1], &cacheArm64e);
+        expect("without the hooks nothing is printed", noted(""));
+
+        ObjCCallbackState old;
+        old.logRegistered = noteRegistered;
+        old.logDelivered = noteDelivered;
+        noteText[0] = 0;
+        old.registerCallbacks(asCallbacks(&v3));
+        old.notifyMapped(1, notePaths, noteMhs);
+        expect("a v3 runtime is shown the plain image and the version",
+               noted("dyld: objc register_callbacks version=3\ndyld: objc mapped disk/libplain.dylib refs_optimized=0\n"));
+
+        struct _dyld_objc_callbacks unsupported = { 5 };
+        ObjCCallbackState refused;
+        refused.logRegistered = noteRegistered;
+        noteText[0] = 0;
+        expect("version 5 is refused for the notification test", !refused.registerCallbacks(&unsupported));
+        expect("a refused registration prints no version line", noted(""));
+        if ( pac ) {
+            _dyld_objc_callbacks_v4 forged;
+            forged.version = 4;
+            forged.mapped = reinterpret_cast<_dyld_objc_notify_mapped3>(signCallbackIB((uint64_t)(uintptr_t)onMapped3, modifier((uint64_t)(uintptr_t)&forged.mapped, kMappedDisc)));
+            forged.init = reinterpret_cast<_dyld_objc_notify_init2>(signCallbackIB((uint64_t)(uintptr_t)onInit2, modifier((uint64_t)(uintptr_t)&forged.init, kInitDisc)));
+            forged.unmapped = reinterpret_cast<_dyld_objc_notify_unmapped>(signCallbackIB((uint64_t)(uintptr_t)onUnmapped, modifier((uint64_t)(uintptr_t)&forged.unmapped, kUnmappedDisc)));
+            forged.patches = reinterpret_cast<_dyld_objc_notify_patch_class>(signCallbackIB((uint64_t)(uintptr_t)onPatch, modifier((uint64_t)(uintptr_t)&forged.patches, kPatchDisc)) ^ (1ull << 63));
+            ObjCCallbackState forgedState;
+            forgedState.logRegistered = noteRegistered;
+            noteText[0] = 0;
+            expect("a forged v4 is refused for the notification test", !forgedState.registerCallbacks(asCallbacks(&forged)));
+            expect("a v4 that fails authentication prints no version line", noted(""));
+        }
     }
       {
           fflush(stdout);
@@ -853,6 +941,14 @@ Dir.mktmpdir('dyld-objc-callbacks-') do |dir|
     ['only a v4 runtime is filtered', 'arm64eRuntime = kV4RuntimeIsArm64e && callbacksVersion == 4;', 'arm64eRuntime = kV4RuntimeIsArm64e;', false, :callbacks],
     ['init is filtered too', "if ( !acceptsImage(mh) )\n\t\t\treturn;", "if ( false )\n\t\t\treturn;", false, :callbacks],
     ['an emptied chunk makes no call', "if ( delivered == 0 )\n\t\t\t\tcontinue;", "if ( false )\n\t\t\t\tcontinue;", false, :callbacks],
+    ['the version is logged after the registration succeeds', 'const uintptr_t callbacksVersion = callbacks->version;',
+     "const uintptr_t callbacksVersion = callbacks->version;\n\t\tif ( logRegistered != nullptr )\n\t\t\tlogRegistered((unsigned)callbacks->version);", false, :callbacks],
+    ['skipped images print no mapped line', 'if ( !acceptsImage(mhs[base + i]) ) {',
+     "if ( !acceptsImage(mhs[base + i]) ) {\n\t\t\t\t\tif ( logDelivered != nullptr )\n\t\t\t\t\t\tlogDelivered(\"mapped\", paths[base + i], 0);", false, :callbacks],
+    ['the mapped line carries the refs-optimized bit',
+     'logDelivered("mapped", infos[delivered].path, infos[delivered].dyldObjCRefsOptimized);',
+     'logDelivered("mapped", infos[delivered].path, infos[delivered].dyldObjCRefsOptimized ^ 1);', false, :callbacks],
+    ['a delivered init prints a line', 'logDelivered("init", path, info.dyldObjCRefsOptimized);', '(void)0;', false, :callbacks],
     ['a skipped image is logged', 'if ( logSkip != nullptr )', 'if ( false )', false, :callbacks],
     ['a v4 runtime is not filtered on unmapped', 'if ( unmapped != nullptr )', 'if ( unmapped != nullptr && acceptsImage(mh) )', false, :callbacks],
     ['the subtype is the arm64e one, not any nonzero', '(subtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E', '(subtype & ~CPU_SUBTYPE_MASK) != 0', false, :adapters],

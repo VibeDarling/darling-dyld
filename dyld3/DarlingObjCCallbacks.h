@@ -146,6 +146,9 @@ struct ObjCCallbackState {
 	ObjCBlockLayout					markImageMutable = { nullptr, 0, 0, 0, nullptr };
 	bool							arm64eRuntime = false;	// a v4 registration on arm64: libobjc authenticates the metadata it reads
 	void							(*logSkip)(const char* format, const char* path) = nullptr;
+	// DYLD_PRINT_OBJC_NOTIFICATIONS: the registered version, and each image actually handed to the runtime.
+	void							(*logRegistered)(unsigned version) = nullptr;
+	void							(*logDelivered)(const char* kind, const char* path, unsigned refsOptimized) = nullptr;
 
 	// Stores the callbacks the struct names. Returns false and sets `error` for a version other than 2-4
 	// and for a v4 field that does not authenticate (a zeroed or forged signature). Versions 2 and 3 are
@@ -192,6 +195,8 @@ struct ObjCCallbackState {
 		}
 		version = callbacksVersion;
 		arm64eRuntime = kV4RuntimeIsArm64e && callbacksVersion == 4;
+		if ( logRegistered != nullptr )
+			logRegistered((unsigned)callbacksVersion);
 		return true;
 	}
 
@@ -224,6 +229,8 @@ struct ObjCCallbackState {
 				infos[delivered].sectionLocationMetadata = nullptr;
 				infos[delivered].dyldObjCRefsOptimized = (mhs[base + i]->flags & MH_DYLIB_IN_CACHE) ? 1 : 0;
 				infos[delivered].flags = 0;
+				if ( logDelivered != nullptr )
+					logDelivered("mapped", infos[delivered].path, infos[delivered].dyldObjCRefsOptimized);
 				++delivered;
 			}
 			if ( delivered == 0 )
@@ -247,6 +254,8 @@ struct ObjCCallbackState {
 		info.sectionLocationMetadata = nullptr;
 		info.dyldObjCRefsOptimized = (mh->flags & MH_DYLIB_IN_CACHE) ? 1 : 0;
 		info.flags = 0;
+		if ( logDelivered != nullptr )
+			logDelivered("init", path, info.dyldObjCRefsOptimized);
 		init2(&info);
 	}
 

@@ -265,6 +265,7 @@ struct EnvironmentVariables {
 							//	DYLD_PRINT_REBASINGS			==> gLinkContext.verboseRebase
 							//	DYLD_PRINT_DOFS					==> gLinkContext.verboseDOF
 							//	DYLD_PRINT_APIS					==> gLogAPIs
+							//	DYLD_PRINT_OBJC_NOTIFICATIONS	==> gLogObjCNotifications (Darling only)
 							//	DYLD_IGNORE_PREBINDING			==> gLinkContext.prebindUsage
 							//	DYLD_PREBIND_DEBUG				==> gLinkContext.verbosePrebinding
 							//	DYLD_NEW_LOCAL_SHARED_REGIONS	==> gLinkContext.sharedRegionMode
@@ -327,6 +328,7 @@ static const char*					sSharedCacheSplitPolicy;	// DYLD_SHARED_CACHE_SPLIT_POLIC
        bool							gSharedCacheOverridden = false;
 ImageLoader::LinkContext			gLinkContext;
 bool								gLogAPIs = false;
+bool								gLogObjCNotifications = false;
 #if SUPPORT_ACCELERATE_TABLES
 bool								gLogAppAPIs = false;
 #endif
@@ -2326,6 +2328,9 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	}
 	else if ( strcmp(key, "DYLD_PRINT_APIS") == 0 ) {
 		gLogAPIs = true;
+	}
+	else if ( strcmp(key, "DYLD_PRINT_OBJC_NOTIFICATIONS") == 0 ) {
+		gLogObjCNotifications = true;
 	}
 #if SUPPORT_ACCELERATE_TABLES
 	else if ( strcmp(key, "DYLD_PRINT_APIS_APP") == 0 ) {

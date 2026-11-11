@@ -2302,6 +2302,16 @@ static void logObjCSkip(const char* format, const char* path)
 	dyld::log(format, path);
 }
 
+static void logObjCRegistered(unsigned version)
+{
+	dyld::log("dyld: objc register_callbacks version=%u\n", version);
+}
+
+static void logObjCDelivered(const char* kind, const char* path, unsigned refsOptimized)
+{
+	dyld::log("dyld: objc %s %s refs_optimized=%u\n", kind, path, refsOptimized);
+}
+
 void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
 {
 	if ( dyld::gLogAPIs )
@@ -2310,6 +2320,10 @@ void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
 	dyld3::darling::ObjCCallbackState& state = dyld3::darling::objcCallbackState();
 	state.markImageMutableInvoke = markImageMutableImpl;
 	state.logSkip = logObjCSkip;
+	if ( dyld::gLogObjCNotifications ) {
+		state.logRegistered = logObjCRegistered;
+		state.logDelivered = logObjCDelivered;
+	}
 	if ( !state.registerCallbacks(callbacks) )
 		dyld::halt(state.error);
 	dyld::registerObjCNotifiers(dyld3::darling::objcMappedThunk, dyld3::darling::objcInitThunk, dyld3::darling::objcUnmappedThunk);

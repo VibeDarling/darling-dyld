@@ -66,6 +66,7 @@ namespace dyld {
 	extern ImageLoader::LinkContext			gLinkContext;
 	extern struct dyld_all_image_infos*		gProcessInfo;
 	extern bool								gLogAPIs;
+	extern bool								gLogObjCNotifications;
 #if SUPPORT_ACCELERATE_TABLES
 	extern bool								gLogAppAPIs;
 #endif
