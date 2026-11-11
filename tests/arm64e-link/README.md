@@ -8,7 +8,7 @@ recipe on a toy dylib and executable.
 LD64=/path/to/aarch64-apple-darwin20-ld ruby tests/arm64e-link/arm64e-link-toy.rb
 ```
 
-Without `LD64` the test prints a `SKIP` line and exits 0. The `h0/` directory builds on the recipe for the H0 guest test (see `h0/README.md`). `ARM64E_LINK_SCRIPT`
+Without `LD64` the test prints a `SKIP` line and exits 0. The `h0/` directory builds on the recipe for the H0 guest test (see `h0/README.md`). The `abi/` directory is the L2 ABI probe: signed pointers from an arm64e executable into Darling's plain-arm64 libs (see `abi/README.md`). `ARM64E_LINK_SCRIPT`
 runs it against another copy of the script (used for mutation probes).
 
 ## Recipe
