@@ -4,7 +4,7 @@ of /usr/lib/libobjc.A.dylib and the Darling SDK's libSystem family.
 
   build_l5.py build --out DIR               # needs LD64 and SDKROOT (the Darling SDK root)
   build_l5.py check EXE [--prefix DIR]      # structural checks; --prefix also proves no stub was installed
-  build_l5.py native --out EXE [--hash-skew N]   # the same harness on the host (not Mach-O)
+  build_l5.py native --out EXE [--hash-skew N] [--policy-any]   # the same harness on the host (not Mach-O)
 
 The stub's symbols come from the compiled test's own undefined names, split against the SDK's
 libSystem exports and the checked-in libobjc import list (l5_imports.txt), so the stub and the link
@@ -113,10 +113,12 @@ def build_probe(out_dir):
     return out, stub, symbols, system, objc
 
 
-def build_native(out, hash_skew=0):
+def build_native(out, hash_skew=0, policy_any=False):
     flags = ["-DABI_NATIVE", "-O1", "-I", os.path.join(ROOT, "abi")]
     if hash_skew:
         flags.append("-DL5_HASH_SKEW=%d" % hash_skew)
+    if policy_any:
+        flags.append("-DL5_POLICY_ANY=1")
     rec.run([os.environ.get("CLANG", "clang")] + flags + [SOURCES[0], "-pthread", "-o", out], False)
     return out
 
@@ -265,10 +267,11 @@ def main(argv):
     n = sub.add_parser("native")
     n.add_argument("--out", required=True)
     n.add_argument("--hash-skew", type=int, default=0)
+    n.add_argument("--policy-any", action="store_true")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "native":
-            print("OK %s" % build_native(a.out, a.hash_skew))
+            print("OK %s" % build_native(a.out, a.hash_skew, a.policy_any))
         elif a.cmd == "build":
             os.makedirs(a.out, exist_ok=True)
             exe, stub, symbols, system, objc = build_probe(a.out)

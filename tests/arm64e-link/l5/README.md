@@ -68,7 +68,7 @@ LD64=... SDKROOT=... [PREFIX=...] ruby arm64e-l5-probe.rb
 `arm64e-l5-probe.rb` proves, without executing Mach-O: the check table lists 01-08 in order and each
 prints exactly one OKMARK line and fails before it; the native stubs fail rather than pass; the
 selftests cover every verdict class; a wrong expected verdict (`selftest-wrong`) and a wrong expected
-hash (`--hash-skew 1`) make the driver exit 1; the built executable is arm64e and the build derives
+hash (`--hash-skew 1`) make the driver exit 1, and so does a check-01 verdict that accepts any loader policy (`--policy-any`; the verdict requires `policy=cache`, while the parser still reads `disk` for c2); the built executable is arm64e and the build derives
 exactly the listed libobjc imports; the arm64e build hands `sigaction` the compiler-signed fault handler in every config (checked on the compiled assembly: `paciza`, no `xpaci`; a stripped-handler mutation is rejected), and no link-only stub is installed in the prefix, including
 one renamed to `libobjc.A.dylib` (the scan finds stubs by structure, not by name).
 

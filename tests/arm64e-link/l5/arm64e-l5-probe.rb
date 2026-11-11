@@ -126,6 +126,15 @@ Dir.mktmpdir('l5-native-') do |dir|
     check 'the check-04 hash gate rejects a wrong expected value (the -DL5_HASH_SKEW mutation)',
           !st.success? && line.any? { |l| l.include?('verdict=failed') && l.include?('EXPECT-MISMATCH') }, line.first
   end
+  anyp = File.join(dir, 'l5_native_policy_any')
+  _o, e, st = py(BUILD, 'native', '--out', anyp, '--policy-any')
+  check 'the policy mutation builds', st.success?, e[0, 300]
+  if st.success?
+    out, st = Open3.capture2e(anyp, 'selftest')
+    line = out.lines.grep(/l5_selftest_policy_line/)
+    check 'check 01 rejects a libobjc policy other than cache (the -DL5_POLICY_ANY mutation accepting any source is killed)',
+          !st.success? && line.any? { |l| l.include?('verdict=failed') && l.include?('EXPECT-MISMATCH') }, line.first
+  end
   rows.each_with_index do |(name, _fn), i|
     n = i + 1
     out, st = Open3.capture2e(bin, 'run', n.to_s)

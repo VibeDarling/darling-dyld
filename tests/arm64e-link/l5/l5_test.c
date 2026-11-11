@@ -21,6 +21,11 @@
 #ifndef L5_HASH_SKEW
 #define L5_HASH_SKEW 0
 #endif
+// The mutation for check 01's verdict: -DL5_POLICY_ANY=1 accepts any policy source, which the native
+// selftest must report as a failure (l5_selftest_policy_line).
+#ifndef L5_POLICY_ANY
+#define L5_POLICY_ANY 0
+#endif
 
 // Facts the checks gate on, never values read back from the accessors under test: 221074 =
 // 186655 occupied + 34419 duplicate class entries; the cache libobjc's __objc_classlist is 0x28 bytes.
@@ -69,6 +74,17 @@ static int l5_policy_from_log(const char *out, char *policy, int sz) {
         if (*p)
             p++;
     }
+    return 0;
+}
+
+// Check 01's verdict on a child that reported inside=1: the loader's line must exist and must say the
+// loader chose the cache. The parser reads any source (c2's control expects disk); this verdict is what
+// rejects it. Returns the failure reason, or 0 when `policy` holds "cache".
+static const char *l5_policy_verdict(const char *out, char *policy, int sz) {
+    if (!l5_policy_from_log(out, policy, sz))
+        return "no loader policy line for /usr/lib/libobjc.A.dylib";
+    if (!L5_POLICY_ANY && !streq(policy, "cache"))
+        return "the loader's policy for /usr/lib/libobjc.A.dylib is not cache";
     return 0;
 }
 
@@ -348,9 +364,10 @@ static int l5_driver(const char *self, const char *setname, const struct check *
         char policy[16];
         policy[0] = 0;
         if (i == 1 && !use_expect && streq(verdict, "ok")) {
-            if (!l5_policy_from_log(out, policy, sizeof policy)) {
+            const char *bad = l5_policy_verdict(out, policy, sizeof policy);
+            if (bad) {
                 verdict = "failed";
-                why = "no loader policy line for /usr/lib/libobjc.A.dylib";
+                why = bad;
             }
         }
         // Check 07's proof is what the loader logged about libobjc's own registration, not the child's claim.
@@ -541,6 +558,25 @@ static int l5_st_policy(void) {
         return l5_fail("policy parse accepted the tag in the middle of a line");
     if (l5_policy_from_log("no policy line here\n", p, sizeof p))
         return l5_fail("policy parse invented a source");
+    // the verdict, not the parser, decides: only a "cache" source passes check 01
+    const char *why = l5_policy_verdict("dyld: cache load source /usr/lib/libobjc.A.dylib: policy=cache "
+                                        "allow_list=hit\n", p, sizeof p);
+    if (why)
+        return l5_fail("the verdict rejected policy=cache");
+    why = l5_policy_verdict("dyld: cache load source /usr/lib/libobjc.A.dylib: policy=disk "
+                            "allow_list=miss\n", p, sizeof p);
+    if (!why || !streq(p, "disk") || !l5_starts(why, "the loader's policy"))
+        return l5_fail("the verdict accepted policy=disk, or gave it no reason");
+    why = l5_policy_verdict("dyld: cache load source /usr/lib/libobjc.A.dylib: policy=cached allow_list=hit\n",
+                            p, sizeof p);
+    if (!why)
+        return l5_fail("the verdict accepted policy=cached");
+    why = l5_policy_verdict("dyld: cache load source /usr/lib/libobjc.A.dylib: policy=\n", p, sizeof p);
+    if (!why || !l5_starts(why, "no loader policy line"))
+        return l5_fail("the verdict accepted an empty source");
+    why = l5_policy_verdict("no policy line here\n", p, sizeof p);
+    if (!why || !l5_starts(why, "no loader policy line"))
+        return l5_fail("the verdict accepted a missing line");
     l5_ok(g_check);
     return 0;
 }
