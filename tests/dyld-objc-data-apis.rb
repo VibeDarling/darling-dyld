@@ -203,6 +203,46 @@ DRIVER = <<~'CPP'
     expect("no data segment", lookupObjCSectionInfo((const struct mach_header*)mh, _dyld_section_location_data_class_list),
            NULL, 0);
 
+    // A cache-shaped image: file offsets are offsets into the cache file, so nothing sits at 0, and a
+    // __TEXT_EXEC segment precedes __TEXT at another address.
+    static uint8_t cacheImage[0x400];
+    struct mach_header_64* ch = (struct mach_header_64*)cacheImage;
+    const uint64_t cacheBase = 0x180000000ull;
+    ch->magic = 0xfeedfacf; ch->ncmds = 3;
+    struct segment_command_64* execSeg = (struct segment_command_64*)(cacheImage + sizeof(*ch));
+    execSeg->cmd = 0x19; execSeg->cmdsize = sizeof(*execSeg);
+    setName(execSeg->segname, "__TEXT_EXEC"); execSeg->vmaddr = cacheBase + 0x4000; execSeg->fileoff = 0x1c4000;
+    struct segment_command_64* cacheText = (struct segment_command_64*)((uint8_t*)execSeg + execSeg->cmdsize);
+    cacheText->cmd = 0x19; cacheText->cmdsize = sizeof(*cacheText);
+    setName(cacheText->segname, "__TEXT"); cacheText->vmaddr = cacheBase; cacheText->fileoff = 0x1cb000;
+    struct segment_command_64* cacheData = (struct segment_command_64*)((uint8_t*)cacheText + cacheText->cmdsize);
+    cacheData->cmd = 0x19; cacheData->cmdsize = sizeof(*cacheData) + sizeof(struct section_64);
+    setName(cacheData->segname, "__DATA_CONST"); cacheData->vmaddr = cacheBase + 0x200; cacheData->fileoff = 0x1cb200; cacheData->nsects = 1;
+    struct section_64* cacheSect = (struct section_64*)(cacheData + 1);
+    setName(cacheSect->sectname, "__objc_classlist"); setName(cacheSect->segname, "__DATA_CONST");
+    cacheSect->addr = cacheBase + 0x230; cacheSect->size = 0x28;
+    ch->sizeofcmds = execSeg->cmdsize + cacheText->cmdsize + cacheData->cmdsize;
+    expect("cache image class list", lookupObjCSectionInfo((const struct mach_header*)ch, _dyld_section_location_data_class_list),
+           cacheImage + 0x230, 0x28);
+    expect("cache image absent section", lookupObjCSectionInfo((const struct mach_header*)ch, _dyld_section_location_data_sel_refs),
+           NULL, 0);
+
+    // No __TEXT segment at all, whatever sits at file offset 0.
+    static uint8_t noTextImage[0x200];
+    struct mach_header_64* nt = (struct mach_header_64*)noTextImage;
+    nt->magic = 0xfeedfacf; nt->ncmds = 2;
+    struct segment_command_64* noTextExec = (struct segment_command_64*)(noTextImage + sizeof(*nt));
+    noTextExec->cmd = 0x19; noTextExec->cmdsize = sizeof(*noTextExec);
+    setName(noTextExec->segname, "__TEXT_EXEC"); noTextExec->vmaddr = base; noTextExec->fileoff = 0;
+    struct segment_command_64* noTextData = (struct segment_command_64*)((uint8_t*)noTextExec + noTextExec->cmdsize);
+    noTextData->cmd = 0x19; noTextData->cmdsize = sizeof(*noTextData) + sizeof(struct section_64);
+    setName(noTextData->segname, "__DATA_CONST"); noTextData->vmaddr = base + 0x100; noTextData->fileoff = 0x100; noTextData->nsects = 1;
+    struct section_64* noTextSect = (struct section_64*)(noTextData + 1);
+    setName(noTextSect->sectname, "__objc_classlist"); noTextSect->addr = base + 0x110; noTextSect->size = 0x28;
+    nt->sizeofcmds = noTextExec->cmdsize + noTextData->cmdsize;
+    expect("no __TEXT segment", lookupObjCSectionInfo((const struct mach_header*)nt, _dyld_section_location_data_class_list),
+           NULL, 0);
+
     // Malformed headers: a real image supplies none of these, and none may read past what the header declares.
     // The bytes after each short or lying command spell a section the walk must not believe in.
     static uint8_t shortImage[0x200];
@@ -210,7 +250,7 @@ DRIVER = <<~'CPP'
     sh->magic = 0xfeedfacf; sh->ncmds = 1;
     struct segment_command_64* shortSeg = (struct segment_command_64*)(shortImage + sizeof(*sh));
     shortSeg->cmd = 0x19; shortSeg->cmdsize = sizeof(struct load_command);
-    shortSeg->vmaddr = base; shortSeg->fileoff = 0; shortSeg->nsects = 1;
+    setName(shortSeg->segname, "__TEXT"); shortSeg->vmaddr = base; shortSeg->fileoff = 0; shortSeg->nsects = 1;
     struct section_64* shortSect = (struct section_64*)((uint8_t*)shortSeg + sizeof(struct segment_command_64));
     setName(shortSect->sectname, "__objc_classlist"); shortSect->addr = base; shortSect->size = 0x30;
     sh->sizeofcmds = sizeof(struct load_command);
@@ -222,7 +262,7 @@ DRIVER = <<~'CPP'
     oh->magic = 0xfeedfacf; oh->ncmds = 1;
     struct segment_command_64* overrunSeg = (struct segment_command_64*)(overrunImage + sizeof(*oh));
     overrunSeg->cmd = 0x19; overrunSeg->cmdsize = 0x100;
-    overrunSeg->vmaddr = base; overrunSeg->fileoff = 0; overrunSeg->nsects = 1;
+    setName(overrunSeg->segname, "__TEXT"); overrunSeg->vmaddr = base; overrunSeg->fileoff = 0; overrunSeg->nsects = 1;
     struct section_64* overrunSect = (struct section_64*)(overrunSeg + 1);
     setName(overrunSect->sectname, "__objc_classlist"); overrunSect->addr = base; overrunSect->size = 0x30;
     oh->sizeofcmds = sizeof(struct load_command);
@@ -234,7 +274,7 @@ DRIVER = <<~'CPP'
     nh->magic = 0xfeedfacf; nh->ncmds = 1;
     struct segment_command_64* nsectsSeg = (struct segment_command_64*)(nsectsImage + sizeof(*nh));
     nsectsSeg->cmd = 0x19; nsectsSeg->cmdsize = sizeof(struct segment_command_64) + sizeof(struct section_64);
-    nsectsSeg->vmaddr = base; nsectsSeg->fileoff = 0; nsectsSeg->nsects = 2;
+    setName(nsectsSeg->segname, "__TEXT"); nsectsSeg->vmaddr = base; nsectsSeg->fileoff = 0; nsectsSeg->nsects = 2;
     struct section_64* nsectsSect = (struct section_64*)(nsectsSeg + 1);
     setName(nsectsSect->sectname, "__objc_classlist"); nsectsSect->addr = base; nsectsSect->size = 0x30;
     nh->sizeofcmds = nsectsSeg->cmdsize;
@@ -246,7 +286,7 @@ DRIVER = <<~'CPP'
     lh->magic = 0xfeedfacf; lh->ncmds = 0x10000;
     struct segment_command_64* lyingSeg = (struct segment_command_64*)(lyingImage + sizeof(*lh));
     lyingSeg->cmd = 0x19; lyingSeg->cmdsize = sizeof(struct segment_command_64);
-    lyingSeg->vmaddr = base; lyingSeg->fileoff = 0; lyingSeg->nsects = 0;
+    setName(lyingSeg->segname, "__TEXT"); lyingSeg->vmaddr = base; lyingSeg->fileoff = 0; lyingSeg->nsects = 0;
     lh->sizeofcmds = sizeof(struct segment_command_64);
     expect("ncmds larger than the command area", lookupObjCSectionInfo((const struct mach_header*)lh, _dyld_section_location_data_class_list),
            NULL, 0);
@@ -276,8 +316,14 @@ Dir.mktmpdir('dyld-objc-data-apis-') do |dir|
   probes = [
     ['kind bound is exclusive', 'if ( (unsigned)kind >= (unsigned)_dyld_section_location_count )',
      'if ( (unsigned)kind > (unsigned)_dyld_section_location_count )'],
-    ['base comes from the segment at file offset 0', 'if ( seg->fileoff == 0 ) {',
-     'if ( seg->fileoff == 1 ) {'],
+    ['base comes from the __TEXT segment', 'if ( strncmp(seg->segname, "__TEXT", sizeof(seg->segname)) == 0 ) {',
+     'if ( strncmp(seg->segname, "__TEXX", sizeof(seg->segname)) == 0 ) {'],
+    ['base is not the first segment', 'if ( strncmp(seg->segname, "__TEXT", sizeof(seg->segname)) == 0 ) {',
+     'if ( true ) {'],
+    ['base is not any segment at file offset 0', 'if ( strncmp(seg->segname, "__TEXT", sizeof(seg->segname)) == 0 ) {',
+     'if ( seg->fileoff == 0 ) {'],
+    ['__TEXT_EXEC is not __TEXT', 'if ( strncmp(seg->segname, "__TEXT", sizeof(seg->segname)) == 0 ) {',
+     'if ( strncmp(seg->segname, "__TEXT", 6) == 0 ) {'],
     ['offset is relative to the image', '(sect[s].addr - imageVMBase), (size_t)sect[s].size }',
      '(sect[s].addr - imageVMBase) + 0x10, (size_t)sect[s].size }'],
     ['names compare within the field', 'strncmp(sect[s].sectname, name, sizeof(sect[s].sectname)) == 0',

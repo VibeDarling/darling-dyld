@@ -40,8 +40,8 @@ static inline void forEachSegmentCommand(const mach_header_64* hdr, F visit)
     }
 }
 
-// Offsets are relative to the mach header: the header sits at the vmaddr of the segment mapped from file
-// offset 0, and every other mapping keeps its vmaddr distance from it, so addr - that base is the in-memory offset.
+// Offsets are relative to the mach header, which sits at the vmaddr of __TEXT (as MachOLoaded::getSlide takes
+// it); a cache image's file offsets are cache-file offsets, so no segment of it is at offset 0.
 static inline struct _dyld_section_info_result lookupObjCSectionInfo(const struct mach_header* mh,
                                                                      enum _dyld_section_location_kind kind)
 {
@@ -51,7 +51,7 @@ static inline struct _dyld_section_info_result lookupObjCSectionInfo(const struc
     uint64_t imageVMBase = 0;
     bool haveVMBase = false;
     forEachSegmentCommand(hdr, [&](const segment_command_64* seg) {
-        if ( seg->fileoff == 0 ) {
+        if ( strncmp(seg->segname, "__TEXT", sizeof(seg->segname)) == 0 ) {
             imageVMBase = seg->vmaddr;
             haveVMBase = true;
             return false;
