@@ -2389,13 +2389,35 @@ static void forEachObjCName(const char* name,
 	// table and an absent one both lie outside the mapping, like a count that would place entries past
 	// its end; rejecting them here is what keeps isLoaded() from reading outside the cache.
 	const uint64_t cacheBegin = (uint64_t)(uintptr_t)cacheBase;
-	const uint64_t cacheEnd   = cacheBegin + cache->mappedSize();
+	const uint64_t mappedSize = cache->mappedSize();
+	const uint64_t cacheEnd   = cacheBegin + mappedSize;
 	const uint64_t table      = (uint64_t)(uintptr_t)images;
 	const uint64_t entries    = table + offsetof(objc_opt::objc_headeropt_rw_t, headers);
 	if ( (table < cacheBegin) || (entries > cacheEnd)
 			|| ((uint64_t)images->count * images->entsize > cacheEnd - entries) )
 		return;
-	auto visit = [callback, cacheBase, images](uint64_t objectCacheOffset, uint16_t dylibObjCIndex, bool& stopObjects) {
+	// An entry names an object only when its offset lands in a mapped region, not merely inside the span
+	// those regions cover: the split runtime leaves the rest of the region PROT_NONE. forEachRegion reports
+	// unslid mapping addresses, so the offset is applied to the first mapping's address.
+	auto inMappedRegion = [cache](uint64_t objectCacheOffset) {
+		struct Lookup { uint64_t firstAddress; uint64_t offset; bool sawFirst; bool inside; };
+		Lookup lookup = { 0, objectCacheOffset, false, false };
+		Lookup* p = &lookup;
+		cache->forEachRegion(^(const void* content, uint64_t vmAddr, uint64_t size, uint32_t initProt, uint32_t maxProt, uint64_t flags) {
+			if ( !p->sawFirst ) {
+				p->firstAddress = vmAddr;
+				p->sawFirst = true;
+			}
+			const uint64_t address = p->firstAddress + p->offset;
+			if ( (address >= vmAddr) && (address < vmAddr + size) )
+				p->inside = true;
+		});
+		return lookup.inside;
+	};
+	auto visit = [callback, cacheBase, images, &inMappedRegion](uint64_t objectCacheOffset, uint16_t dylibObjCIndex, bool& stopObjects) {
+		// The offset is cache content as well; an entry outside the mapped regions names no object.
+		if ( !inMappedRegion(objectCacheOffset) )
+			return;
 		bool stop = false;
 		bool isLoaded = images->isLoaded(dylibObjCIndex);
 		dyld3::darling::callObjCEnumerationBlock(callback, (void*)(cacheBase + objectCacheOffset), isLoaded, &stop);

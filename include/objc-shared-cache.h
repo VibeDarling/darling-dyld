@@ -249,9 +249,14 @@ protected:
             return;
         }
 
-        // The object appears in more than one header.
+        // The object appears in more than one header. The duplicates are one array for the whole table,
+        // and the table declares its length; a range past that array is cache content contradicting itself.
         uint32_t count = data.duplicateCount();
-        const ObjectData* list = &duplicateOffsets()[data.duplicateIndex()];
+        uint32_t first = data.duplicateIndex();
+        uint32_t total = duplicateCount();
+        if ( (first > total) || (count > total - first) )
+            return;
+        const ObjectData* list = &duplicateOffsets()[first];
         for ( uint32_t i = 0; i < count; ++i ) {
             bool stopObjects = false;
             callback(list[i].object.objectCacheOffset, list[i].object.dylibObjCIndex, stopObjects);
