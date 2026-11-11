@@ -81,6 +81,8 @@ Source is http://burtleburtle.net/bob/c/perfect.c
 */
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <optional>
 #ifdef CLOSURE_SELOPT_WRITE
 #include "Array.h"
 #include "Map.h"
@@ -107,6 +109,11 @@ Source is http://burtleburtle.net/bob/c/perfect.c
 #define S32(x) x = little_endian ? OSSwapHostToLittleInt32(x) : OSSwapHostToBigInt32(x)
 #define S64(x) x = little_endian ? OSSwapHostToLittleInt64(x) : OSSwapHostToBigInt64(x)
 
+// Perfect hash shared by the version-16 tables below and the legacy writer further down.
+namespace objc_opt {
+static uint64_t lookup8( uint8_t *k, size_t length, uint64_t level);
+}
+
 namespace objc {
 // The version-16 class/protocol tables (dyld-1376.6 common/OptimizerObjC.h). dyld reads these out of
 // the cache and never builds one, so only what classCount() needs is named here. The arrays follow
@@ -131,6 +138,65 @@ protected:
     }
     const StringOffset* offsets() const {
         return (const StringOffset*)&checkbytes()[capacity];
+    }
+
+    uint32_t hash(const char* key, size_t keylen) const {
+        uint64_t val   = objc_opt::lookup8((uint8_t*)key, keylen, salt);
+        uint32_t index = (uint32_t)((shift == 64) ? 0 : (val >> shift)) ^ scramble[tab[val & mask]];
+        return index;
+    }
+
+    uint32_t hash(const char* key) const {
+        return hash(key, strlen(key));
+    }
+
+    // Reject strings that are not in the table without paging in the cstring data.
+    CheckByteType checkbyte(const char* key, size_t keylen) const {
+        return ((key[0] & 0x7) << 5) | ((uint8_t)keylen & 0x1f);
+    }
+
+    CheckByteType checkbyte(const char* key) const {
+        return checkbyte(key, strlen(key));
+    }
+
+    std::optional<uint32_t> tryGetIndex(const char* key) const {
+        size_t   keylen = strlen(key);
+        uint32_t h      = hash(key, keylen);
+
+        CheckByteType h_check   = checkbytes()[h];
+        CheckByteType key_check = checkbyte(key, keylen);
+        if ( h_check != key_check )
+            return {};
+
+        StringOffset offset = offsets()[h];
+        if ( offset == 0 )
+            return {};
+
+        const char* result = (const char*)this + offset;
+        if ( 0 != strcmp(key, result) )
+            return {};
+
+        return h;
+    }
+};
+
+// Precomputed version-16 selector table. The cache's selector table starts with a version word,
+// so its fields sit one word later than the version-15 objc_stringhash_t below.
+class SelectorHashTable : public StringHashTable {
+public:
+    // Readers that walk the table directly (dyld_shared_cache_util.cpp) use these names.
+    using StringHashTable::capacity;
+    using StringHashTable::offsets;
+    using StringHashTable::tryGetIndex;
+
+    const char* get(const char* key) const {
+        if ( std::optional<uint32_t> index = tryGetIndex(key) )
+            return getEntryForIndex(*index);
+        return nullptr;
+    }
+
+    const char* getEntryForIndex(uint32_t index) const {
+        return (const char*)this + offsets()[index];
     }
 };
 
@@ -174,8 +240,6 @@ namespace objc_opt {
 
 typedef int32_t objc_stringhash_offset_t;
 typedef uint8_t objc_stringhash_check_t;
-
-static uint64_t lookup8( uint8_t *k, size_t length, uint64_t level);
 
 #if defined(SELOPT_WRITE) || defined(CLOSURE_SELOPT_WRITE)
 
@@ -230,8 +294,8 @@ static void make_perfect(const string_map& strings, perfect_hash& phash);
 #endif // defined(SELOPT_WRITE)
 
 
-// Precomputed perfect hash table of strings.
-// Base class for precomputed selector table and class table.
+// Version-15 perfect hash table of strings.
+// Base class for the version-15 class and protocol tables.
 // Edit objc-sel-table.s if you change this structure.
 struct __attribute__((packed)) objc_stringhash_t {
     uint32_t capacity;
@@ -407,29 +471,21 @@ struct __attribute__((packed)) objc_stringhash_t {
 #endif
 };
 
-// Precomputed selector table.
-// Edit objc-sel-table.s if you change this structure.
-struct objc_selopt_t : objc_stringhash_t {
+// Precomputed version-16 selector table: a StringHashTable whose offsets() point at the strings.
+struct objc_selopt_t : objc::SelectorHashTable {
 
-    const char* getEntryForIndex(uint32_t index) const {
-        return (const char *)this + offsets()[index];
-    }
-
+    // Names kept for the version-15 readers.
     uint32_t getIndexForKey(const char *key) const {
-        return getIndex(key);
+        std::optional<uint32_t> index = tryGetIndex(key);
+        return index.has_value() ? *index : INDEX_NOT_FOUND;
     }
 
     uint32_t getSentinelIndex() const {
         return INDEX_NOT_FOUND;
     }
 
-    const char* get(const char *key) const
-    {
-        uint32_t h = getIndex(key);
-        if (h == INDEX_NOT_FOUND) return NULL;
-        return getEntryForIndex(h);
-    }
-
+    // The version-15 name for the table size. Its only caller bounds the 24-bit selector
+    // indices in SelectorReferenceFixup, and those indices range over capacity, not occupancy.
     size_t usedCount() const {
         return capacity;
     }
