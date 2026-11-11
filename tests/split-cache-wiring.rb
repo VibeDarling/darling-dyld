@@ -308,6 +308,7 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
   # --- libdyld asks every mapped cache for its objc tables: a split cache has none of the dyld3 image arrays ---
   cache_src = File.read("#{root}/dyld3/shared-cache/DyldSharedCache.cpp")
   objc_opt_fn = cache_src[/^const objc_opt::objc_opt_t\* DyldSharedCache::objcOpt\(\) const \{.*?^\}/m] or abort 'objcOpt missing'
+  objc_ptrs_fn = cache_src[/^const void\* DyldSharedCache::objcOptPtrs\(\) const \{.*?^\}/m] or abort 'objcOptPtrs missing'
   objc_range_fn = cache_src[/^std::pair<const void\*, uint64_t> DyldSharedCache::getObjCConstantRange\(\) const \{.*?^\}/m] or abort 'getObjCConstantRange missing'
   run_cpp(dir, 'objc', <<~CPP, root)
     #{COMMON}
@@ -322,23 +323,30 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
                           struct ImageArray { const Image* imageForNum(uint32_t) const { static Image i; return &i; } }; }
       struct MachOAnalyzer {
         struct SegmentInfo { const char* segName; };
-        struct SectionInfo { SegmentInfo segInfo; uint64_t sectAddr; const char* sectName; };
+        struct SectionInfo { SegmentInfo segInfo; uint64_t sectAddr; const char* sectName; uint64_t sectSize; };
         int64_t getSlide() const { return 0; }
+        uint32_t pointerSize() const { return 8; }
         void forEachSection(void (^cb)(const SectionInfo&, bool, bool&)) const {
-          SectionInfo info = { { "__TEXT" }, (uint64_t)(uintptr_t)&gOpt, "__objc_opt_ro" }; bool stop = false; cb(info, false, stop);
+          SectionInfo info = { { "__TEXT" }, (uint64_t)(uintptr_t)&gOpt, "__objc_opt_ro", sizeof gOpt }; bool stop = false; cb(info, false, stop);
         }
         const void* findSectionContent(const char*, const char*, uint64_t& size) const { size = sizeof gRanges; return gRanges; }
       };
     }
     struct DyldSharedCache {
       bool split = false;
+      uint32_t imageIndex = 0, imagesCount = 1;
+      mutable int entryCalls = 0;
       bool isSplitCache() const { return split; }
-      bool hasImagePath(const char*, uint32_t& index) const { index = 0; return true; }
+      bool hasImagePath(const char*, uint32_t& index) const { index = imageIndex; return true; }
+      void imageTable(uint32_t& count) const { count = imagesCount; }
+      const void* getIndexedImageEntry(uint32_t, uint64_t&, uint64_t&) const { ++entryCalls; return &gOpt; }
       const dyld3::closure::ImageArray* cachedDylibsImageArray() const { ++arrayCalls; static dyld3::closure::ImageArray a; return &a; }
       const objc_opt::objc_opt_t* objcOpt() const;
+      const void* objcOptPtrs() const;
       std::pair<const void*, uint64_t> getObjCConstantRange() const;
     };
     #{objc_opt_fn}
+    #{objc_ptrs_fn}
     #{objc_range_fn}
     int main() {
       DyldSharedCache cache;
@@ -346,13 +354,17 @@ Dir.mktmpdir('split-cache-wiring-') do |dir|
       CHECK(cache.objcOpt() == &gOpt);
       CHECK(cache.getObjCConstantRange().first == gRanges && cache.getObjCConstantRange().second == sizeof gRanges);
       CHECK(arrayCalls > 0);
-      // a split cache has no tables to give and the image array (which it does not have) is never read
+      // a split cache finds libobjc through its image table; the image array (which it does not have) is never read
       arrayCalls = 0; cache.split = true;
-      CHECK(cache.objcOpt() == nullptr);
+      CHECK(cache.objcOpt() == &gOpt);
       CHECK(cache.getObjCConstantRange().first == nullptr && cache.getObjCConstantRange().second == 0);
       CHECK(arrayCalls == 0);
+      // an index from a corrupt trie that the image table does not hold is rejected before the entry is read
+      cache.imageIndex = 1; cache.entryCalls = 0;
+      CHECK(cache.objcOpt() == nullptr && cache.objcOptPtrs() == nullptr);
+      CHECK(cache.entryCalls == 0);
       if (failures) { printf("%d failure(s)\\n", failures); return 1; }
-      puts("PASS objc tables of a split cache are absent, not read through a missing image array");
+      puts("PASS objc tables of a split cache are read through the image table, not a missing image array");
       return 0;
     }
   CPP

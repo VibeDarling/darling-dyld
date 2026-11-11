@@ -1587,21 +1587,32 @@ const uint8_t* DyldSharedCache::legacyCacheDataRegionBuffer() const
 
 #if !BUILDING_LIBDSC
 const objc_opt::objc_opt_t* DyldSharedCache::objcOpt() const {
-    // A split cache has no dyld3 image array to find libobjc through, and libdyld asks every mapped cache.
-    if ( isSplitCache() )
-        return nullptr;
-
-    // Find the objc image
+    // Find the objc image. A split cache has no dyld3 image array, so libobjc is located through
+    // its image table and the array is never read.
     const dyld3::MachOAnalyzer* objcMA = nullptr;
 
     uint32_t imageIndex;
-    if ( hasImagePath("/usr/lib/libobjc.A.dylib", imageIndex) ) {
-        const dyld3::closure::ImageArray* images = cachedDylibsImageArray();
-        const dyld3::closure::Image* image = images->imageForNum(imageIndex+1);
-        objcMA = (const dyld3::MachOAnalyzer*)((uintptr_t)this + image->cacheOffset());
-    } else {
+    if ( !hasImagePath("/usr/lib/libobjc.A.dylib", imageIndex) )
         return nullptr;
+    if ( isSplitCache() ) {
+        // hasImagePath decodes the index from the dylibs trie, which is untrusted cache content
+        uint32_t imagesCount;
+        imageTable(imagesCount);
+        if ( imageIndex >= imagesCount )
+            return nullptr;
+        uint64_t mTime, inode;
+        objcMA = (const dyld3::MachOAnalyzer*)getIndexedImageEntry(imageIndex, mTime, inode);
+    } else {
+        const dyld3::closure::ImageArray* images = cachedDylibsImageArray();
+        if ( images == nullptr )
+            return nullptr;
+        const dyld3::closure::Image* image = images->imageForNum(imageIndex+1);
+        if ( image == nullptr )
+            return nullptr;
+        objcMA = (const dyld3::MachOAnalyzer*)((uintptr_t)this + image->cacheOffset());
     }
+    if ( objcMA == nullptr )
+        return nullptr;
 
     // If we found the objc image, then try to find the read-only data inside.
     __block const uint8_t* objcROContent = nullptr;
@@ -1612,6 +1623,11 @@ const objc_opt::objc_opt_t* DyldSharedCache::objcOpt() const {
         if (strcmp(info.sectName, "__objc_opt_ro") != 0)
             return;
         if ( malformedSectionRange ) {
+            stop = true;
+            return;
+        }
+        // the section must hold the whole version-16 objc_opt_t the caller will read
+        if ( info.sectSize < sizeof(objc_opt::objc_opt_t) ) {
             stop = true;
             return;
         }
@@ -1626,17 +1642,32 @@ const objc_opt::objc_opt_t* DyldSharedCache::objcOpt() const {
 }
 
 const void* DyldSharedCache::objcOptPtrs() const {
-    // Find the objc image
+    // Find the objc image. A split cache has no dyld3 image array, so libobjc is located through
+    // its image table and the array is never read.
     const dyld3::MachOAnalyzer* objcMA = nullptr;
 
     uint32_t imageIndex;
-    if ( hasImagePath("/usr/lib/libobjc.A.dylib", imageIndex) ) {
-        const dyld3::closure::ImageArray* images = cachedDylibsImageArray();
-        const dyld3::closure::Image* image = images->imageForNum(imageIndex+1);
-        objcMA = (const dyld3::MachOAnalyzer*)((uintptr_t)this + image->cacheOffset());
-    } else {
+    if ( !hasImagePath("/usr/lib/libobjc.A.dylib", imageIndex) )
         return nullptr;
+    if ( isSplitCache() ) {
+        // hasImagePath decodes the index from the dylibs trie, which is untrusted cache content
+        uint32_t imagesCount;
+        imageTable(imagesCount);
+        if ( imageIndex >= imagesCount )
+            return nullptr;
+        uint64_t mTime, inode;
+        objcMA = (const dyld3::MachOAnalyzer*)getIndexedImageEntry(imageIndex, mTime, inode);
+    } else {
+        const dyld3::closure::ImageArray* images = cachedDylibsImageArray();
+        if ( images == nullptr )
+            return nullptr;
+        const dyld3::closure::Image* image = images->imageForNum(imageIndex+1);
+        if ( image == nullptr )
+            return nullptr;
+        objcMA = (const dyld3::MachOAnalyzer*)((uintptr_t)this + image->cacheOffset());
     }
+    if ( objcMA == nullptr )
+        return nullptr;
 
     // If we found the objc image, then try to find the read-only data inside.
     __block const void* objcPointersContent = nullptr;

@@ -18,6 +18,7 @@ PAGE = 0x4000
 STUB_SLOT_OFF = 3 * PAGE + 0x100 + 8 * 2   # entry 2 of the page-3 matrix: IA, address diversity, diversity 0
 REGION_SIZE = 0x40000
 INSTALL_NAME = b"/usr/lib/libmini.dylib"
+OBJC_NAME = b"/usr/lib/libobjc.A.dylib"
 
 # dyld_cache_header offsets
 H_MAGIC, H_MAPPING_OFF, H_MAPPING_CNT, H_IMAGES_OFF, H_IMAGES_CNT = 0x00, 0x10, 0x14, 0x18, 0x1C
@@ -35,6 +36,7 @@ VARIANTS = [
     "main_wx", "slide_outside_file", "sub_outside_region", "chain_start_unaligned", "main_count_mismatch", "page_starts_range",
     "page_starts_truncated", "chain_leaves_page", "chain_start_outside", "unknown_slide_version",
     "target_outside_region", "bad_page_size", "auth_target_outside_region", "no_auth", "patch", "patch_high",
+    "objc", "objc_no_ro", "objc_no_ptrs", "objc_short_ro",
 ]
 
 
@@ -272,10 +274,36 @@ def build_patch(base, value_add, rt, image0_addr, image0_path, patch_vm):
                 pages=3, plain=slots_in_chains - n_auth, auth=n_auth, mappings=3)
 
 
+def libobjc_macho(addr, with_ro, with_ptrs, ro_size=0x30):
+    """A bare version-16 libobjc: one 152-byte segment command per section, written with the same pack
+    formats as the libmini image. The __objc_opt_ro content is a version-16 objc_opt_t prefix; ro_size
+    can make the section shorter than the struct the accessor reads."""
+    img = bytearray(0x200)
+    ncmds = int(with_ro) + int(with_ptrs)
+    struct.pack_into("<IIIIIIII", img, 0, 0xFEEDFACF, 0x0100000C, 0x80000002, 6, ncmds, 152 * ncmds, 0, 0)
+    off = 32
+    ro_addr = ptrs_addr = 0
+    if with_ro:
+        ro_addr = addr + 0x180
+        sect = struct.pack("<16s16sQQIIIIIIII", b"__objc_opt_ro", b"__TEXT", ro_addr, ro_size, 0x980, 3, 0, 0, 0, 0, 0, 0)
+        struct.pack_into("<II16sQQQQIIII", img, off, 0x19, 152, b"__TEXT", addr, 0x200, 0x800, 0x200, 5, 5, 1, 0)
+        img[off + 72:off + 152] = sect
+        struct.pack_into("<II", img, 0x180, 16, 6)     # version, flags
+        off += 152
+    if with_ptrs:
+        ptrs_addr = addr + 0x1C0
+        sect = struct.pack("<16s16sQQIIIIIIII", b"__objc_opt_ptrs", b"__DATA", ptrs_addr, 8, 0x9C0, 3, 0, 0, 0, 0, 0, 0)
+        struct.pack_into("<II16sQQQQIIII", img, off, 0x19, 152, b"__DATA", ptrs_addr, 8, 0x9C0, 8, 3, 3, 1, 0)
+        img[off + 72:off + 152] = sect
+        struct.pack_into("<Q", img, 0x1C0, 0x8000000000000123)
+    return bytes(img), ro_addr, ptrs_addr
+
+
 def build(base, variant):
     files = {}
     v = variant
     patch = v in ("patch", "patch_high")
+    with_objc = v in ("objc", "objc_no_ro", "objc_no_ptrs", "objc_short_ro")
     patch_vm = PATCH_VM_HIGH if v == "patch_high" else PATCH_VM
     region_size = patch_vm + 0x40000 if patch else REGION_SIZE
     # Real caches have value_add == region start; the fixture offsets it so that code which ignored
@@ -307,6 +335,17 @@ def build(base, variant):
     struct.pack_into("<II16sQQQQIIII", macho, 32 + lc_size, 0x19, 152, b"__TEXT", image_addr, PAGE, 0, PAGE, 5, 5, 1, 0)
     macho[32 + lc_size + 72:32 + lc_size + 152] = sect
     macho[0x400:0x400 + len(stub)] = stub
+    # An optional second image in the same text page: a fake version-16 libobjc with the two
+    # sections the cache accessors read.
+    objc_addr = image_addr + 0x800
+    objc_ro_addr = objc_ptrs_addr = 0
+    if with_objc:
+        objc_img, objc_ro_addr, objc_ptrs_addr = libobjc_macho(objc_addr, v != "objc_no_ro", v != "objc_no_ptrs",
+                                                               2 if v == "objc_short_ro" else 0x30)
+        # A section shorter than objc_opt_t must be ignored, so the expected result is absent.
+        if v == "objc_short_ro":
+            objc_ro_addr = 0
+        macho[0x800:0x800 + len(objc_img)] = objc_img
     sub1_addr = {"sub_overlap": text_addr - 0x4000, "sub_outside_region": base + REGION_SIZE}.get(v, text_addr)
     h1 = header(sub1_addr, 0,
                 magic=b"dyld_v1   arm64" if v == "sub_bad_magic" else b"dyld_v1  arm64e",
@@ -420,7 +459,7 @@ def build(base, variant):
         struct.pack_into("<QQ", h, 0x98, extra["blob_addr"], extra["blob_size"])
     struct.pack_into("<II", h, H_SUBCACHE_OFF, 0x300, 3 if patch else 2)
     struct.pack_into("<II", h, H_IMAGES_OFF_SPLIT, main_len - 16 if v == "image_table_outside" else 0x400,
-                     0 if v == "main_not_split" else (1 + len(extra["images"]) if patch else 1))
+                     0 if v == "main_not_split" else (1 + len(extra["images"]) if patch else 1) + (1 if with_objc else 0))
     struct.pack_into("<I", h, H_TRIE_SIZE, 0)
     sig_off, sig_size = main_len + (0x1000 if v == "bad_codesig" else 0), 0
     if v == "sig_before_eof":
@@ -445,6 +484,9 @@ def build(base, variant):
     path_off = 0x500
     m[0x400:0x420] = struct.pack("<QQQII", image_addr, 0, 0, path_off, 0)
     m[path_off:path_off + len(INSTALL_NAME) + 1] = INSTALL_NAME + b"\0"
+    if with_objc:
+        m[0x420:0x440] = struct.pack("<QQQII", objc_addr, 0, 0, 0x600, 0)
+        m[0x600:0x600 + len(OBJC_NAME) + 1] = OBJC_NAME + b"\0"
     if patch:
         files["cache.03.patch"] = extra["file"]
         next_path = path_off + 0x20
@@ -467,7 +509,10 @@ def build(base, variant):
             plain_n += 1
             expect.append((data_addr + off, (value_add + (raw & (2 ** 34 - 1))) | (((raw >> 34) & 0xFF) << 56)))
     manifest = ["base 0x%x" % base,
-                "image 0x%x %s" % (image_addr, INSTALL_NAME.decode()),
+                "image 0x%x %s" % (image_addr, INSTALL_NAME.decode())]
+    if with_objc:
+        manifest.append("objc 0x%x 0x%x 0x%x" % (objc_addr, objc_ro_addr, objc_ptrs_addr))
+    manifest += [
                 "stats files=%d mappings=%d pages=%d plain=%d auth=%d" % (
                     4 if patch else 3, 6 if patch else 3, len([x for x in starts if x != 0xFFFF]) + (extra["pages"] if patch else 0),
                     plain_n + (extra["plain"] if patch else 0), auth_n + (extra["auth"] if patch else 0)),

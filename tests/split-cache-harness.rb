@@ -14,8 +14,71 @@ module SplitCacheHarness
           struct MachOFile { static uint64_t read_uleb128(Diagnostics&, const uint8_t*&p, const uint8_t*end) { uint64_t r = 0; int sh = 0; while (p < end) { uint8_t b = *p++; r |= (uint64_t)(b & 0x7f) << sh; sh += 7; if (!(b & 0x80)) break; } return r; } };
   STUB
 
+  # Optional support for the Objective-C cache accessors. The dyld3 Mach-O layer is not built for the
+  # host, so the section walk reads the LC_SEGMENT_64 table the fixture writes and exposes the fields
+  # forEachSection gives the accessor. cachedDylibsImageArray is null by construction: a split cache
+  # has no image array and reaching it is a test failure.
+  OBJC_TYPES = <<~'CPP'.strip
+    struct mach_header_64 { uint32_t magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved; };
+    struct load_command { uint32_t cmd, cmdsize; };
+    struct segment_command_64 { uint32_t cmd, cmdsize; char segname[16]; uint64_t vmaddr, vmsize, fileoff, filesize; uint32_t maxprot, initprot, nsects, flags; };
+    struct section_64 { char sectname[16], segname[16]; uint64_t addr, size; uint32_t offset, align, reloff, nreloc, flags, reserved1, reserved2, reserved3; };
+    namespace dyld3 { namespace closure {
+      struct Image { uint32_t cacheOffset() const { return 0; } };
+      struct ImageArray { const Image *imageForNum(uint32_t) const { return nullptr; } };
+    } }
+    namespace dyld3 {
+      struct MachOAnalyzer {
+        struct SegmentInfo { const char *segName; };
+        struct SectionInfo { SegmentInfo segInfo; const char *sectName; uint64_t sectAddr, sectSize; };
+        int64_t getSlide() const {
+          const mach_header_64 *mh = (const mach_header_64 *)this;
+          const uint8_t *p = (const uint8_t *)this + sizeof(mach_header_64);
+          for (uint32_t i = 0; i < mh->ncmds; ++i) {
+            const load_command *cmd = (const load_command *)p;
+            if ( cmd->cmd == 0x19 && !strcmp(((const segment_command_64 *)cmd)->segname, "__TEXT") )
+              return (int64_t)((uintptr_t)this - ((const segment_command_64 *)cmd)->vmaddr);
+            p += cmd->cmdsize;
+          }
+          return 0;
+        }
+        uint32_t pointerSize() const { return 8; }
+        void forEachSection(void (^cb)(const SectionInfo&, bool, bool&)) const {
+          const mach_header_64 *mh = (const mach_header_64 *)this;
+          const uint8_t *p = (const uint8_t *)this + sizeof(mach_header_64);
+          bool stop = false;
+          for (uint32_t i = 0; i < mh->ncmds && !stop; ++i) {
+            const load_command *cmd = (const load_command *)p;
+            if ( cmd->cmd == 0x19 ) {
+              const segment_command_64 *seg = (const segment_command_64 *)cmd;
+              const section_64 *sects = (const section_64 *)(seg + 1);
+              for (uint32_t j = 0; j < seg->nsects && !stop; ++j) {
+                SectionInfo info = { { seg->segname }, sects[j].sectname, sects[j].addr, sects[j].size };
+                bool malformed = (sects[j].addr < seg->vmaddr) || (sects[j].addr + sects[j].size > seg->vmaddr + seg->filesize);
+                cb(info, malformed, stop);
+              }
+            }
+            p += cmd->cmdsize;
+          }
+        }
+      };
+    }
+  CPP
+  OBJC_DECLS = <<~'CPP'.strip
+      const dyld3::closure::ImageArray *cachedDylibsImageArray() const;
+      const objc_opt::objc_opt_t *objcOpt() const;
+      const void *objcOptPtrs() const;
+  CPP
+  OBJC_DEFS = <<~'CPP'.strip
+    static unsigned gCachedDylibsImageArrayCalls = 0;
+    const dyld3::closure::ImageArray *DyldSharedCache::cachedDylibsImageArray() const {
+      ++gCachedDylibsImageArrayCalls;
+      return nullptr;
+    }
+  CPP
+
   # C++ source up to and including "using namespace dyld3;".
-  def self.prefix(root, real_trie: false)
+  def self.prefix(root, real_trie: false, objc: false)
     runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
     loaded_src = File.read("#{root}/dyld3/MachOLoaded.cpp")
     cache_src = File.read("#{root}/dyld3/shared-cache/DyldSharedCache.cpp")
@@ -55,6 +118,7 @@ module SplitCacheHarness
     #include <string>
     #include <vector>
     #include <set>
+    #{objc ? '#include "objc-shared-cache.h"' : ''}
     #define DARLING 1
     #define TARGET_OS_SIMULATOR 0
     #define __offsetof offsetof
@@ -85,6 +149,7 @@ module SplitCacheHarness
       #{real_trie ? REAL_TRIE : NO_TRIE}
       #{sign_pointer}
     }
+    #{objc ? OBJC_TYPES : ''}
     struct DyldSharedCache {
       dyld_cache_header header;
       const dyld_cache_image_info *imageTable(uint32_t&) const;
@@ -99,7 +164,9 @@ module SplitCacheHarness
       uint64_t unslidLoadAddress() const;
       #{log_func}
       #{patch_decls}
+      #{objc ? OBJC_DECLS : ''}
     };
+    #{objc ? OBJC_DEFS : ''}
     #{image_helper}
     #{image_funcs.join("\n")}
     #{patch_reader}

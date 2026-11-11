@@ -3682,6 +3682,9 @@ static bool useCacheImageWithoutClosure(const char* path, const dyld3::SharedCac
 	const bool splitCache = sSharedCacheLoadInfo.loadAddress->isSplitCache();
 	const dyld3::SharedCacheLoadSource source = dyld3::chooseSharedCacheLoadSource(splitCache, true, existsOnDisk,
 																				  found.pathInCache, dyld3::sharedCacheAllowList());
+	const bool allowListed = dyld3::sharedCachePathIsAllowListed(found.pathInCache, dyld3::sharedCacheAllowList());
+	dyld::log("cache load source %s: policy=%s allow_list=%s\n", found.pathInCache ? found.pathInCache : path,
+			  source == dyld3::kSharedCacheLoadFromCache ? "cache" : "disk", allowListed ? "hit" : "miss");
 	if ( source == dyld3::kSharedCacheLoadFromDisk )
 		return false;
 	// the stat was of a disk file that the cache now shadows: its inode and mtime must not end up on the cache image
