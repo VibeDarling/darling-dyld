@@ -255,10 +255,10 @@ def matrix_assignments_ok(script, root)
   # every guest run through the launcher's environment)
   code = script.lines.reject { |l| l.lstrip.start_with?('#') }.join
   code.scan('DYLD_SHARED_CACHE_SPLIT_DIR=').size == 1 &&
-    code.scan(/(?:\A|[;[:space:]"])E=/).size == 1 && code.scan(/(?:\A|[;[:space:]"])C=/).size == 1 &&
+    code.scan(/\bE=/).size == 1 && code.scan(/\bC=/).size == 1 &&
     log.include?("E=#{probe}/l4_probe_arm64e; C=#{probe}/l4_probe_arm64") &&
     log.scan('DYLD_SHARED_CACHE_SPLIT_DIR=').size == 1 &&
-    log.scan(/(?:\A|[;[:space:]])E=/).size == 1 && log.scan(/(?:\A|[;[:space:]])C=/).size == 1 &&
+    log.scan(/\bE=/).size == 1 && log.scan(/\bC=/).size == 1 &&
     log[/PROBE_CONFIG=c1[^;]*/].to_s == 'PROBE_CONFIG=c1 $C' &&
     log[/PROBE_CONFIG=c2[^;]*/].to_s == 'PROBE_CONFIG=c2 $E' &&
     log[/PROBE_CONFIG=c3[^;]*/].to_s == "PROBE_CONFIG=c3 DYLD_SHARED_CACHE_SPLIT_DIR=#{cache} $E" &&
