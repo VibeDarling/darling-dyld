@@ -256,6 +256,7 @@ def matrix_records_ok(log, root)
     File.write(path, stub)
     FileUtils.chmod(0o755, path)
   end
+  return false unless log.lines.size == 1
   line = log[%r{/bin/bash -c (.*)}, 1].to_s
   return false if line.empty?
   _o, _e, st = Open3.capture3({ 'RECORDS' => records }, '/bin/bash', '-c', line.gsub('/Volumes/SystemRoot', ''))
@@ -292,6 +293,10 @@ Dir.mktmpdir('l4-matrix-') do |dir|
         matrix_policy_ok(MATRIX, dir)
   check 'run_matrix.sh runs c1 on the plain control, c2 and c3 on the arm64e probe, gives only c3 the cache directory and self-tests both builds',
         matrix_assignments_ok(MATRIX, File.join(dir, 'assign'))
+  mroot = File.join(dir, 'multiline')
+  mlog = matrix_commands(MATRIX, mroot, {})
+  check 'run_matrix log extraction accepts one line and rejects a log with more lines',
+        matrix_records_ok(mlog, mroot) && !matrix_records_ok(mlog + "# noise\n", mroot)
   matrix_probes = [
     ['the policy is never set', '$policy \\$E', ' \\$E'],
     ['the policy is set on every command', 'PROBE_CONFIG=c2 \\$E', 'PROBE_CONFIG=c2 DYLD_SHARED_CACHE_SPLIT_POLICY=/x \\$E'],
@@ -321,6 +326,10 @@ Dir.mktmpdir('l4-matrix-') do |dir|
      'C=$g/l4_probe_arm64e; PROBE_CONFIG=c1 \\$C'],
     ['the control variable is reassigned with a tab before c1', 'cmd="$cmd; PROBE_CONFIG=c1 \\$C"',
      'cmd="$cmd;' + "\t" + 'C=$g/l4_probe_arm64e; PROBE_CONFIG=c1 \\$C"'],
+    ['the control variable is set as an array element', 'PROBE_CONFIG=c1 \\$C',
+     'C[0]=$g/l4_probe_arm64e; PROBE_CONFIG=c1 \\$C'],
+    ['the control variable is set through printf -v', 'PROBE_CONFIG=c1 \\$C',
+     'printf -v C $g/l4_probe_arm64e; PROBE_CONFIG=c1 \\$C'],
     ['the cache directory is exported on the host side', "set -u\n",
      "set -u\nexport DYLD_SHARED_CACHE_SPLIT_DIR=/x\n"]
   ]

@@ -115,17 +115,18 @@ defect on the built binary (authenticated vtable binds with addend 0). When the 
 
 ## Host validation (this branch)
 
-Host test: 161 checks, `ALL PASS`, with LD64, SDKROOT, LIBCXX_INCLUDE, DARLING_USR_LIB and CACHE_EXPORTS_DIR
-(the T0 export lists) set (155 without the two library environments, whose six checks SKIP). The native part needs only clang and g++; the plain dylib is built and checked in the Mach-O part (plain arm64,
+Host test: 164 checks, `ALL PASS`, with LD64, SDKROOT, LIBCXX_INCLUDE, DARLING_USR_LIB and CACHE_EXPORTS_DIR
+(the T0 export lists) set (158 without the two library environments, whose six checks SKIP). The native part needs only clang and g++; the plain dylib is built and checked in the Mach-O part (plain arm64,
 no PAC instruction, the two libc++ imports, system install names; a copy with one PAC instruction and the arm64e executable are refused). The native part alone needs only clang and g++.
 Native run (libstdc++, aarch64 Linux, no PAC): 36 `ok` (the 26 plan checks, x1..x8, y1 and y2), the two q1 checks and z1..z8 `failed` (the plain Mach-O
 dylib cannot be loaded), `expect_mismatches=0`; with `PROBE_CONFIG=c3` exactly checks 1, 2 and z1..z8 mismatch, and a
 configuration that only extends a key (`c1x`, `c2x`) or is unknown mismatches on all 46.
 The harness's own changes are tested natively on code extracted from or rebuilt out of `../abi/abi_harness.c` and
-`run_matrix.sh`, with 34 probes: the handler policy (signed under c2 and c3, stripped everywhere else; 6), the filter for
-dyld's adapter warnings (6), the matrix runner's policy variable (5) and its config-to-probe assignment (11: c1 on the plain
+`run_matrix.sh`, with 36 probes: the handler policy (signed under c2 and c3, stripped everywhere else; 6), the filter for
+dyld's adapter warnings (6), the matrix runner's policy variable (5) and its config-to-probe assignment (13: c1 on the plain
 control, c2/c3 on the arm64e probe, the cache directory on c3 only and assigned once in the script and once in the generated
-command, the executable variables assigned once, both builds in the self-test), and the driver's exit-137, adapter-warning,
+command, the executable variables assigned once, both builds in the self-test, and two records-only reassignments the
+command text cannot show, `C[0]=` and `printf -v C`), and the driver's exit-137, adapter-warning,
 required-text, exact-key and hang branches (6). Mutation probes on the checks: 20, each rebuilt natively and each changing the verdict of exactly the named check:
 dropped rethrow (05), a changed value through the frames (04), the cleanup destructor order (07), a
 non-caught exception type (08, faulted), a lambda that does not throw (09), `catch(...)` replaced (06,
