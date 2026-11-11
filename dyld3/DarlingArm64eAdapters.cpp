@@ -161,9 +161,10 @@ uint64_t callThunkHelperAddress()
 	return (uint64_t)&callRow;
 }
 
-// Saves x0-x7 below a frame record, then helper(regs, row, real) does the work and returns the result in x0. Both
-// directions use this template; the row is whichever table the helper reads.
-static size_t emitCallThunkWith(uint32_t* words, const void* row, uint64_t real, uint64_t helper)
+// Saves x0-x7 below a frame record, then helper(regs, row, real, aux) does the work and returns the result in x0. Both
+// directions use this template; the row is whichever table the helper reads, and aux is the reverse direction's entry
+// predicate (0 forward, where the helper does not read x3).
+static size_t emitCallThunkWith(uint32_t* words, const void* row, uint64_t real, uint64_t aux, uint64_t helper)
 {
 	static const uint32_t kTemplate[14] = {
 		0xA9BB7BFD,		// stp x29, x30, [sp, #-80]!
@@ -175,29 +176,30 @@ static size_t emitCallThunkWith(uint32_t* words, const void* row, uint64_t real,
 		0x910043E0,		// add x0, sp, #16
 		0x580000E1,		// ldr x1, row
 		0x58000102,		// ldr x2, real
-		0x58000130,		// ldr x16, helper
+		0x58000123,		// ldr x3, aux
+		0x58000150,		// ldr x16, helper
 		0xD63F0200,		// blr x16
 		0xA8C57BFD,		// ldp x29, x30, [sp], #80
 		0xD65F03C0,		// ret
-		0xD503201F,		// nop (the literals are 8 aligned)
 	};
 	memcpy(words, kTemplate, sizeof(kTemplate));
 	putLiteral(&words[14], (uint64_t)row);
 	putLiteral(&words[16], real);
-	putLiteral(&words[18], helper);
-	return 20;
+	putLiteral(&words[18], aux);
+	putLiteral(&words[20], helper);
+	return 22;
 }
 
 size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real)
 {
-	return emitCallThunkWith(words, row, real, callThunkHelperAddress());
+	return emitCallThunkWith(words, row, real, 0, callThunkHelperAddress());
 }
 
-static uint64_t callReverseRow(uint64_t* regs, const ReverseRow* row, uint64_t real);
+static uint64_t callReverseRow(uint64_t* regs, const ReverseRow* row, uint64_t real, FunctionEntryPredicate isEntry);
 
-size_t emitReverseThunk(uint32_t* words, const ReverseRow* row, uint64_t real)
+size_t emitReverseThunk(uint32_t* words, const ReverseRow* row, uint64_t real, FunctionEntryPredicate isEntry)
 {
-	return emitCallThunkWith(words, row, real, (uint64_t)&callReverseRow);
+	return emitCallThunkWith(words, row, real, (uint64_t)isEntry, (uint64_t)&callReverseRow);
 }
 
 // Thunks are never in a page that is writable and executable at once. Each new thunk gets its own page: mapped read-write,
@@ -207,8 +209,10 @@ size_t emitReverseThunk(uint32_t* words, const ReverseRow* row, uint64_t real)
 // holds the lock; it only ever grows, and a hit reads an entry that is complete and a sealed page.
 static const size_t kThunkPageSize = 16384;		// the largest page size of the hosts (Asahi has 16 KiB)
 
-// row is a row of either table; the two tables are distinct arrays, so the pointer alone tells them apart
-struct ThunkEntry { const void* row; uint64_t real; uint64_t thunk; };
+// row is a row of either table; the two tables are distinct arrays, so the pointer alone tells them apart. aux is the
+// reverse direction's entry predicate, part of the key because the thunk carries it: a thunk made for one predicate is
+// never reused for another.
+struct ThunkEntry { const void* row; uint64_t real; uint64_t aux; uint64_t thunk; };
 static ThunkEntry sThunks[128];
 static size_t sThunkCount;
 // Thunks are made by a bind or by dlsym, neither of which is async-signal-safe, so no signal handler can arrive on a thread
@@ -240,10 +244,10 @@ bool sealExecutablePage(void* page, size_t length)
 enum class Direction : uint8_t { ArmToPlain, PlainToArm };
 
 // 0 when no page can be had
-static uint64_t emitThunkLocked(const void* row, Direction direction, uint64_t real)
+static uint64_t emitThunkLocked(const void* row, Direction direction, uint64_t real, uint64_t aux)
 {
 	for (size_t i = 0; i != sThunkCount; ++i) {
-		if ( (sThunks[i].row == row) && (sThunks[i].real == real) )
+		if ( (sThunks[i].row == row) && (sThunks[i].real == real) && (sThunks[i].aux == aux) )
 			return sThunks[i].thunk;
 	}
 	if ( sThunkCount == sizeof(sThunks) / sizeof(sThunks[0]) )
@@ -251,7 +255,7 @@ static uint64_t emitThunkLocked(const void* row, Direction direction, uint64_t r
 	uint32_t words[40];
 	size_t count;
 	if ( direction == Direction::PlainToArm ) {
-		count = emitReverseThunk(words, (const ReverseRow*)row, real);
+		count = emitReverseThunk(words, (const ReverseRow*)row, real, (FunctionEntryPredicate)aux);
 	}
 	else {
 		const AdapterRow* adapterRow = (const AdapterRow*)row;
@@ -266,14 +270,14 @@ static uint64_t emitThunkLocked(const void* row, Direction direction, uint64_t r
 		munmap(page, kThunkPageSize);
 		return 0;
 	}
-	sThunks[sThunkCount++] = { row, real, (uint64_t)page };
+	sThunks[sThunkCount++] = { row, real, aux, (uint64_t)page };
 	return (uint64_t)page;
 }
 
-static uint64_t emitThunk(const void* row, Direction direction, uint64_t real)
+static uint64_t emitThunk(const void* row, Direction direction, uint64_t real, uint64_t aux)
 {
 	while ( __sync_lock_test_and_set(&sThunkLock, 1) ) { }
-	const uint64_t thunk = emitThunkLocked(row, direction, real);
+	const uint64_t thunk = emitThunkLocked(row, direction, real, aux);
 	__sync_lock_release(&sThunkLock);
 	return thunk;
 }
@@ -636,7 +640,7 @@ uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e)
 				   symbol, row->evidence);
 		return target;
 	}
-	const uint64_t thunk = emitThunk(row, Direction::ArmToPlain, target);
+	const uint64_t thunk = emitThunk(row, Direction::ArmToPlain, target, 0);
 	if ( thunk == 0 ) {
 		dyld::warn("arm64e adapters: no room for a thunk for %s; it is bound unadapted and calls with a signed pointer fault\n", symbol);
 		return target;
@@ -645,8 +649,6 @@ uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e)
 }
 
 // ------------------------------------------------------------------------------------------ the opposite direction
-
-static FunctionEntryPredicate sIsEntry;
 
 // The handlers that this module authenticated and handed back raw to plain code (the results of get_terminate and of the old
 // handler of set_terminate). Plain code that passes one back gets it signed again: arm64e code signed it first, so this
@@ -745,11 +747,13 @@ const char* validateReverseRows(const ReverseRow* rows, size_t count)
 // unchanged and the arm64e callee that authenticates it fails. Without a predicate only handed-back handlers are signed. A
 // handler that comes back must authenticate under IA/0: one that does not stops the process. The non-hint authentication is
 // fine here: a reverse thunk only exists in a process that has an arm64e cache image, which runs on PAC hardware.
-static uint64_t callReverseRow(uint64_t* regs, const ReverseRow* row, uint64_t real)
+//
+// isEntry is the predicate the caller of reverseAdaptedTarget gave when this thunk was made; it travels in the thunk's own
+// literals, so two predicates never see each other's thunks.
+static uint64_t callReverseRow(uint64_t* regs, const ReverseRow* row, uint64_t real, FunctionEntryPredicate isEntry)
 {
 	uint64_t a[8];
 	memcpy(a, regs, sizeof(a));
-	const FunctionEntryPredicate isEntry = __atomic_load_n(&sIsEntry, __ATOMIC_RELAXED);
 	for (unsigned i = 0; i != 8; ++i) {
 		if ( ((row->signMask >> i) & 1) == 0 )
 			continue;
@@ -786,8 +790,7 @@ uint64_t reverseAdaptedTarget(const char* symbol, uint64_t target, bool targetIs
 				   symbol, row->evidence);
 		return target;
 	}
-	__atomic_store_n(&sIsEntry, isEntry, __ATOMIC_RELAXED);
-	const uint64_t thunk = emitThunk(row, Direction::PlainToArm, target);
+	const uint64_t thunk = emitThunk(row, Direction::PlainToArm, target, (uint64_t)isEntry);
 	if ( thunk == 0 ) {
 		dyld::warn("arm64e adapters: no room for a thunk for %s; it is bound unadapted\n", symbol);
 		return target;
@@ -809,7 +812,7 @@ const ReverseRow* findReverseRow(const char*) { return nullptr; }
 const char* validateReverseRows(const ReverseRow*, size_t) { return nullptr; }
 uint64_t reverseAdaptedTarget(const char*, uint64_t target, bool, FunctionEntryPredicate) { return target; }
 bool functionStartsContain(const uint8_t*, size_t, uint64_t) { return false; }
-size_t emitReverseThunk(uint32_t*, const ReverseRow*, uint64_t) { return 0; }
+size_t emitReverseThunk(uint32_t*, const ReverseRow*, uint64_t, FunctionEntryPredicate) { return 0; }
 size_t emitAuthThunk(uint32_t*, uint8_t, uint64_t) { return 0; }
 size_t emitCallThunk(uint32_t*, const AdapterRow*, uint64_t) { return 0; }
 uint64_t callThunkHelperAddress() { return 0; }

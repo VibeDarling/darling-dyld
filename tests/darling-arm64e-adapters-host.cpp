@@ -657,11 +657,16 @@ static Block gHeapResult;
 static void checkBlockCopy()
 {
 	Fn8 t = thunkFor("__Block_copy");
-	const uint64_t target = codeWithSignature(0);
+	// an invoke that a signature made for modifier 0 cannot authenticate at the copy's address: a re-sign without address
+	// diversity is then caught on every run, not only when the two PAC fields happen to collide (about once in 128)
+	uint64_t plainTarget = codeWithSignature(0);
+	while ( oracleAuth(oracleSign(plainTarget, 0), (uint64_t)&gHeapResult.invoke) == plainTarget )
+		plainTarget = codeWithSignature(plainTarget + 0x40);
 	Block original = { nullptr, 0, 0, nullptr, nullptr };
-	original.invoke = (void*)oracleSign(codeWithSignature((uint64_t)&original.invoke), (uint64_t)&original.invoke);
-	const uint64_t plainTarget = oracleStrip((uint64_t)original.invoke);
-	(void)target;
+	original.invoke = (void*)oracleSign(plainTarget, (uint64_t)&original.invoke);
+	CHECK(oracleAuth(oracleSign(plainTarget, 0), (uint64_t)&gHeapResult.invoke) != plainTarget,
+	      "the Block_copy target verifies a signature made for modifier 0: the no-diversity mutant would survive");
+	CHECK(oracleAuth((uint64_t)original.invoke, (uint64_t)&original.invoke) == plainTarget, "the original's invoke is not signed for its own address");
 
 	// the plain Block_copy moves the literal and leaves the stale signature in the copy
 	gHeapResult = original;
@@ -1051,7 +1056,7 @@ int main(int argc, char** argv)
 		const AdapterRow* row = findAdapterRow(argv[2]);
 		if ( row == nullptr )
 			return 2;
-		uint32_t w[20];
+		uint32_t w[24];
 		const size_t n = emitCallThunk(w, row, 0x1122334455667788ULL);
 		printf("ROWADDR %016llx HELPER %016llx\n", (unsigned long long)(uint64_t)row, (unsigned long long)callThunkHelperAddress());
 		for (size_t i = 0; i != n; ++i)

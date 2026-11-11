@@ -129,10 +129,10 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
       row, helper = head[1].to_i(16), head[3].to_i(16)
       got = o.map { |w| w.to_i(16) }
       listing = ['stp x29, x30, [sp, #-80]!', 'mov x29, sp', 'stp x0, x1, [sp, #16]', 'stp x2, x3, [sp, #32]', 'stp x4, x5, [sp, #48]', 'stp x6, x7, [sp, #64]',
-                 'add x0, sp, #16', 'ldr x1, #28', 'ldr x2, #32', 'ldr x16, #36', 'blr x16', 'ldp x29, x30, [sp], #80', 'ret', 'nop']
+                 'add x0, sp, #16', 'ldr x1, #28', 'ldr x2, #32', 'ldr x3, #36', 'ldr x16, #40', 'blr x16', 'ldp x29, x30, [sp], #80', 'ret']
       want = mc_words(listing.join("\n"))
       lit = ->(v) { [v & 0xffffffff, v >> 32] }
-      check "call thunk of #{sym} is what llvm-mc assembles", want && got == want + lit[row] + lit[0x1122334455667788] + lit[helper], got.map { |w| format('%08x', w) }.join(' ')[0, 200]
+      check "call thunk of #{sym} is what llvm-mc assembles", want && got == want + lit[row] + lit[0x1122334455667788] + lit[0] + lit[helper], got.map { |w| format('%08x', w) }.join(' ')[0, 200]
     end
   else
     puts 'SKIP thunk bytes: llvm-mc not found'
@@ -207,7 +207,7 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     'a thunk page is left read-write-execute by the seal' => ['PROT_READ | PROT_EXEC) == 0', 'PROT_READ | PROT_WRITE | PROT_EXEC) == 0'],
     'a thunk page is mapped writable and executable' => ['mmap(nullptr, kThunkPageSize, PROT_READ | PROT_WRITE,', 'mmap(nullptr, kThunkPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,'],
     'a thunk page is never sealed' => ['if ( !sealExecutablePage(page, kThunkPageSize) ) {', 'if ( false ) {'],
-    'a thunk is made again for the same row and target' => ['(sThunks[i].real == real) )', '(sThunks[i].real == real) && false )'],
+    'a thunk is made again for the same row and target' => ['(sThunks[i].real == real) && (sThunks[i].aux == aux) )', '(sThunks[i].real == real) && (sThunks[i].aux == aux) && false )'],
     'an unsupported row is bound as if supported' => [/if \( row->status == AdapterStatus::Unsupported \) \{(\s+dyld::warn\("arm64e adapters: %s is imported by)/, 'if ( false ) {\1'],
     'a handled-elsewhere row warns or is thunked' => [/if \( row->status == AdapterStatus::HandledElsewhere \)\s+return target;\n/, ''],
     'an arm64e target is thunked' => ['if ( (sMode == AdapterMode::Off) || targetIsArm64e )', 'if ( sMode == AdapterMode::Off )'],
@@ -234,6 +234,7 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     end
     mutated = from.is_a?(Regexp) ? text.sub(from, to) : text.sub(from) { to }
     mexe, merr = build(root, dir, "mutant#{i}", adapters_text: (where == :rows ? nil : mutated), rows_text: (where == :rows ? mutated : nil))
+    mout = nil
     dead = mexe.nil? || begin
       mout, mst = run(mexe)
       !mst.success? || mout =~ /^FAIL/
@@ -250,8 +251,11 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
       end
       bytes_dead = bad
     end
-    killed += 1 if dead || spec_dead || bytes_dead
-    check "mutation probe killed: #{desc}", dead || spec_dead || bytes_dead, merr[0, 200]
+    dies = dead || spec_dead || bytes_dead
+    killed += 1 if dies
+    # a surviving mutant has no FAIL line: report what the driver did print, so the probe is not just a bare count
+    detail = !dies && mout ? (mout.lines.grep(/^FAIL/).first || mout.lines.last || 'the driver printed no FAIL line').strip : merr[0, 200]
+    check "mutation probe killed: #{desc}", dies, detail
   end
   puts "probes killed #{killed}/#{mutants.size}"
 end
