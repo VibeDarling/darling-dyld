@@ -115,17 +115,23 @@ static int l5_path_and_bit(const char *s, int *plen) {
 
 static void l5_objc_scan(const char *out, const char *exe, struct l5_objc_seen *seen) {
     static const char libobjc[] = "/usr/lib/libobjc.A.dylib";
+    // the kind word is matched whole: "objc skipping ..." shares the prefix and is not one of these
+    static const char kRegister[] = "objc register_callbacks version=", kMapped[] = "objc mapped ",
+                      kInit[] = "objc init ";
     seen->registers = 0; seen->version = -1; seen->libobjc_bit = -1; seen->exe_bit = -1; seen->inits = 0;
     seen->repeats = 0;
     for (const char *p = out; *p; ) {
         const char *h = l5_starts(p, "dyld: ") ? p + 6 : p;
         int n = 0, bit;
-        if (l5_starts(h, "objc register_callbacks version=")) {
-            const char *v = h + sizeof "objc register_callbacks version=" - 1;
+        if (l5_starts(h, kRegister)) {
+            const char *v = h + sizeof kRegister - 1;
             seen->registers++;
-            seen->version = (v[0] >= '0' && v[0] <= '9' && (v[1] == '\n' || !v[1])) ? v[0] - '0' : -2;
-        } else if (l5_starts(h, "objc mapped ")) {
-            const char *r = h + sizeof "objc mapped " - 1;
+            int ver = 0, digits = 0;
+            for (; v[digits] >= '0' && v[digits] <= '9'; digits++)
+                ver = ver < 100000 ? ver * 10 + (v[digits] - '0') : ver;
+            seen->version = digits && (v[digits] == '\n' || !v[digits]) ? ver : -2;   // -2: not a clean %u
+        } else if (l5_starts(h, kMapped)) {
+            const char *r = h + sizeof kMapped - 1;
             if ((bit = l5_path_and_bit(r, &n)) >= 0) {
                 // an image is mapped once; a repeat could hide a wrong bit behind a right one
                 if (l5_eq_n(r, n, libobjc)) {
@@ -137,8 +143,8 @@ static void l5_objc_scan(const char *out, const char *exe, struct l5_objc_seen *
                     seen->exe_bit = bit;
                 }
             }
-        } else if (l5_starts(h, "objc init ")) {
-            if (l5_path_and_bit(h + sizeof "objc init " - 1, &n) >= 0)
+        } else if (l5_starts(h, kInit)) {
+            if (l5_path_and_bit(h + sizeof kInit - 1, &n) >= 0)
                 seen->inits++;
         }
         while (*p && *p != '\n')
@@ -151,8 +157,10 @@ static void l5_objc_scan(const char *out, const char *exe, struct l5_objc_seen *
 // The verdict on a scan: null when the loader's lines prove libobjc registered version 4 callbacks once,
 // was reported cache-served (bit 1) and this disk-served executable was reported with bit 0.
 static const char *l5_objc_verdict(const struct l5_objc_seen *s) {
+    if (s->registers > 1)
+        return "the loader logged more than one objc register_callbacks line (in L5 only libobjc registers)";
     if (s->registers != 1)
-        return "the loader did not log exactly one objc register_callbacks line (DYLD_PRINT_OBJC_NOTIFICATIONS=1 set?)";
+        return "the loader did not log an objc register_callbacks line (DYLD_PRINT_OBJC_NOTIFICATIONS=1 set?)";
     if (s->version != 4)
         return "libobjc did not register version 4 callbacks";
     if (s->repeats)
@@ -426,7 +434,10 @@ static int l5_st_fault(void) { *(volatile int *)8 = 1; return 0; }
 static int l5_st_objc_lines(void) {
     static const char good[] =
         "dyld: objc register_callbacks version=4\n"
+        "dyld: objc skipping /usr/lib/libswiftCore.dylib: its metadata is unsigned plain arm64\n"
+        "dyld: objc skipping /x/objc mapped /y refs_optimized=1\n"   // shares the prefix, is not a mapped line
         "dyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\n"
+        "dyld: objc skipping /tmp/z: plain arm64\n"
         "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\n"
         "dyld: objc init /tmp/a b/l5_probe refs_optimized=0\n";
     static const char exe[] = "/tmp/a b/l5_probe";
@@ -456,6 +467,12 @@ static int l5_st_objc_lines(void) {
         "dyld: objc register_callbacks version=4\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\n"
         "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=1\ndyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\n"
         "dyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",
+        "dyld: objc register_callbacks version=4\ndyld: objc mapped2 /usr/lib/libobjc.A.dylib refs_optimized=1\n"
+        "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\ndyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",  // near-miss kind
+        "dyld: objc register_callbacks version=4\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\n"
+        "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\ndyld: objc initialized /tmp/a b/l5_probe refs_optimized=0\n",  // near-miss init
+        "dyld: objc register_callbacks version=4\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1 \n"
+        "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\ndyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",  // trailing space
         "OKMARK 07 dyld: objc register_callbacks version=4\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\n"
         "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\ndyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",
     };
@@ -466,6 +483,28 @@ static int l5_st_objc_lines(void) {
             return l5_fail("objc line parse accepted a bad sample");
         }
     }
+    // the version is the whole %u: 14 is read as 14 (and rejected), 4 plus junk is not a version
+    static const char v14[] = "dyld: objc register_callbacks version=14\n";
+    static const char v4x[] = "dyld: objc register_callbacks version=4x\n";
+    l5_objc_scan(v14, exe, &s);
+    if (s.version != 14)
+        return l5_fail("version=14 was not read as 14");
+    l5_objc_scan(v4x, exe, &s);
+    if (s.version != -2)
+        return l5_fail("version=4x was read as a version");
+    static const char vnone[] = "dyld: objc register_callbacks version=\n";
+    l5_objc_scan(vnone, exe, &s);
+    if (s.version != -2)
+        return l5_fail("an empty version was read as a number");
+    // a second registration has its own reason, not the missing-line one
+    static const char two[] =
+        "dyld: objc register_callbacks version=4\ndyld: objc register_callbacks version=4\n"
+        "dyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\ndyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\n"
+        "dyld: objc init /tmp/a b/l5_probe refs_optimized=0\n";
+    l5_objc_scan(two, exe, &s);
+    const char *why = l5_objc_verdict(&s);
+    if (!why || !l5_starts(why, "the loader logged more than one"))
+        return l5_fail("two registrations did not get their own reason");
     l5_ok(g_check);
     return 0;
 }
