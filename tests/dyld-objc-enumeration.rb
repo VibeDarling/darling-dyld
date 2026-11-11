@@ -175,6 +175,54 @@ DRIVER = <<~'CPP'
   }
 
   static TestBlock gBlock;
+
+  static void testHelper()
+  {
+      uint32_t capture = 0x5eed;
+      TestBlock block = {};
+      block.layout.isa = (void*)(uintptr_t)0xDEADBEEFDEADBEEFull;    // libobjc never reads it
+      block.layout.flags = 0;
+      block.capture = &capture;
+      signInvoke(block);
+
+      if ( pacHost() ) {
+          expect("the fixture invoke is signed", (block.layout.invoke >> 48) != 0);
+          expect("the fixture signature authenticates to the function",
+                 dyld3::darling::authenticateBlockInvoke(block.layout.invoke, (uint64_t)(uintptr_t)&block.layout.invoke) == (uint64_t)(uintptr_t)testInvoke);
+      }
+
+      resetInvocation();
+      bool stop = false;
+      dyld3::darling::callObjCEnumerationBlock(&block, (void*)(uintptr_t)0x1a2b3c, true, &stop);
+      expect("the block runs once", gInvocations == 1);
+      expect("the caller's own block reaches its invoke", gInvokeBlock == &block);
+      expect("the object pointer reaches the block", gInvokeObject == (void*)(uintptr_t)0x1a2b3c);
+      expect("isLoaded reaches the block", gInvokeLoaded);
+      expect("a block that leaves stop alone leaves it false", !stop);
+      expect("the captures stay in the caller's block", *block.capture == 0x5eed);
+
+      gStopOnCall = 1;
+      stop = false;
+      dyld3::darling::callObjCEnumerationBlock(&block, nullptr, false, &stop);
+      expect("a block that sets stop reaches the caller", stop);
+
+      if ( pacHost() ) {
+          pid_t pid = fork();
+          if ( pid == 0 ) {
+              ObjCEnumerationInvoke invoke = (ObjCEnumerationInvoke)(uintptr_t)block.layout.invoke;
+              bool neverStop = false;
+              invoke(&block.layout, nullptr, true, &neverStop);
+              _exit(0);
+          }
+          int status = 0;
+          waitpid(pid, &status, 0);
+          expect("a direct call through the signed invoke faults", WIFSIGNALED(status));
+      }
+      else {
+          printf("skip a direct call through the signed invoke faults (no pointer authentication on this CPU)\n");
+      }
+  }
+
   // --- the version-16 tables ------------------------------------------------------------------
   // The fixed part is five uint32 words, a uint64 salt at 24 and scramble[256] at 32, so tab[] starts at
   // 1056: tab[mask+1] (one byte at mask 0), checkbytes[capacity], offsets[capacity],
@@ -289,6 +337,162 @@ DRIVER = <<~'CPP'
       expect("the pointer is the cache base plus the entry's offset", (uintptr_t)gInvokeObject == expected);
       expect("the entry reports its image loaded", gInvokeLoaded);
       expect("libobjc's own block is the one called", gInvokeBlock == (const void*)&gBlock);
+
+      beginTable("DupClass");
+      setDuplicate(2, 0);
+      setDuplicateEntry(0, 0x2000, 3);
+      setDuplicateEntry(1, 0x3000, 4);
+      setImages(8);
+      setImageLoaded(3, true);
+      useFixtureTable(kTableOffset, 0);
+      resetInvocation();
+      enumerateClass("DupClass");
+      expect("two implementations are two calls", gInvocations == 2);
+      expect("the first duplicate is the first entry", (uintptr_t)gObjects[0] == cacheBase + 0x2000);
+      expect("the second duplicate is the second entry", (uintptr_t)gObjects[1] == cacheBase + 0x3000);
+      expect("the first duplicate reports its loaded image", gLoadedResults[0]);
+      expect("the second duplicate reports its unloaded image", !gLoadedResults[1]);
+
+      resetInvocation();
+      gStopOnCall = 1;
+      enumerateClass("DupClass");
+      expect("a stop ends the duplicate walk after one call", gInvocations == 1);
+      expect("the stopped walk saw the first entry", (uintptr_t)gObjects[0] == cacheBase + 0x2000);
+
+      beginTable("DupRange");
+      setDuplicate(2, 1);                 // two entries starting at slot 1
+      setDuplicateEntry(1, 0x2500, 3);
+      setDuplicateEntry(2, 0x2600, 4);    // past the two the table declares: a missing bound calls it
+      setImages(8);
+      setImageLoaded(3, true);
+      useFixtureTable(kTableOffset, 0);
+      resetInvocation();
+      enumerateClass("DupRange");
+      expect("a duplicate range past the table's duplicate array makes no call", gInvocations == 0);
+
+      beginTable("DupEdge");
+      setDuplicate(1, 1);
+      write32(tableBase() + kDuplicateCount, 2);  // the table declares two duplicate entries
+      setDuplicateEntry(1, 0x2700, 3);    // the range ends exactly at the array's end
+      setImages(8);
+      setImageLoaded(3, true);
+      useFixtureTable(kTableOffset, 0);
+      resetInvocation();
+      enumerateClass("DupEdge");
+      expect("a duplicate range ending at the array's end is reported", gInvocations == 1);
+      expect("the reported duplicate is the one in the range", (uintptr_t)gObjects[0] == cacheBase + 0x2700);
+
+      beginTable("FarObject");
+      setObject(0x8000, 2);               // the first byte past the 32 KB mapping
+      setImages(8);
+      setImageLoaded(2, true);
+      useFixtureTable(kTableOffset, 0);
+      resetInvocation();
+      enumerateClass("FarObject");
+      expect("an entry outside the cache mapping makes no call", gInvocations == 0);
+
+      beginTable("EdgeObject");
+      setObject(0x7ff8, 2);               // the last eight bytes of the mapping are still inside it
+      setImages(8);
+      setImageLoaded(2, true);
+      useFixtureTable(kTableOffset, 0);
+      resetInvocation();
+      enumerateClass("EdgeObject");
+      expect("an entry at the end of the cache mapping is reported", gInvocations == 1);
+
+      beginTable("GapObject");
+      setObject(0x7900, 2);               // inside the span mappedSize() covers, between the listed mappings
+      setImages(8);
+      setImageLoaded(2, true);
+      useFixtureTable(kTableOffset, 0);
+      resetInvocation();
+      enumerateClass("GapObject");
+      expect("an entry in an unmapped gap between cache mappings makes no call", gInvocations == 0);
+
+      resetInvocation();
+      enumerateClass("NSObject");
+      expect("a name the table does not hold makes no call", gInvocations == 0);
+
+      beginTable("NSCopying");
+      setObject(0x4321, 5);
+      setImages(8);
+      setImageLoaded(5, true);
+      useFixtureTable(0, kTableOffset);
+      resetInvocation();
+      enumerateProtocol("NSCopying");
+      expect("a protocol is one call", gInvocations == 1);
+      expect("the protocol pointer is the cache base plus the entry's offset", (uintptr_t)gInvokeObject == cacheBase + 0x4321);
+      expect("the protocol reports its image loaded", gInvokeLoaded);
+
+      resetInvocation();
+      enumerateClass("NSCopying");
+      expect("the class walk does not read the protocol table", gInvocations == 0);
+      resetInvocation();
+      enumerateProtocol("NSObject");
+      expect("the protocol walk does not read the class table", gInvocations == 0);
+
+      beginTable("OutOfRange");
+      setObject(0x7777, 8);
+      setImages(8);
+      setImageLoaded(8, true);            // the word past the counted images: a missing check would report it
+      useFixtureTable(kTableOffset, 0);
+      resetInvocation();
+      enumerateClass("OutOfRange");
+      expect("an index past the image table counts as not loaded", gInvocations == 1 && !gInvokeLoaded);
+
+      beginTable("ShortStride");
+      setObject(0x1234, 2);
+      setImages(8);
+      setImageLoaded(1, true);            // the word a stride of 4 lands on for entry 2: a missing stride
+                                          // check would report that image's bit as entry 2's
+      write32(gFixture + kImages + 4, 4); // an entry stride too small to hold one header_info_rw
+      useFixtureTable(kTableOffset, 0);
+      resetInvocation();
+      enumerateClass("ShortStride");
+      expect("an rw table whose stride is smaller than one entry reports not loaded",
+             gInvocations == 1 && !gInvokeLoaded);
+
+      beginTable("HugeCount");
+      setObject(0x1234, 2);
+      setImages(0xFFFFFFFF);              // entries that cannot fit inside the cache mapping
+      useFixtureTable(kTableOffset, 0);
+      resetInvocation();
+      enumerateClass("HugeCount");
+      expect("an rw table larger than the cache mapping makes no call", gInvocations == 0);
+
+      beginTable("HugeStride");
+      setObject(0x1234, 2);
+      setImages(8);
+      write32(gFixture + kImages + 4, 0x10000000);  // the entry for image 2 would land outside the mapping
+      useFixtureTable(kTableOffset, 0);
+      resetInvocation();
+      enumerateClass("HugeStride");
+      expect("an rw entry outside the cache mapping makes no call", gInvocations == 0);
+
+      beginTable("NSObject");
+      setObject(0x1234, 2);
+      setImages(8);
+      setImageLoaded(2, true);
+      useFixtureTable(kTableOffset, 0, 0);
+      resetInvocation();
+      enumerateClass("NSObject");
+      expect("a cache without the rw image table makes no call", gInvocations == 0);
+
+      gCachePtr->opt = nullptr;
+      resetInvocation();
+      enumerateClass("NSObject");
+      enumerateProtocol("NSCopying");
+      expect("a cache without an optimizer table makes no call", gInvocations == 0);
+
+      beginTable("NSObject");
+      setObject(0x1234, 2);
+      setImages(8);
+      setImageLoaded(2, true);
+      useFixtureTable(0, 0);
+      resetInvocation();
+      enumerateClass("NSObject");
+      enumerateProtocol("NSObject");
+      expect("absent tables make no call", gInvocations == 0);
   }
 
   int main()
@@ -298,6 +502,7 @@ DRIVER = <<~'CPP'
       gBlock.capture = nullptr;
       signInvoke(gBlock);
 
+      testHelper();
       testWalker();
       if ( failures != 0 ) {
           printf("%d failures\n", failures);
@@ -337,20 +542,54 @@ Dir.mktmpdir('dyld-objc-enumeration-') do |dir|
 
   probes = [
     # [description, text to replace, replacement, only where the CPU has pointer authentication]
+    ['the block is called through its stripped invoke',
+     '((ObjCEnumerationInvoke)(uintptr_t)stripSignedPointer(block->invoke))(block, objectPtr, isLoaded, stop);',
+     '((ObjCEnumerationInvoke)(uintptr_t)block->invoke)(block, objectPtr, isLoaded, stop);', true],
     ['the caller\'s own block is passed on',
      '((ObjCEnumerationInvoke)(uintptr_t)stripSignedPointer(block->invoke))(block, objectPtr, isLoaded, stop);',
      "ObjCBlockLayout copy = *block;\n\t((ObjCEnumerationInvoke)(uintptr_t)stripSignedPointer(copy.invoke))(&copy, objectPtr, isLoaded, stop);", false],
+    ['the loaded bit is not a constant true',
+     'bool isLoaded = images->isLoaded(dylibObjCIndex);',
+     'bool isLoaded = (images->isLoaded(dylibObjCIndex), true);', false],
     ['the loaded bit is not a constant false',
      'bool isLoaded = images->isLoaded(dylibObjCIndex);',
      'bool isLoaded = (images->isLoaded(dylibObjCIndex), false);', false],
     ['the loaded bit is the entry\'s own image', 'bool isLoaded = images->isLoaded(dylibObjCIndex);',
      'bool isLoaded = images->isLoaded(0);', false],
+    ['a cache without the rw image table answers nothing',
+     "if ( (table < cacheBegin) || (entries > cacheEnd)",
+     "if ( (table == ~0ull) || (entries > cacheEnd)", false],
+    ['an index past the image table is not loaded',
+     "if ( (index >= count) || (entsize < sizeof(header_info_rw)) )\n            return false;",
+     "if ( (false) || (entsize < sizeof(header_info_rw)) )\n            return false;", false],
+    ['a stride smaller than one entry is not loaded',
+     "if ( (index >= count) || (entsize < sizeof(header_info_rw)) )\n            return false;",
+     "if ( index >= count )\n            return false;", false],
+    ['the rw table stays inside the cache mapping',
+     "if ( (table < cacheBegin) || (entries > cacheEnd)\n\t\t\t|| ((uint64_t)images->count * images->entsize > cacheEnd - entries) )\n\t\treturn;",
+     "if ( cacheBegin == 0 && cacheEnd == 0 && table == 0 && entries == 0 )\n\t\treturn;", false],
     ['the entry offset is added to the cache base',
      '(void*)(cacheBase + objectCacheOffset)', '(void*)(cacheBase - objectCacheOffset)', false],
+    ['a single implementation is one call', 'if ( !data.isDuplicate() ) {', 'if ( true ) {', false],
+    ['duplicates start at their index', '&duplicateOffsets()[first]',
+     '&duplicateOffsets()[first + 1]', false],
+    ['a duplicate range stays inside the duplicate array',
+     "if ( (first > total) || (count > total - first) )\n            return;",
+     "if ( (first > total) || (count > total) )\n            return;", false],
+    ['an object offset stays inside a mapped region',
+     "if ( (address >= vmAddr) && (address < vmAddr + size) )",
+     "if ( address >= vmAddr )", false],
+    ['a duplicate stops when the block asks', "if ( stopObjects )\n                break;",
+     "if ( false )\n                break;", false],
+    ['a stop reaches the walk', 'stopObjects = stop;', 'stopObjects = false;', false],
     ['the class walk reads the class table', 'const objc::ClassHashTable* table = opt->classOpt();',
      'const objc::ClassHashTable* table = (const objc::ClassHashTable*)opt->protocolOpt();', false],
     ['the class wrapper asks for classes', 'forEachObjCName(className, callback, false);',
      'forEachObjCName(className, callback, true);', false],
+    ['a cache without an optimizer table answers nothing', "if ( opt == nullptr )\n\t\treturn;",
+     "if ( false )\n\t\treturn;", false],
+    ['an absent class table answers nothing', "if ( table != nullptr )\n\t\t\ttable->forEachClass(name, visit);",
+     "\t\t\ttable->forEachClass(name, visit);", false],
   ]
   probes.each do |name, from, to, pac_only|
     if SOURCE.include?(from)
