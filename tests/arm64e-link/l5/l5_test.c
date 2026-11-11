@@ -359,12 +359,118 @@ static const struct check l5_selftests[] = {
 #define L5_NSELFTESTS ((int)(sizeof l5_selftests / sizeof l5_selftests[0]))
 
 // --------------------------------------------------------------------------- guest checks
-// Placeholders until the guest bodies land: a guest-only check reports a failure rather than a
-// silent pass, and no selftest calls one.
+#ifndef ABI_NATIVE
+
+// The cache libobjc's loaded bits, measured (the dyld2 path never notifies libobjc about cache
+// images, so the truthful answer here is 0 until such a notifier exists; the check does not assume).
+static uint32_t l5_rw_loaded(void) {
+    const struct l5_headeropt_rw *t = (const struct l5_headeropt_rw *)_dyld_for_objc_header_opt_rw();
+    if (t == 0 || t->entsize < sizeof(struct l5_header_info_rw))
+        return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < t->count; i++) {
+        const struct l5_header_info_rw *h =
+            (const struct l5_header_info_rw *)((const char *)t->headers + (size_t)i * t->entsize);
+        n += (uint32_t)h->isLoaded;
+    }
+    return n;
+}
+
+// 01: the image behind objc_getClass is inside the shared cache range, and the prefix's disk copy
+// did not win; the driver pairs this with the loader's own policy line.
+static int l5_check01(void) {
+    void *fn = STRIP((void *)objc_getClass);
+    struct l5_dl_info info;
+    if (!dladdr(fn, &info) || !info.dli_fname)
+        return l5_fail("dladdr found no image for objc_getClass");
+    size_t len = 0;
+    const void *base = _dyld_get_shared_cache_range(&len);
+    uintptr_t a = (uintptr_t)fn;
+    int inside = base && (uintptr_t)base <= a && a < (uintptr_t)base + len;
+    int disk = access("/usr/lib/libobjc.A.dylib", L5_F_OK) == 0;
+    if (!inside)
+        return l5_fail("objc_getClass lies outside the shared cache range");
+    put("OKMARK 01 served image="); put(info.dli_fname); put(" inside="); putdec(inside);
+    put(" base="); puthex((uintptr_t)base); put(" size="); puthex(len);
+    put(" disk_copy="); putdec(disk); put(" policy=?"); nl();
+    return 0;
+}
+
+// 02: a class from the runtime whose name, isa and address all agree, plus the measured
+// header-opt-rw loaded bits the dyld2 path reports today (the T4 gate: measure, never assume).
+static int l5_check02(void) {
+    void *cls = objc_getClass("NSObject");
+    if (!cls)
+        return l5_fail("objc_getClass(NSObject) returned null");
+    const char *name = class_getName(cls);
+    void *isa = *(void **)cls;
+    const char *isaName = isa ? class_getName(isa) : 0;
+    if (!name || !streq(name, "NSObject"))
+        return l5_fail("class name is not NSObject");
+    if (!isaName || !streq(isaName, "NSObject"))
+        return l5_fail("the class's isa is not NSObject");
+    size_t len = 0;
+    const void *base = _dyld_get_shared_cache_range(&len);
+    uintptr_t c = (uintptr_t)cls;
+    int inside = base && (uintptr_t)base <= c && c < (uintptr_t)base + len;
+    if (!inside)
+        return l5_fail("NSObject lies outside the shared cache range");
+    put("OKMARK 02 getclass cls="); puthex(c); put(" name="); put(name);
+    put(" isa="); put(isaName); put(" cls_in_cache="); putdec(inside);
+    put(" rw_loaded="); putdec(l5_rw_loaded()); nl();
+    return 0;
+}
+
+// 03: class_createInstance on the cache's class.
+static int l5_check03(void) {
+    void *cls = objc_getClass("NSObject");
+    if (!cls)
+        return l5_fail("objc_getClass(NSObject) returned null");
+    void *obj = class_createInstance(cls, 0);
+    if (!obj)
+        return l5_fail("class_createInstance returned null");
+    const char *isaName = class_getName(*(void **)obj);
+    if (!isaName || !streq(isaName, "NSObject"))
+        return l5_fail("the instance's isa is not NSObject");
+    put("OKMARK 03 createinstance obj="); puthex((uintptr_t)obj); put(" isa="); put(isaName); nl();
+    return 0;
+}
+
+// 04: objc_msgSend of -hash (stable across two calls, and the instance's own address) and
+// -isEqual: (YES for self, NO for a second instance). l5_hash_ok is the harness mutation point.
+static int l5_check04(void) {
+    void *cls = objc_getClass("NSObject");
+    void *o1 = cls ? class_createInstance(cls, 0) : 0;
+    void *o2 = cls ? class_createInstance(cls, 0) : 0;
+    if (!o1 || !o2)
+        return l5_fail("class_createInstance returned null");
+    void *hashSel = sel_registerName("hash");
+    void *eqSel = sel_registerName("isEqual:");
+    if (!hashSel || !eqSel)
+        return l5_fail("sel_registerName returned null");
+    uintptr_t h1 = ((uintptr_t (*)(void *, void *))(void *)objc_msgSend)(o1, hashSel);
+    uintptr_t h2 = ((uintptr_t (*)(void *, void *))(void *)objc_msgSend)(o1, hashSel);
+    int eqSelf = ((signed char (*)(void *, void *, void *))(void *)objc_msgSend)(o1, eqSel, o1) != 0;
+    int eqOther = ((signed char (*)(void *, void *, void *))(void *)objc_msgSend)(o1, eqSel, o2) != 0;
+    if (!l5_hash_ok(h1, h2, (uintptr_t)o1))
+        return l5_fail("hash is not stable, or is not the instance's address");
+    if (!eqSelf)
+        return l5_fail("isEqual: with self returned NO");
+    if (eqOther)
+        return l5_fail("isEqual: with another instance returned YES");
+    put("OKMARK 04 msgsend hash1="); puthex(h1); put(" hash2="); puthex(h2);
+    put(" eq_self=1 eq_other=0"); nl();
+    return 0;
+}
+
+#else   // ABI_NATIVE: the guest checks need libobjc; their decisions are covered by the selftests
+
 static int l5_check01(void) { return l5_fail("guest-only check"); }
 static int l5_check02(void) { return l5_fail("guest-only check"); }
 static int l5_check03(void) { return l5_fail("guest-only check"); }
 static int l5_check04(void) { return l5_fail("guest-only check"); }
+
+#endif   // ABI_NATIVE
 
 const struct check checks[] = {
     {"check01_served", l5_check01, 0},
