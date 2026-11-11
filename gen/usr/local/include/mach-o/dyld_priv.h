@@ -1001,6 +1001,71 @@ extern void* _dyld_for_objc_header_opt_rw(void);
 extern uint32_t _dyld_objc_class_count(void);
 
 
+// The dyld4 callback interface the shared cache's libobjc registers with, with dyld-1378's shapes.
+// v1 is the shape _dyld_objc_notify_register takes; v4 carries callback pointers the arm64e libobjc
+// ptrauth-signs (IB, diversity 1, a string discriminator) into plain fields, which Darling's plain
+// arm64 loader authenticates and strips by hand (dyld3/DarlingObjCCallbacks.h). The plain field
+// types below are what both loaders read; the signing is not the header's business.
+// >>> Darling dyld4 objc callbacks
+typedef void (*_dyld_objc_notify_patch_class)(const struct mach_header* originalMH, void* originalClass,
+                                              const struct mach_header* replacementMH, const void* replacementClass);
+struct _dyld_objc_notify_mapped_info {
+    const struct mach_header*       mh;
+    const char*                     path;
+    _dyld_section_location_info_t   sectionLocationMetadata;
+    uint32_t                        dyldObjCRefsOptimized   :  1,
+                                    flags                   : 31;
+};
+typedef void (*_dyld_objc_notify_mapped2)(unsigned count, const struct _dyld_objc_notify_mapped_info infos[]);
+typedef void (*_dyld_objc_notify_init2)(const struct _dyld_objc_notify_mapped_info* info);
+
+typedef void (^_dyld_objc_mark_image_mutable)(uint32_t objcImageIndex);
+typedef void (*_dyld_objc_notify_mapped3)(unsigned count, const struct _dyld_objc_notify_mapped_info infos[],
+                                          _dyld_objc_mark_image_mutable callback);
+
+struct _dyld_objc_callbacks
+{
+    uintptr_t version;
+};
+
+struct _dyld_objc_callbacks_v2
+{
+    uintptr_t                       version; // == 2
+    _dyld_objc_notify_mapped2       mapped;
+    _dyld_objc_notify_init2         init;
+    _dyld_objc_notify_unmapped      unmapped;
+    _dyld_objc_notify_patch_class   patches;
+};
+
+struct _dyld_objc_callbacks_v3
+{
+    uintptr_t                       version; // == 3
+    _dyld_objc_notify_mapped3       mapped;
+    _dyld_objc_notify_init2         init;
+    _dyld_objc_notify_unmapped      unmapped;
+    _dyld_objc_notify_patch_class   patches;
+};
+
+struct _dyld_objc_callbacks_v4
+{
+    uintptr_t                       version; // == 4
+    _dyld_objc_notify_mapped3       mapped;     // signed IB, "_dyld_objc_notify_mapped4"
+    _dyld_objc_notify_init2         init;       // signed IB, "_dyld_objc_notify_init3"
+    _dyld_objc_notify_unmapped      unmapped;   // signed IB, "_dyld_objc_notify_unmapped2"
+    _dyld_objc_notify_patch_class   patches;    // signed IB, "_dyld_objc_notify_patch_class2"
+};
+
+// Exists in Mac OS X 13.0 and later; accepts versions 2 through 4 and halts on any other.
+extern void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks*);
+// <<< Darling dyld4 objc callbacks
+
+
+// The mach header of the image a dlopen() handle names: RTLD_MAIN_ONLY for the main executable, a
+// handle from dlopen otherwise, null when the handle is not a loaded image. RTLD_SELF is answered in
+// libdyld, where the caller's return address is still visible.
+extern const struct mach_header* _dyld_get_dlopen_image_header(void* handle);
+
+
 // called by exit() before it calls cxa_finalize() so that thread_local
 // objects are destroyed before global objects.
 extern void _tlv_exit(void);
