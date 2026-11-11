@@ -36,8 +36,13 @@ VARIANTS = [
     "main_wx", "slide_outside_file", "sub_outside_region", "chain_start_unaligned", "main_count_mismatch", "page_starts_range",
     "page_starts_truncated", "chain_leaves_page", "chain_start_outside", "unknown_slide_version",
     "target_outside_region", "bad_page_size", "auth_target_outside_region", "no_auth", "patch", "patch_high",
-    "objc", "objc_no_ro", "objc_no_ptrs", "objc_short_ro",
+    "objc", "objc_no_ro", "objc_no_ptrs", "objc_short_ro", "objc_mid_ro", "objc_edge_ro",
 ]
+
+# __objc_opt_ro section sizes shorter than sizeof(objc_opt::objc_opt_t), 0x30 for version 16. objc_mid_ro sits
+# between the version-15 size (0x20) and 0x30: a check against the old size would accept it. objc_edge_ro is
+# one byte short of the struct.
+OBJC_RO_SIZES = {"objc_short_ro": 2, "objc_mid_ro": 0x28, "objc_edge_ro": 0x2F}
 
 
 def uuid_for(name):
@@ -303,7 +308,7 @@ def build(base, variant):
     files = {}
     v = variant
     patch = v in ("patch", "patch_high")
-    with_objc = v in ("objc", "objc_no_ro", "objc_no_ptrs", "objc_short_ro")
+    with_objc = v in ("objc", "objc_no_ro", "objc_no_ptrs", "objc_short_ro", "objc_mid_ro", "objc_edge_ro")
     patch_vm = PATCH_VM_HIGH if v == "patch_high" else PATCH_VM
     region_size = patch_vm + 0x40000 if patch else REGION_SIZE
     # Real caches have value_add == region start; the fixture offsets it so that code which ignored
@@ -341,9 +346,9 @@ def build(base, variant):
     objc_ro_addr = objc_ptrs_addr = 0
     if with_objc:
         objc_img, objc_ro_addr, objc_ptrs_addr = libobjc_macho(objc_addr, v != "objc_no_ro", v != "objc_no_ptrs",
-                                                               2 if v == "objc_short_ro" else 0x30)
+                                                               OBJC_RO_SIZES.get(v, 0x30))
         # A section shorter than objc_opt_t must be ignored, so the expected result is absent.
-        if v == "objc_short_ro":
+        if v in OBJC_RO_SIZES:
             objc_ro_addr = 0
         macho[0x800:0x800 + len(objc_img)] = objc_img
     sub1_addr = {"sub_overlap": text_addr - 0x4000, "sub_outside_region": base + REGION_SIZE}.get(v, text_addr)
