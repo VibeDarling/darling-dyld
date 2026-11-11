@@ -195,6 +195,23 @@ Dir.mktmpdir('objc-opt-v16-') do |dir|
             assert(sel->getEntryForIndex(k) == str);
     }
 
+    static void selector_empty_slot(void)
+    {
+        alignas(8) uint8_t buf[4096];
+        SelTable t = make_sel_table(buf);
+        // A matched bucket whose offset is zero is an empty slot. The bytes at the table base
+        // spell the key, so with the offset check gone strcmp succeeds and get() returns the
+        // table base instead of nothing.
+        memcpy(buf, "abc", 4);
+        for (int i = 0; i < 256; ++i) {
+            t.checkbytes[i] = (uint8_t)((('a' & 0x7) << 5) | (3 & 0x1f));
+            t.offsets[i] = 0;
+        }
+
+        const TestSelectorTable* sel = (const TestSelectorTable*)buf;
+        assert(sel->get("abc") == NULL);
+    }
+
     static void selector_checkbyte_reject(void)
     {
         alignas(8) uint8_t buf[4096];
@@ -246,6 +263,7 @@ Dir.mktmpdir('objc-opt-v16-') do |dir|
         class_count();
         real_cache_words();
         selector_lookup();
+        selector_empty_slot();
         selector_checkbyte_reject();
         selector_entry_index();
         printf("OK objc_opt v16\\n");
