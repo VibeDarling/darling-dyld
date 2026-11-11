@@ -250,6 +250,8 @@ static const struct dyld_func dyld_funcs[] = {
     {"__dyld_for_objc_header_opt_rw",					(void*)_dyld_for_objc_header_opt_rw },
     {"__dyld_objc_class_count",							(void*)_dyld_objc_class_count },
     {"__dyld_lookup_section_info",						(void*)_dyld_lookup_section_info },
+    {"__dyld_for_each_objc_class",						(void*)_dyld_for_each_objc_class },
+    {"__dyld_for_each_objc_protocol",					(void*)_dyld_for_each_objc_protocol },
     {"__dyld_get_shared_cache_uuid",					(void*)_dyld_get_shared_cache_uuid },
     {"__dyld_get_shared_cache_range",					(void*)_dyld_get_shared_cache_range },
     {"__dyld_images_for_addresses",						(void*)_dyld_images_for_addresses },
@@ -2366,6 +2368,61 @@ struct _dyld_section_info_result _dyld_lookup_section_info(const struct mach_hea
 		dyld::log("%s()\n", __func__);
 	(void)locationHandle;
 	return lookupObjCSectionInfo(mh, kind);
+}
+
+// libobjc asks for every implementation of a class or protocol name. The cache's version-16 tables hold
+// each implementation's offset from the cache base and the index of the image that defines it; the
+// headeropt rw table holds whether libobjc has mapped that image yet.
+static void forEachObjCName(const char* name,
+							void (^callback)(void* objectPtr, bool isLoaded, bool* stop),
+							bool protocols)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s(%s)\n", protocols ? "_dyld_for_each_objc_protocol" : "_dyld_for_each_objc_class", name);
+	const DyldSharedCache* cache = (const DyldSharedCache*)dyld::imMemorySharedCacheHeader();
+	const objc_opt::objc_opt_t* opt = (cache != nullptr) ? cache->objcOpt() : nullptr;
+	if ( opt == nullptr )
+		return;
+	const objc_opt::objc_headeropt_rw_t* images = opt->headeropt_rw();
+	const uint8_t* cacheBase = (const uint8_t*)cache;
+	// The rw table is cache content, and the split-cache directory is chosen by the environment. A null
+	// table and an absent one both lie outside the mapping, like a count that would place entries past
+	// its end; rejecting them here is what keeps isLoaded() from reading outside the cache.
+	const uint64_t cacheBegin = (uint64_t)(uintptr_t)cacheBase;
+	const uint64_t cacheEnd   = cacheBegin + cache->mappedSize();
+	const uint64_t table      = (uint64_t)(uintptr_t)images;
+	const uint64_t entries    = table + offsetof(objc_opt::objc_headeropt_rw_t, headers);
+	if ( (table < cacheBegin) || (entries > cacheEnd)
+			|| ((uint64_t)images->count * images->entsize > cacheEnd - entries) )
+		return;
+	auto visit = [callback, cacheBase, images](uint64_t objectCacheOffset, uint16_t dylibObjCIndex, bool& stopObjects) {
+		bool stop = false;
+		bool isLoaded = images->isLoaded(dylibObjCIndex);
+		dyld3::darling::callObjCEnumerationBlock(callback, (void*)(cacheBase + objectCacheOffset), isLoaded, &stop);
+		stopObjects = stop;
+	};
+	if ( protocols ) {
+		const objc::ProtocolHashTable* table = opt->protocolOpt();
+		if ( table != nullptr )
+			table->forEachProtocol(name, visit);
+	}
+	else {
+		const objc::ClassHashTable* table = opt->classOpt();
+		if ( table != nullptr )
+			table->forEachClass(name, visit);
+	}
+}
+
+void _dyld_for_each_objc_class(const char* className,
+							   void (^callback)(void* classPtr, bool isLoaded, bool* stop))
+{
+	forEachObjCName(className, callback, false);
+}
+
+void _dyld_for_each_objc_protocol(const char* protocolName,
+								  void (^callback)(void* protocolPtr, bool isLoaded, bool* stop))
+{
+	forEachObjCName(protocolName, callback, true);
 }
 
 void _dyld_images_for_addresses(unsigned count, const void* addresses[], struct dyld_image_uuid_offset infos[])

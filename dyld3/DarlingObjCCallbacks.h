@@ -108,6 +108,18 @@ static_assert(sizeof(ObjCBlockLayout) == 32, "block literal layout");
 
 typedef void (*ObjCBlockInvoke)(void* block, uint32_t objcImageIndex);
 
+// One of libobjc's enumeration blocks (_dyld_for_each_objc_class/_protocol). arm64e libclosure signs its
+// invoke, so a plain branch through it reaches a non-canonical address. Strip the signature and call
+// through the caller's block, whose captures the invoke still finds where it left them; nothing is
+// copied or released, so the block runtime's helpers are never reached. `isa` is never read.
+typedef void (*ObjCEnumerationInvoke)(const ObjCBlockLayout* block, void* objectPtr, bool isLoaded, bool* stop);
+
+static inline void callObjCEnumerationBlock(const void* blockPtr, void* objectPtr, bool isLoaded, bool* stop)
+{
+	const ObjCBlockLayout* block = (const ObjCBlockLayout*)blockPtr;
+	((ObjCEnumerationInvoke)(uintptr_t)stripSignedPointer(block->invoke))(block, objectPtr, isLoaded, stop);
+}
+
 struct ObjCCallbackState {
 	const char*						error		= nullptr;	// why registration failed, for the caller to halt with
 	uintptr_t						version		= 0;

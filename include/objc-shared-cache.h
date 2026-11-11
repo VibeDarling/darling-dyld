@@ -116,8 +116,8 @@ static uint64_t lookup8( uint8_t *k, size_t length, uint64_t level);
 
 namespace objc {
 // The version-16 class/protocol tables (dyld-1376.6 common/OptimizerObjC.h). dyld reads these out of
-// the cache and never builds one, so only what classCount() needs is named here. The arrays follow
-// the fixed part; tab[] is where the variable-length layout begins.
+// the cache and never builds one, so only what the count and the name walk need is named here. The
+// arrays follow the fixed part; tab[] is where the variable-length layout begins.
 class StringHashTable {
 protected:
     typedef uint8_t CheckByteType;
@@ -218,6 +218,10 @@ protected:
             Duplicate duplicate;
             uint64_t  raw;
         };
+
+        bool isDuplicate() const { return duplicate.isDuplicate; }
+        uint32_t duplicateCount() const { return (uint32_t)duplicate.count; }
+        uint32_t duplicateIndex() const { return (uint32_t)duplicate.index; }
     };
 
     // objectOffsets[capacity], then the uint32_t duplicate count, then duplicateOffsets[]
@@ -225,14 +229,55 @@ protected:
     const uint32_t& duplicateCount() const {
         return *(const uint32_t*)&objectOffsets()[capacity];
     }
+    const ObjectData* duplicateOffsets() const {
+        return (const ObjectData*)(&duplicateCount() + 1);
+    }
+
+    // Calls callback(objectCacheOffset, dylibObjCIndex, stopObjects) once per implementation of key, and
+    // stops when a callback sets stopObjects. A template rather than the block Apple's copy takes: this
+    // tree builds dyld for a plain arm64 target and the walk is driver-independent.
+    template <typename ObjectCallback>
+    void forEachObject(const char* key, ObjectCallback callback) const {
+        std::optional<uint32_t> index = tryGetIndex(key);
+        if ( !index.has_value() )
+            return;
+
+        const ObjectData& data = objectOffsets()[*index];
+        if ( !data.isDuplicate() ) {
+            bool stopObjects = false;
+            callback(data.object.objectCacheOffset, data.object.dylibObjCIndex, stopObjects);
+            return;
+        }
+
+        // The object appears in more than one header.
+        uint32_t count = data.duplicateCount();
+        const ObjectData* list = &duplicateOffsets()[data.duplicateIndex()];
+        for ( uint32_t i = 0; i < count; ++i ) {
+            bool stopObjects = false;
+            callback(list[i].object.objectCacheOffset, list[i].object.dylibObjCIndex, stopObjects);
+            if ( stopObjects )
+                break;
+        }
+    }
 };
 
 class ClassHashTable : public ObjectHashTable {
 public:
     uint32_t classCount() const { return occupied + duplicateCount(); }
+
+    template <typename ObjectCallback>
+    void forEachClass(const char* key, ObjectCallback callback) const {
+        forEachObject(key, callback);
+    }
 };
 
-class ProtocolHashTable;
+class ProtocolHashTable : public ObjectHashTable {
+public:
+    template <typename ObjectCallback>
+    void forEachProtocol(const char* key, ObjectCallback callback) const {
+        forEachObject(key, callback);
+    }
+};
 } // namespace objc
 
 // Top-level optimization structure.
@@ -851,8 +896,28 @@ struct objc_protocolopt2_t : objc_clsopt_t {
 // Precomputed image list.
 struct objc_headeropt_ro_t;
 
-// Precomputed image list.
-struct objc_headeropt_rw_t;
+// One image's loaded state, as libobjc writes it through this table when it maps the image.
+struct header_info_rw {
+    uint64_t isLoaded           : 1,
+             allClassesRealized : 1,
+             next               : 62;
+};
+STATIC_ASSERT(sizeof(header_info_rw) == 8);
+
+// Precomputed image list. The class and protocol enumerations report an entry's definition image as
+// loaded only when libobjc has set that image's bit. The table is cache content, so a stride too small
+// to hold an entry reads nothing: an entry may be larger than this struct, never smaller.
+struct objc_headeropt_rw_t {
+    uint32_t count;
+    uint32_t entsize;
+    header_info_rw headers[0];  // sorted by mhdr address
+
+    bool isLoaded(uint32_t index) const {
+        if ( (index >= count) || (entsize < sizeof(header_info_rw)) )
+            return false;
+        return ((const header_info_rw*)((const uint8_t*)headers + index * entsize))->isLoaded;
+    }
+};
 
 // Precomputed class list.
 struct objc_clsopt_t;
