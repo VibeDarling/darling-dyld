@@ -463,12 +463,161 @@ static int l5_check04(void) {
     return 0;
 }
 
+// 05: a class built at runtime: allocate, add a method, register, instantiate, send.
+static int l5_method_answer(void *self, void *cmd) { (void)self; (void)cmd; return 42; }
+
+static int l5_check05(void) {
+    void *base = objc_getClass("NSObject");
+    if (!base)
+        return l5_fail("objc_getClass(NSObject) returned null");
+    void *cls = objc_allocateClassPair(base, "L5Dynamic", 0);
+    if (!cls)
+        return l5_fail("objc_allocateClassPair returned null");
+    void *sel = sel_registerName("answer");
+    if (!sel)
+        return l5_fail("sel_registerName returned null");
+    if (!class_addMethod(cls, sel, (l5_imp)(void *)l5_method_answer, "i@:"))
+        return l5_fail("class_addMethod returned NO");
+    objc_registerClassPair(cls);
+    void *obj = class_createInstance(cls, 0);
+    if (!obj)
+        return l5_fail("class_createInstance returned null");
+    const char *name = class_getName(cls);
+    void *super = class_getSuperclass(cls);
+    int answer = ((int (*)(void *, void *))(void *)objc_msgSend)(obj, sel);
+    if (!name || !streq(name, "L5Dynamic"))
+        return l5_fail("the dynamic class name is not L5Dynamic");
+    if (super != base)
+        return l5_fail("the dynamic class does not inherit NSObject");
+    if (answer != 42)
+        return l5_fail("the added method did not return 42");
+    put("OKMARK 05 subclass name="); put(name); put(" answer="); putdec(answer);
+    put(" super="); put(super ? class_getName(super) : "none"); nl();
+    return 0;
+}
+
+// 06: the six dyld4 objc SPIs against independent facts: the class count from T0's own walk of
+// the cache's table, and libobjc's __objc_classlist size. Never the accessor's value against itself.
+static int l5_check06(void) {
+    uint32_t count = _dyld_objc_class_count();
+    const void *ro = _dyld_for_objc_header_opt_ro();
+    void *rw = _dyld_for_objc_header_opt_rw();
+    void *fn = STRIP((void *)objc_getClass);
+    struct l5_dl_info info;
+    if (!dladdr(fn, &info) || !info.dli_fbase)
+        return l5_fail("dladdr found no image for objc_getClass");
+    const struct l5_mach_header *mh = (const struct l5_mach_header *)info.dli_fbase;
+    struct l5_section_info_result list =
+        _dyld_lookup_section_info(mh, 0, l5_section_data_class_list);
+    struct l5_section_info_result missing =
+        _dyld_lookup_section_info(mh, 0, l5_section_text_swift5_protos);
+    void *h = dlopen("/usr/lib/libobjc.A.dylib", L5_RTLD_NOW);
+    const struct l5_mach_header *dh = h ? _dyld_get_dlopen_image_header(h) : 0;
+    int lookup = list.buffer != 0 && list.bufferSize == L5_CLASSLIST_SIZE &&
+                 missing.buffer == 0 && missing.bufferSize == 0;
+    if (count != L5_CLASS_COUNT)
+        return l5_fail("_dyld_objc_class_count is not 221074");
+    if (!ro || !rw)
+        return l5_fail("a header-opt SPI returned null");
+    if (!lookup)
+        return l5_fail("the section lookup does not give {__objc_classlist, 0x28} and {null, 0}");
+    if (dh != mh)
+        return l5_fail("the dlopen header is not libobjc's");
+    put("OKMARK 06 apis count="); putdec(count);
+    put(" opt_ro=1 opt_rw=1 lookup=1 dlopen_header=1"); nl();
+    return 0;
+}
+
+// 07: register v4 callbacks and read back what the loader reports: the images notified, the
+// per-image refs-optimized bit (1 cache-served libobjc, 0 disk-served libswiftCore) and init calls.
+static uint32_t g_cb_images, g_cb_optimized, g_cb_init;
+static int g_cb_libobjc = -1, g_cb_swiftcore = -1;
+
+static int l5_path_ends_with(const char *path, const char *suffix) {
+    size_t n = 0, m = 0;
+    while (suffix[m])
+        m++;
+    while (path[n])
+        n++;
+    return n >= m && streq(path + n - m, suffix);
+}
+
+static void l5_cb_mapped(unsigned count, const struct l5_mapped_info *infos,
+                         l5_mark_image_mutable mark) {
+    (void)mark;
+    for (unsigned i = 0; i < count; i++) {
+        int bit = L5_REFS_OPTIMIZED(&infos[i]) ? 1 : 0;
+        g_cb_images++;
+        g_cb_optimized += (uint32_t)bit;
+        if (infos[i].path && l5_path_ends_with(infos[i].path, "libobjc.A.dylib"))
+            g_cb_libobjc = bit;
+        if (infos[i].path && l5_path_ends_with(infos[i].path, "libswiftCore.dylib"))
+            g_cb_swiftcore = bit;
+    }
+}
+
+static void l5_cb_init(const struct l5_mapped_info *info) { (void)info; g_cb_init++; }
+static void l5_cb_unmapped(const char *path, const struct l5_mach_header *mh) {
+    (void)path; (void)mh;
+}
+static void l5_cb_patches(const struct l5_mach_header *original, void *originalClass,
+                          const struct l5_mach_header *replacement, const void *replacementClass) {
+    (void)original; (void)originalClass; (void)replacement; (void)replacementClass;
+}
+
+static int l5_check07(void) {
+    static struct l5_objc_callbacks_v4 cb;   // the loader keeps the pointer, so it must outlive the call
+    cb.version = 4;
+    cb.mapped = (l5_mapped3)L5_SIGN_CALLBACK(l5_cb_mapped, &cb.mapped, "_dyld_objc_notify_mapped4");
+    cb.init = (l5_init2)L5_SIGN_CALLBACK(l5_cb_init, &cb.init, "_dyld_objc_notify_init3");
+    cb.unmapped =
+        (l5_unmapped)L5_SIGN_CALLBACK(l5_cb_unmapped, &cb.unmapped, "_dyld_objc_notify_unmapped2");
+    cb.patches =
+        (l5_patches)L5_SIGN_CALLBACK(l5_cb_patches, &cb.patches, "_dyld_objc_notify_patch_class2");
+    _dyld_objc_register_callbacks((const struct l5_objc_callbacks *)&cb);
+    if (g_cb_images == 0)
+        return l5_fail("the mapped callback was never called");
+    if (g_cb_optimized < 1)
+        return l5_fail("no reported image carried dyldObjCRefsOptimized");
+    if (g_cb_libobjc != 1)
+        return l5_fail("the cache-served libobjc's refs-optimized bit is not 1");
+    if (g_cb_swiftcore != 0)
+        return l5_fail("the disk-served libswiftCore's refs-optimized bit is not 0");
+    if (g_cb_init < 1)
+        return l5_fail("the init callback was never called");
+    put("OKMARK 07 callbacks version=4 map_images="); putdec(g_cb_images);
+    put(" refs_optimized="); putdec(g_cb_optimized);
+    put(" libobjc_bit="); putdec(g_cb_libobjc);
+    put(" swiftcore_bit="); putdec(g_cb_swiftcore);
+    put(" init="); putdec(g_cb_init); nl();
+    return 0;
+}
+
+// 08: dispose a runtime-created object, then read the two commpage words libobjc loads (T6).
+static int l5_check08(void) {
+    void *cls = objc_getClass("NSObject");
+    void *obj = cls ? class_createInstance(cls, 0) : 0;
+    if (!obj)
+        return l5_fail("class_createInstance returned null");
+    object_dispose(obj);
+    volatile const uint64_t *cp = (volatile const uint64_t *)L5_COMMPAGE_BASE;
+    uint64_t d0 = cp[L5_COMMPAGE_D0 / 8];
+    uint64_t d8 = cp[L5_COMMPAGE_D8 / 8];
+    put("OKMARK 08 dispose done d0="); puthex((uintptr_t)d0);
+    put(" d8="); puthex((uintptr_t)d8); nl();
+    return 0;
+}
+
 #else   // ABI_NATIVE: the guest checks need libobjc; their decisions are covered by the selftests
 
 static int l5_check01(void) { return l5_fail("guest-only check"); }
 static int l5_check02(void) { return l5_fail("guest-only check"); }
 static int l5_check03(void) { return l5_fail("guest-only check"); }
 static int l5_check04(void) { return l5_fail("guest-only check"); }
+static int l5_check05(void) { return l5_fail("guest-only check"); }
+static int l5_check06(void) { return l5_fail("guest-only check"); }
+static int l5_check07(void) { return l5_fail("guest-only check"); }
+static int l5_check08(void) { return l5_fail("guest-only check"); }
 
 #endif   // ABI_NATIVE
 
@@ -477,6 +626,10 @@ const struct check checks[] = {
     {"check02_getclass", l5_check02, 0},
     {"check03_createinstance", l5_check03, 0},
     {"check04_msgsend", l5_check04, 0},
+    {"check05_subclass", l5_check05, 0},
+    {"check06_apis", l5_check06, 0},
+    {"check07_callbacks", l5_check07, 0},
+    {"check08_dispose", l5_check08, 0},
 };
 const int nchecks = (int)(sizeof checks / sizeof checks[0]);
 
