@@ -47,6 +47,9 @@ HAND = {
   '_signal' => [0x2, 0, 0, 1, 2, 0],                       # sig_t signal(int, sig_t)
   '__Block_copy' => [0x0, 0, 0, 2, 1, 0],                  # void* _Block_copy(const void*)
   '__tlv_atexit' => [0x1, 0, 0, 0, 2, 1],                  # (void (*termFunc)(void*), void* objAddr); not in the T0 lists
+  # The two enumerations take a block, but dyld calls it through a stripped invoke itself: no thunk.
+  '__dyld_for_each_objc_class' => [0x0, 0, 0, 0, 0, 2],
+  '__dyld_for_each_objc_protocol' => [0x0, 0, 0, 0, 0, 2],
 }.freeze
 # The callback-taking imports of the C++ runtime, ObjC and Foundation closures from the T0 facts scan: class, public prototype note.
 FIXTURE = File.readlines(File.join(root, 'tests/darling-arm64e-callback-imports.tsv'), chomp: true).drop(1).map { |l| l.split("\t") }

@@ -2365,12 +2365,28 @@ void _dyld_for_each_objc_class(const char* className,
                            void (^callback)(void* classPtr, bool isLoaded, bool* stop)) {
     if ( gUseDyld3 )
         return dyld3::_dyld_for_each_objc_class(className, callback);
+
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef void (*funcType)(const char*, void (^)(void*, bool, bool*));
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_for_each_objc_class", &p);
+	p(className, callback);
 }
 
 void _dyld_for_each_objc_protocol(const char* protocolName,
                                   void (^callback)(void* protocolPtr, bool isLoaded, bool* stop)) {
     if ( gUseDyld3 )
         return dyld3::_dyld_for_each_objc_protocol(protocolName, callback);
+
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef void (*funcType)(const char*, void (^)(void*, bool, bool*));
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_for_each_objc_protocol", &p);
+	p(protocolName, callback);
 }
 
 void _dyld_register_driverkit_main(void (*mainFunc)(void))
