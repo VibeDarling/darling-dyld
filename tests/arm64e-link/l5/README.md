@@ -18,6 +18,8 @@ arm64 dyld2 must load it and the six dyld4 objc SPIs must answer from the cache.
   result. `native` builds the same harness on the host.
 - `run_l5.sh`: the guest runner for T10, one boot per configuration through `../abi/run_guest.sh`.
 - `arm64e-l5-probe.rb`: the host test described below.
+- `rosetta_stub.c`, `build_l5_prefix.py`, `prefix_unit.py`: the private prefix's disk files (see Prefix) and the
+  host test of the builder.
 
 ## Checks
 
@@ -69,6 +71,32 @@ selftests cover every verdict class; a wrong expected verdict (`selftest-wrong`)
 hash (`--hash-skew 1`) make the driver exit 1; the built executable is arm64e and the build derives
 exactly the listed libobjc imports; the arm64e build hands `sigaction` the compiler-signed fault handler in every config (checked on the compiled assembly: `paciza`, no `xpaci`; a stripped-handler mutation is rejected), and no link-only stub is installed in the prefix, including
 one renamed to `libobjc.A.dylib` (the scan finds stubs by structure, not by name).
+
+## Prefix
+
+`build_l5_prefix.py install --root <runtime root>` (the guest's `prefix/libexec/darling` or a DPREFIX; `LD64`
+set) puts two files on disk in the guest, then runs `precheck`:
+
+- `usr/lib/libRosetta.dylib`: an arm64e stub exporting the two symbols libobjc imports, so libobjc binds to
+  disk instead of the cache's libRosetta (its text holds 4 raw `svc` sites).
+- `usr/lib/swift/libswiftCore.dylib`: an empty plain-arm64 dylib (install name `/usr/lib/swift/libswiftCore.dylib`,
+  compatibility 1.0.0, current 0.0.0, no exports, no dependencies, no sections beyond an empty `__TEXT,__text`,
+  and only the load commands ld64 emits for an empty dylib, so nothing in it can run or export at load).
+  libobjc imports nothing from libswiftCore and only LC_LOADs it. Darling's real file is plain arm64, and its
+  initializer hands the cache's arm64e libobjc unsigned hook pointers (`objc_setHook_getClass`,
+  `objc_setHook_getImageName`, `objc_setHook_lazyClassNamer`, `objc_addLoadImageFunc`), so libobjc traps
+  (`brk #0xc470`). Swift returns at L7, served from the cache.
+
+`install` replaces libswiftCore only when it is absent, a git-lfs pointer or an earlier stand-in; the real
+17 MB file or anything else is refused and left alone (move it aside, for example to
+`libswiftCore.dylib.keep`). Files are replaced atomically. `precheck` fails loud on anything but the stand-in,
+including the real file.
+
+```
+LD64=... python3 -I build_l5_prefix.py install --root <root> [--stub FILE]
+python3 -I build_l5_prefix.py precheck --root <root>
+LD64=... python3 -I prefix_unit.py        # host test; without LD64 the linker-built cases SKIP
+```
 
 ## Guest run (T10)
 
