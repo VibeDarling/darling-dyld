@@ -2424,23 +2424,14 @@ static void forEachObjCName(const char* name,
 		return;
 	const objc_opt::objc_headeropt_rw_t* images = opt->headeropt_rw();
 	const uint8_t* cacheBase = (const uint8_t*)cache;
-	// The rw table is cache content, and the split-cache directory is chosen by the environment. A null
-	// table and an absent one both lie outside the mapping, like a count that would place entries past
-	// its end; rejecting them here is what keeps isLoaded() from reading outside the cache.
-	const uint64_t cacheBegin = (uint64_t)(uintptr_t)cacheBase;
-	const uint64_t mappedSize = cache->mappedSize();
-	const uint64_t cacheEnd   = cacheBegin + mappedSize;
-	const uint64_t table      = (uint64_t)(uintptr_t)images;
-	const uint64_t entries    = table + offsetof(objc_opt::objc_headeropt_rw_t, headers);
-	if ( (table < cacheBegin) || (entries > cacheEnd)
-			|| ((uint64_t)images->count * images->entsize > cacheEnd - entries) )
-		return;
-	// An entry names an object only when its offset lands in a mapped region, not merely inside the span
-	// those regions cover: the split runtime leaves the rest of the region PROT_NONE. forEachRegion reports
-	// unslid mapping addresses, so the offset is applied to the first mapping's address.
-	auto inMappedRegion = [cache](uint64_t objectCacheOffset) {
-		struct Lookup { uint64_t firstAddress; uint64_t offset; bool sawFirst; bool inside; };
-		Lookup lookup = { 0, objectCacheOffset, false, false };
+	// Cache content is chosen by the environment, so the rw table and each object offset must land in a
+	// mapped region, not merely inside the span those regions cover: the split runtime leaves the rest of
+	// that span PROT_NONE, and mappedSize() covers all of it. forEachRegion reports unslid mapping addresses,
+	// so an offset from the cache base is applied to the first mapping's address. The range [offset,
+	// offset + length) must lie inside one region.
+	auto inMappedRegion = [cache](uint64_t cacheOffset, uint64_t length) {
+		struct Lookup { uint64_t firstAddress; uint64_t offset; uint64_t length; bool sawFirst; bool inside; };
+		Lookup lookup = { 0, cacheOffset, length, false, false };
 		Lookup* p = &lookup;
 		cache->forEachRegion(^(const void* content, uint64_t vmAddr, uint64_t size, uint32_t initProt, uint32_t maxProt, uint64_t flags) {
 			if ( !p->sawFirst ) {
@@ -2448,14 +2439,24 @@ static void forEachObjCName(const char* name,
 				p->sawFirst = true;
 			}
 			const uint64_t address = p->firstAddress + p->offset;
-			if ( (address >= vmAddr) && (address < vmAddr + size) )
+			if ( (address >= vmAddr) && (address - vmAddr < size) && (p->length <= size - (address - vmAddr)) )
 				p->inside = true;
 		});
 		return lookup.inside;
 	};
+	// A null or absent table lies below the cache: its offset wraps to a value below the first mapping, which
+	// no region holds. A count that would place entries past the end of its region is rejected the same way,
+	// which is what keeps isLoaded() from reading unmapped memory. The header check comes first because it is
+	// what makes the read of count safe.
+	const uint64_t tableOffset = (uint64_t)(uintptr_t)images - (uint64_t)(uintptr_t)cacheBase;
+	const uint64_t headerSize  = offsetof(objc_opt::objc_headeropt_rw_t, headers);
+	if ( !inMappedRegion(tableOffset, headerSize) )
+		return;
+	if ( !inMappedRegion(tableOffset, headerSize + (uint64_t)images->count * images->entsize) )
+		return;
 	auto visit = [callback, cacheBase, images, &inMappedRegion](uint64_t objectCacheOffset, uint16_t dylibObjCIndex, bool& stopObjects) {
 		// The offset is cache content as well; an entry outside the mapped regions names no object.
-		if ( !inMappedRegion(objectCacheOffset) )
+		if ( !inMappedRegion(objectCacheOffset, 1) )
 			return;
 		bool stop = false;
 		bool isLoaded = images->isLoaded(dylibObjCIndex);

@@ -63,7 +63,12 @@ reg_from = APIS.index(REGISTER_START) or abort 'src/dyldAPIs.cpp: _dyld_objc_not
 reg_sig = APIS.index('void _dyld_objc_register_callbacks(', reg_from) or abort 'src/dyldAPIs.cpp: _dyld_objc_register_callbacks not found'
 reg_to = APIS.index("\n}\n", reg_sig) + 3
 REGISTRATION = APIS[reg_from...reg_to]
+# The walker's rw table comes from headeropt_rw(), whose null branch the optimizer folds away once the result
+# is dereferenced; taking the pointer through an opaque function keeps a dropped header check observable.
+RW_FROM = 'const objc_opt::objc_headeropt_rw_t* images = opt->headeropt_rw();'
 WALKER = source_span(APIS, 'static void forEachObjCName(', "\n}\n", 'src/dyldAPIs.cpp')
+abort 'src/dyldAPIs.cpp: the walker no longer reads headeropt_rw()' unless WALKER.include?(RW_FROM)
+WALKER_OPAQUE = WALKER.sub(RW_FROM) { 'const objc_opt::objc_headeropt_rw_t* images = gRwTableOf(opt);' }
 WRAPPER_CLASS = source_span(APIS, 'void _dyld_for_each_objc_class(const char* className,', "\n}\n",
                             'src/dyldAPIs.cpp')
 WRAPPER_PROTOCOL = source_span(APIS, 'void _dyld_for_each_objc_protocol(const char* protocolName,', "\n}\n",
@@ -110,10 +115,12 @@ STUBS = <<~'CPP'.chomp
       const objc_opt::objc_opt_t* opt = nullptr;
       const objc_opt::objc_opt_t* objcOpt() const { return opt; }
       uint64_t mappedSize() const { return sizeof(mapping); }
-      // Two listed mappings with the unlisted gap the split runtime leaves PROT_NONE; addresses are the
-      // unslid ones forEachRegion reports.
+      // Two listed mappings with the unlisted gap the split runtime leaves PROT_NONE. The addresses are the
+      // unslid ones forEachRegion reports, a slide below the slid content pointers, so taking a content
+      // pointer as the base of an offset lands outside every region.
+      static constexpr uint64_t kSlide = 0x100000;
       void forEachRegion(void (^handler)(const void*, uint64_t, uint64_t, uint32_t, uint32_t, uint64_t)) const {
-          const uint64_t base = (uint64_t)(uintptr_t)mapping;
+          const uint64_t base = (uint64_t)(uintptr_t)mapping - kSlide;
           handler(mapping, base, 0x7800, 3, 3, 0);
           handler(mapping + 0x7c00, base + 0x7c00, 0x400, 3, 3, 0);
       }
@@ -156,6 +163,11 @@ PRELUDE = [
   TABLE_SPIS,
   '',
   <<~'CPP',
+    static const objc_opt::objc_headeropt_rw_t* rwTableOf(const objc_opt::objc_opt_t* opt) { return opt->headeropt_rw(); }
+    static const objc_opt::objc_headeropt_rw_t* (* volatile gRwTableOf)(const objc_opt::objc_opt_t*) = rwTableOf;
+  CPP
+  '',
+  <<~'CPP',
     static bool gGateAtReplay;
     static unsigned gReplays;
     namespace dyld {
@@ -169,7 +181,7 @@ PRELUDE = [
   CPP
   REGISTRATION,
   '',
-  WALKER,
+  WALKER_OPAQUE,
   WRAPPER_CLASS,
   WRAPPER_PROTOCOL,
   '',
@@ -536,6 +548,36 @@ DRIVER = <<~'CPP'
       enumerateClass("HugeStride");
       expect("an rw entry outside the cache mapping makes no call", gInvocations == 0);
 
+      // The rw table must lie wholly inside one mapped region. The listed regions are [0, 0x7800) and
+      // [0x7c00, 0x8000); mappedSize() covers the unlisted gap between them as well.
+      auto placeRwTable = [](uint32_t at, uint32_t count, uint32_t entsize, bool loaded) {
+          write32(gFixture + at, count);
+          write32(gFixture + at + 4, entsize);
+          write64(gFixture + at + 8 + 8 * 2, loaded ? 1 : 0);
+      };
+      struct RwCase { const char* key; uint32_t at; uint32_t count; uint32_t entsize; unsigned expected; const char* what; };
+      const RwCase rwCases[] = {
+          { "RwGap",       0x7900, 8, 8, 0, "an rw table inside the gap between two regions makes no call" },
+          { "RwGapHeader", 0x7800, 8, 8, 0, "an rw table starting at the end of a region makes no call" },
+          { "RwStraddle",  0x77f0, 8, 8, 0, "an rw table whose entries cross the end of a region makes no call" },
+          { "RwHdrCross",  0x77fc, 0, 8, 0, "an rw table whose header crosses the end of a region makes no call" },
+          { "RwCacheEnd",  0x7fd0, 8, 8, 0, "an rw table whose entries cross the end of the last region makes no call" },
+          { "RwLastByte",  0x7fb8, 8, 8, 1, "an rw table ending exactly at the end of the last region is read" },
+          { "RwSecond",    0x7c00, 8, 8, 1, "an rw table inside the second region is read" },
+          { "RwFirstEnd",  0x77b8, 8, 8, 1, "an rw table ending exactly at the end of the first region is read" },
+          // count * entsize wraps to 0 in 32 bits, but entry 1 would land 2 GiB out
+          { "RwWrap",      0x800,  2, 0x80000000u, 0, "an rw table whose 32-bit size wraps to zero makes no call" },
+      };
+      for (const RwCase& rw : rwCases) {
+          beginTable(rw.key);
+          setObject(0x1234, 2);
+          placeRwTable(rw.at, rw.count, rw.entsize, true);
+          useFixtureTable(kTableOffset, 0, (int32_t)rw.at);
+          resetInvocation();
+          enumerateClass(rw.key);
+          expect(rw.what, gInvocations == rw.expected && (rw.expected == 0 || gInvokeLoaded));
+      }
+
       beginTable("NSObject");
       setObject(0x1234, 2);
       setImages(8);
@@ -708,18 +750,27 @@ Dir.mktmpdir('dyld-objc-enumeration-') do |dir|
      'bool isLoaded = (images->isLoaded(dylibObjCIndex), false);', false],
     ['the loaded bit is the entry\'s own image', 'bool isLoaded = images->isLoaded(dylibObjCIndex);',
      'bool isLoaded = images->isLoaded(0);', false],
-    ['a cache without the rw image table answers nothing',
-     "if ( (table < cacheBegin) || (entries > cacheEnd)",
-     "if ( (table == ~0ull) || (entries > cacheEnd)", false],
     ['an index past the image table is not loaded',
      "if ( (index >= count) || (entsize < sizeof(header_info_rw)) )\n            return false;",
      "if ( (false) || (entsize < sizeof(header_info_rw)) )\n            return false;", false],
     ['a stride smaller than one entry is not loaded',
      "if ( (index >= count) || (entsize < sizeof(header_info_rw)) )\n            return false;",
      "if ( index >= count )\n            return false;", false],
-    ['the rw table stays inside the cache mapping',
-     "if ( (table < cacheBegin) || (entries > cacheEnd)\n\t\t\t|| ((uint64_t)images->count * images->entsize > cacheEnd - entries) )\n\t\treturn;",
-     "if ( cacheBegin == 0 && cacheEnd == 0 && table == 0 && entries == 0 )\n\t\treturn;", false],
+    ['the rw table is bounded by the span mappedSize() covers',
+     "\tif ( !inMappedRegion(tableOffset, headerSize) )\n\t\treturn;\n\tif ( !inMappedRegion(tableOffset, headerSize + (uint64_t)images->count * images->entsize) )\n\t\treturn;",
+     "\tconst uint64_t cacheEnd = (uint64_t)(uintptr_t)cacheBase + cache->mappedSize();\n\tconst uint64_t entries = (uint64_t)(uintptr_t)images + headerSize;\n\tif ( ((uint64_t)(uintptr_t)images < (uint64_t)(uintptr_t)cacheBase + (tableOffset & 0)) || (entries > cacheEnd)\n\t\t\t|| ((uint64_t)images->count * images->entsize > cacheEnd - entries) )\n\t\treturn;", false],
+    ['the rw table header is not checked before count is read',
+     "\tif ( !inMappedRegion(tableOffset, headerSize) )\n\t\treturn;\n", "", false],
+    ['the rw table size is computed in 32 bits',
+     "headerSize + (uint64_t)images->count * images->entsize)", "headerSize + (uint32_t)(images->count * images->entsize))", false],
+    ['an offset is based on the slid content pointer',
+     "p->firstAddress = vmAddr;", "p->firstAddress = (uintptr_t)content;", false],
+    ['the rw table is checked for its header only',
+     "\tif ( !inMappedRegion(tableOffset, headerSize + (uint64_t)images->count * images->entsize) )\n\t\treturn;\n", "", false],
+    ['the rw table length is not checked against its region',
+     "(p->length <= size - (address - vmAddr))", "true", false],
+    ['the rw table length is not counted from its entries',
+     "headerSize + (uint64_t)images->count * images->entsize", "headerSize", false],
     ['the entry offset is added to the cache base',
      '(void*)(cacheBase + objectCacheOffset)', '(void*)(cacheBase - objectCacheOffset)', false],
     ['a single implementation is one call', 'if ( !data.isDuplicate() ) {', 'if ( true ) {', false],
@@ -729,7 +780,7 @@ Dir.mktmpdir('dyld-objc-enumeration-') do |dir|
      "if ( (first > total) || (count > total - first) )\n            return;",
      "if ( (first > total) || (count > total) )\n            return;", false],
     ['an object offset stays inside a mapped region',
-     "if ( (address >= vmAddr) && (address < vmAddr + size) )",
+     "if ( (address >= vmAddr) && (address - vmAddr < size) && (p->length <= size - (address - vmAddr)) )",
      "if ( address >= vmAddr )", false],
     ['a duplicate stops when the block asks', "if ( stopObjects )\n                break;",
      "if ( false )\n                break;", false],
