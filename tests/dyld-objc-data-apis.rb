@@ -307,10 +307,91 @@ def build_and_run(dir, source)
   [status.success?, out]
 end
 
+# --- libdyld's three table wrappers, replayed against stubs of the loader --------------------------
+# The dyld2 loader decides whether its objc tables fit the process's libobjc, so a wrapper that answers from
+# libdyld's own copy of the cache's table (gObjCOpt) would hand them to any runtime. The three functions are
+# cut out of src/dyldAPIsInLibSystem.cpp; the cache table here is non-null, so a local answer shows.
+WRAPPER_START = 'const void* _dyld_for_objc_header_opt_ro(void)'
+wrapper_from = WRAPPERS.index(WRAPPER_START + "\n{") or abort 'libsystem table wrappers not found'
+wrapper_to = WRAPPERS.index('struct _dyld_section_info_result _dyld_lookup_section_info(', wrapper_from) or abort 'end of the table wrappers not found'
+TABLE_WRAPPERS = WRAPPERS[wrapper_from...wrapper_to]
+
+WRAPPER_SOURCE = <<~'CPP' + TABLE_WRAPPERS + <<~'CPP2'
+  #include <stdint.h>
+  #include <stdio.h>
+  #include <string.h>
+  #define DYLD_NO_LOCK_THIS_BLOCK
+  #define __ptrauth_dyld_function_ptr
+  namespace objc { struct ClassHashTable { uint32_t classCount() const { return 221074; } }; }
+  namespace objc_opt {
+    struct objc_opt_t {
+      const void* headeropt_ro() const { return (const void*)0xc0; }
+      void* headeropt_rw() const { return (void*)0xc1; }
+      const objc::ClassHashTable* classOpt() const { static objc::ClassHashTable t; return &t; }
+    };
+  }
+  static objc_opt::objc_opt_t gCacheOpt;
+  __attribute__((unused)) static const objc_opt::objc_opt_t* gObjCOpt = &gCacheOpt;
+  static bool gUseDyld3 = false;
+  namespace dyld3 {
+    static const void* _dyld_for_objc_header_opt_ro() { return (const void*)0xd0; }
+    static void* _dyld_for_objc_header_opt_rw() { return (void*)0xd1; }
+    static uint32_t _dyld_objc_class_count() { return 3; }
+  }
+  // The loader's answers, for a runtime that is not the cache's: none.
+  static const void* loaderRo() { return nullptr; }
+  static void* loaderRw() { return nullptr; }
+  static uint32_t loaderCount() { return 0; }
+  static unsigned lookups;
+  static char lastName[64];
+  static void dyld_func_lookup_and_resign(const char* name, const void* (**address)(void)) { ++lookups; strcpy(lastName, name); *address = loaderRo; }
+  static void dyld_func_lookup_and_resign(const char* name, void* (**address)(void)) { ++lookups; strcpy(lastName, name); *address = loaderRw; }
+  static void dyld_func_lookup_and_resign(const char* name, uint32_t (**address)(void)) { ++lookups; strcpy(lastName, name); *address = loaderCount; }
+
+CPP
+  static int failures;
+  static void expect(const char* what, bool ok)
+  {
+    if ( ok ) { printf("ok %s\n", what); return; }
+    ++failures;
+    printf("FAIL %s\n", what);
+  }
+
+  int main()
+  {
+    expect("headeropt_ro is the loader's answer, not libdyld's table", _dyld_for_objc_header_opt_ro() == nullptr);
+    expect("headeropt_ro asks the loader by its row name", strcmp(lastName, "__dyld_for_objc_header_opt_ro") == 0);
+    expect("headeropt_rw is the loader's answer, not libdyld's table", _dyld_for_objc_header_opt_rw() == nullptr);
+    expect("headeropt_rw asks the loader by its row name", strcmp(lastName, "__dyld_for_objc_header_opt_rw") == 0);
+    expect("the class count is the loader's answer, not libdyld's table", _dyld_objc_class_count() == 0);
+    expect("the class count asks the loader by its row name", strcmp(lastName, "__dyld_objc_class_count") == 0);
+    expect("each wrapper looked the loader up once", lookups == 3);
+    _dyld_for_objc_header_opt_ro(); _dyld_for_objc_header_opt_rw(); _dyld_objc_class_count();
+    expect("the loader row is cached after the first call", lookups == 3);
+    gUseDyld3 = true;
+    expect("the dyld3 branch is kept for headeropt_ro", _dyld_for_objc_header_opt_ro() == (const void*)0xd0);
+    expect("the dyld3 branch is kept for headeropt_rw", _dyld_for_objc_header_opt_rw() == (void*)0xd1);
+    expect("the dyld3 branch is kept for the class count", _dyld_objc_class_count() == 3);
+    return failures != 0;
+  }
+CPP2
+
+def build_wrappers(dir, source)
+  exe = "#{dir}/objc_table_wrappers"
+  File.write("#{dir}/wrappers.cpp", source)
+  out, status = Open3.capture2e('clang++', '-std=c++17', '-O1', '-Wall', '-Werror', '-Wno-unused-function', '-o', exe, "#{dir}/wrappers.cpp")
+  return [false, "build failed:\n#{out}"] unless status.success?
+  out, status = Open3.capture2e(exe)
+  [status.success?, out]
+end
+
 Dir.mktmpdir('dyld-objc-data-apis-') do |dir|
   ok, out = build_and_run(dir, lookup_source(SECTION_INFO))
   puts out
   check('section lookup replay', ok, out)
+  ok, out = build_wrappers(dir, WRAPPER_SOURCE)
+  puts out
+  check('table wrappers forward to the loader', ok, out)
   next unless RUN_PROBES
 
   probes = [
@@ -339,6 +420,27 @@ Dir.mktmpdir('dyld-objc-data-apis-') do |dir|
      'if ( seg->nsects > (seg->cmdsize - sizeof(segment_command_64))/sizeof(section_64) )',
      'if ( false )'],
   ]
+  [
+    ['headeropt_ro answers from libdyld\'s table', "\tDYLD_NO_LOCK_THIS_BLOCK;\n    typedef const void* (*funcType)(void);",
+     "    return (gObjCOpt != nullptr) ? gObjCOpt->headeropt_ro() : nullptr;\n\tDYLD_NO_LOCK_THIS_BLOCK;\n    typedef const void* (*funcType)(void);"],
+    ['headeropt_rw answers from libdyld\'s table', "\tDYLD_NO_LOCK_THIS_BLOCK;\n    typedef void* (*funcType)(void);",
+     "    return (gObjCOpt != nullptr) ? gObjCOpt->headeropt_rw() : nullptr;\n\tDYLD_NO_LOCK_THIS_BLOCK;\n    typedef void* (*funcType)(void);"],
+    ['the class count answers from libdyld\'s table', "\tDYLD_NO_LOCK_THIS_BLOCK;\n    typedef uint32_t (*funcType)(void);",
+     "    if ( gObjCOpt != nullptr )\n        return gObjCOpt->classOpt()->classCount();\n\tDYLD_NO_LOCK_THIS_BLOCK;\n    typedef uint32_t (*funcType)(void);"],
+    ['headeropt_ro keeps its dyld3 branch', 'return dyld3::_dyld_for_objc_header_opt_ro();', 'return nullptr;'],
+    ['the class count asks its own row', '"__dyld_objc_class_count"', '"__dyld_for_objc_header_opt_ro"'],
+  ].each do |name, from, to|
+    abort "probe text not found: #{name}" unless WRAPPER_SOURCE.include?(from)
+    ok, out = build_wrappers(dir, WRAPPER_SOURCE.sub(from, to))
+    if out.start_with?('build failed')
+      abort "probe does not compile: #{name}\n#{out}"
+    elsif ok
+      $failures += 1
+      puts "SURVIVED #{name}"
+    else
+      puts "killed   #{name}"
+    end
+  end
   probes.each do |name, from, to|
     source = lookup_source(SECTION_INFO)
     abort "probe text not found: #{name}" unless source.include?(from)

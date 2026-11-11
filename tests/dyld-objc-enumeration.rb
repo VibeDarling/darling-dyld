@@ -52,6 +52,17 @@ BLOCK_LAYOUT = source_span(CALLOUTS, 'struct ObjCBlockLayout {',
                            'dyld3/DarlingObjCCallbacks.h')
 ENUMERATION_CALL = source_span(CALLOUTS, 'typedef void (*ObjCEnumerationInvoke)',
                                "\n}\n", 'dyld3/DarlingObjCCallbacks.h')
+# The gate and the three table SPIs that share it, up to the section lookup that follows them.
+GATE_START = '// The cache holds objc tables for its own libobjc only'
+gate_from = APIS.index(GATE_START) or abort 'src/dyldAPIs.cpp: the objc runtime gate not found'
+gate_to = APIS.index('struct _dyld_section_info_result _dyld_lookup_section_info', gate_from) or abort 'src/dyldAPIs.cpp: lookup after the gate not found'
+TABLE_SPIS = APIS[gate_from...gate_to]
+# The registration entry points: the old-shape one and the one that latches the gate.
+REGISTER_START = 'void _dyld_objc_notify_register(_dyld_objc_notify_mapped'
+reg_from = APIS.index(REGISTER_START) or abort 'src/dyldAPIs.cpp: _dyld_objc_notify_register not found'
+reg_sig = APIS.index('void _dyld_objc_register_callbacks(', reg_from) or abort 'src/dyldAPIs.cpp: _dyld_objc_register_callbacks not found'
+reg_to = APIS.index("\n}\n", reg_sig) + 3
+REGISTRATION = APIS[reg_from...reg_to]
 WALKER = source_span(APIS, 'static void forEachObjCName(', "\n}\n", 'src/dyldAPIs.cpp')
 WRAPPER_CLASS = source_span(APIS, 'void _dyld_for_each_objc_class(const char* className,', "\n}\n",
                             'src/dyldAPIs.cpp')
@@ -59,6 +70,41 @@ WRAPPER_PROTOCOL = source_span(APIS, 'void _dyld_for_each_objc_protocol(const ch
                                'src/dyldAPIs.cpp')
 
 STUBS = <<~'CPP'.chomp
+  struct mach_header;
+  struct _dyld_objc_callbacks { uintptr_t version; };
+  typedef void (*_dyld_objc_notify_mapped)(unsigned, const char* const[], const struct mach_header* const[]);
+  typedef void (*_dyld_objc_notify_init)(const char*, const struct mach_header*);
+  typedef void (*_dyld_objc_notify_unmapped)(const char*, const struct mach_header*);
+  struct ImageLoader {
+      bool inCache;
+      bool inSharedCache() const { return inCache; }
+  };
+  // What a runtime's callbacks struct carries here: its version and its mapped callback.
+  struct StubCallbacks { uintptr_t version; void* mapped; };
+  namespace dyld3 { namespace darling {
+      struct ObjCCallbackState {
+          const char* error = nullptr;
+          uintptr_t version = 0;
+          void* mapped2 = nullptr;
+          void* mapped3 = nullptr;
+          void (*markImageMutableInvoke)(void*, uint32_t) = nullptr;
+          void (*logSkip)(const char*, const char*) = nullptr;
+          void (*logRegistered)(unsigned) = nullptr;
+          void (*logDelivered)(const char*, const char*, unsigned) = nullptr;
+          bool registerCallbacks(const _dyld_objc_callbacks* callbacks)
+          {
+              const StubCallbacks* c = (const StubCallbacks*)callbacks;
+              version = c->version;
+              mapped2 = (version == 2) ? c->mapped : nullptr;
+              mapped3 = (version >= 3) ? c->mapped : nullptr;
+              return true;
+          }
+      };
+      static ObjCCallbackState& objcCallbackState() { static ObjCCallbackState state; return state; }
+      static void objcMappedThunk(unsigned, const char* const[], const struct mach_header* const[]) {}
+      static void objcInitThunk(const char*, const struct mach_header*) {}
+      static void objcUnmappedThunk(const char*, const struct mach_header*) {}
+  } }
   struct DyldSharedCache {
       alignas(16) uint8_t mapping[0x8000];  // the cache mapping the table and entry bounds are checked against
       const objc_opt::objc_opt_t* opt = nullptr;
@@ -81,6 +127,11 @@ STUBS = <<~'CPP'.chomp
       static bool gLogAPIs = false;
       static void log(const char*, ...) {}
       static const void* imMemorySharedCacheHeader() { return gCachePtr; }
+      static bool gLogObjCNotifications = false;
+      static bool gObjCRuntimeIsSharedCache = false;
+      static ImageLoader* findImageContainingAddress(const void* address);
+      static void halt(const char*) { __builtin_trap(); }
+      static void registerObjCNotifiers(_dyld_objc_notify_mapped, _dyld_objc_notify_init, _dyld_objc_notify_unmapped);
   }
 CPP
 
@@ -101,6 +152,22 @@ PRELUDE = [
   '} }',
   '',
   STUBS,
+  '',
+  TABLE_SPIS,
+  '',
+  <<~'CPP',
+    static bool gGateAtReplay;
+    static unsigned gReplays;
+    namespace dyld {
+        // The mapped replay reaches the table SPIs, so what they see here is what libobjc would see.
+        static void registerObjCNotifiers(_dyld_objc_notify_mapped, _dyld_objc_notify_init, _dyld_objc_notify_unmapped)
+        {
+            ++gReplays;
+            gGateAtReplay = (objcRuntimeCache() != nullptr);
+        }
+    }
+  CPP
+  REGISTRATION,
   '',
   WALKER,
   WRAPPER_CLASS,
@@ -495,6 +562,88 @@ DRIVER = <<~'CPP'
       expect("absent tables make no call", gInvocations == 0);
   }
 
+  // The tables answer only when the process's libobjc is the cache's.
+  static const void* (* volatile gOptRo)(void) = _dyld_for_objc_header_opt_ro;
+  static void* (* volatile gOptRw)(void) = _dyld_for_objc_header_opt_rw;
+  static uint32_t (* volatile gClassCount)(void) = _dyld_objc_class_count;
+
+  static void testGate()
+  {
+      beginTable("NSObject");
+      setObject(0x1234, 2);
+      setImages(8);
+      setImageLoaded(2, true);
+      useFixtureTable(kTableOffset, kTableOffset);
+      ((objc_opt::objc_opt_t*)gFixture)->headeropt_ro_offset = 0x700;
+
+      dyld::gObjCRuntimeIsSharedCache = true;
+      resetInvocation();
+      enumerateClass("NSObject");
+      enumerateProtocol("NSObject");
+      expect("a cache libobjc is enumerated, classes and protocols", gInvocations == 2);
+      expect("a cache libobjc gets headeropt_ro", gOptRo() == (const void*)(gFixture + 0x700));
+      expect("a cache libobjc gets headeropt_rw", gOptRw() == (void*)(gFixture + kImages));
+      expect("a cache libobjc gets the class count", gClassCount() == 1);
+
+      dyld::gObjCRuntimeIsSharedCache = false;
+      resetInvocation();
+      enumerateClass("NSObject");
+      enumerateProtocol("NSObject");
+      expect("another libobjc, or none, enumerates no class and no protocol", gInvocations == 0);
+      expect("another libobjc, or none, gets no headeropt_ro", gOptRo() == nullptr);
+      expect("another libobjc, or none, gets no headeropt_rw", gOptRw() == nullptr);
+      expect("another libobjc, or none, gets a zero class count", gClassCount() == 0);
+      dyld::gObjCRuntimeIsSharedCache = true;
+  }
+
+  static uint8_t gCacheCallback[1], gDiskCallback[1];
+  namespace dyld {
+      static ImageLoader gCacheImage = { true }, gDiskImage = { false };
+      static ImageLoader* findImageContainingAddress(const void* address)
+      {
+          if ( address == gCacheCallback ) return &gCacheImage;
+          if ( address == gDiskCallback ) return &gDiskImage;
+          return nullptr;
+      }
+  }
+
+  static void registerRuntime(uintptr_t version, void* mapped)
+  {
+      StubCallbacks callbacks = { version, mapped };
+      gReplays = 0;
+      gGateAtReplay = false;
+      _dyld_objc_register_callbacks((const _dyld_objc_callbacks*)&callbacks);
+  }
+
+  static void testLatch()
+  {
+      expect("before any registration the gate is off", !dyld::gObjCRuntimeIsSharedCache);
+
+      registerRuntime(4, gCacheCallback);
+      expect("a v4 runtime whose callback is in a cache image turns the gate on", dyld::gObjCRuntimeIsSharedCache);
+      expect("the gate is on before the mapped replay", gReplays == 1 && gGateAtReplay);
+
+      dyld::gObjCRuntimeIsSharedCache = false;
+      registerRuntime(4, gDiskCallback);
+      expect("a v4 runtime whose callback is in a disk image leaves the gate off", !dyld::gObjCRuntimeIsSharedCache);
+      expect("the gate is off during that replay", gReplays == 1 && !gGateAtReplay);
+
+      registerRuntime(4, nullptr);
+      expect("a runtime with no mapped callback leaves the gate off", !dyld::gObjCRuntimeIsSharedCache);
+
+      registerRuntime(3, gCacheCallback);
+      expect("a v3 runtime's mapped callback is the one located", dyld::gObjCRuntimeIsSharedCache);
+      dyld::gObjCRuntimeIsSharedCache = false;
+      registerRuntime(2, gDiskCallback);
+      expect("a v2 disk runtime leaves the gate off", !dyld::gObjCRuntimeIsSharedCache);
+
+      gReplays = 0;
+      gGateAtReplay = false;
+      _dyld_objc_notify_register(nullptr, nullptr, nullptr);
+      expect("the old-shape registration replays and leaves the gate off", gReplays == 1 && !gGateAtReplay && !dyld::gObjCRuntimeIsSharedCache);
+      dyld::gObjCRuntimeIsSharedCache = true;   // the walker cases below need the cache's tables
+  }
+
   int main()
   {
       gBlock.layout.isa = (void*)(uintptr_t)0xDEADBEEFDEADBEEFull;
@@ -502,8 +651,10 @@ DRIVER = <<~'CPP'
       gBlock.capture = nullptr;
       signInvoke(gBlock);
 
+      testLatch();
       testHelper();
       testWalker();
+      testGate();
       if ( failures != 0 ) {
           printf("%d failures\n", failures);
           return 1;
@@ -530,6 +681,7 @@ def build_and_run(dir, source, header = nil)
 end
 
 SOURCE = PRELUDE + DRIVER
+
 TABLE_HEADER = File.read("#{ROOT}/include/objc-shared-cache.h")
 
 Dir.mktmpdir('dyld-objc-enumeration-') do |dir|
@@ -586,6 +738,27 @@ Dir.mktmpdir('dyld-objc-enumeration-') do |dir|
      'const objc::ClassHashTable* table = (const objc::ClassHashTable*)opt->protocolOpt();', false],
     ['the class wrapper asks for classes', 'forEachObjCName(className, callback, false);',
      'forEachObjCName(className, callback, true);', false],
+    ['the class and protocol walk ask the gate',
+     "const DyldSharedCache* cache = objcRuntimeCache();\n\tconst objc_opt::objc_opt_t* opt = (cache != nullptr)",
+     "const DyldSharedCache* cache = (const DyldSharedCache*)dyld::imMemorySharedCacheHeader();\n\tconst objc_opt::objc_opt_t* opt = (cache != nullptr)", false],
+    ['headeropt, rw and the class count ask the gate',
+     "const DyldSharedCache* cache = objcRuntimeCache();\n\treturn (cache != nullptr)",
+     "const DyldSharedCache* cache = (const DyldSharedCache*)dyld::imMemorySharedCacheHeader();\n\treturn (cache != nullptr)", false],
+    ['the gate admits the cache libobjc', 'if ( !dyld::gObjCRuntimeIsSharedCache )',
+     'if ( dyld::gObjCRuntimeIsSharedCache )', false],
+    ['the gate flag is read', "if ( !dyld::gObjCRuntimeIsSharedCache )\n\t\treturn nullptr;",
+     "if ( false )\n\t\treturn nullptr;", false],
+    ['the latch is never set', 'dyld::gObjCRuntimeIsSharedCache = (image != nullptr) && image->inSharedCache();',
+     'dyld::gObjCRuntimeIsSharedCache = (image != nullptr) && image->inSharedCache() && false;', false],
+    ['the latch is set for a disk callback', 'dyld::gObjCRuntimeIsSharedCache = (image != nullptr) && image->inSharedCache();',
+     'dyld::gObjCRuntimeIsSharedCache = (image != nullptr);', false],
+    ['the latch is set before the replay',
+     "\tlatchObjCRuntime((state.version >= 3) ? (const void*)state.mapped3 : (const void*)state.mapped2);\n\tdyld::registerObjCNotifiers(dyld3::darling::objcMappedThunk, dyld3::darling::objcInitThunk, dyld3::darling::objcUnmappedThunk);",
+     "\tdyld::registerObjCNotifiers(dyld3::darling::objcMappedThunk, dyld3::darling::objcInitThunk, dyld3::darling::objcUnmappedThunk);\n\tlatchObjCRuntime((state.version >= 3) ? (const void*)state.mapped3 : (const void*)state.mapped2);", false],
+    ['a v3 runtime is located by its mapped3 callback', '(state.version >= 3) ? (const void*)state.mapped3 : (const void*)state.mapped2',
+     '(const void*)state.mapped2', false],
+    ['the old-shape registration leaves the latch alone', "\tdyld::registerObjCNotifiers(mapped, init, unmapped);",
+     "\tdyld::gObjCRuntimeIsSharedCache = true;\n\tdyld::registerObjCNotifiers(mapped, init, unmapped);", false],
     ['a cache without an optimizer table answers nothing', "if ( opt == nullptr )\n\t\treturn;",
      "if ( false )\n\t\treturn;", false],
     ['an absent class table answers nothing', "if ( table != nullptr )\n\t\t\ttable->forEachClass(name, visit);",

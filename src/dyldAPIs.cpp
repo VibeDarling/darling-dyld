@@ -2312,6 +2312,15 @@ static void logObjCDelivered(const char* kind, const char* path, unsigned refsOp
 	dyld::log("dyld: objc %s %s refs_optimized=%u\n", kind, path, refsOptimized);
 }
 
+// Whether the registering runtime is the cache's, from the image holding its mapped callback. Latched once
+// before the mapped replay, which reaches the table SPIs; a plain bool needs no lock for that. The lookup
+// reads dyld's lock-free mapped-range table, so it can run inside the notification lock.
+static void latchObjCRuntime(const void* mappedCallback)
+{
+	const ImageLoader* image = (mappedCallback != nullptr) ? dyld::findImageContainingAddress(mappedCallback) : nullptr;
+	dyld::gObjCRuntimeIsSharedCache = (image != nullptr) && image->inSharedCache();
+}
+
 void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
 {
 	if ( dyld::gLogAPIs )
@@ -2326,6 +2335,7 @@ void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
 	}
 	if ( !state.registerCallbacks(callbacks) )
 		dyld::halt(state.error);
+	latchObjCRuntime((state.version >= 3) ? (const void*)state.mapped3 : (const void*)state.mapped2);
 	dyld::registerObjCNotifiers(dyld3::darling::objcMappedThunk, dyld3::darling::objcInitThunk, dyld3::darling::objcUnmappedThunk);
 }
 
@@ -2347,9 +2357,17 @@ const void* _dyld_get_shared_cache_range(size_t* length)
 
 // The dyld executable has no dyld3/APIs.cpp, so it needs its own copies of these four; libdyld's live in
 // dyld3/APIs.cpp. Both answer from the cache the same way.
+// The cache holds objc tables for its own libobjc only; a disk libobjc, or none registered yet, gets no cache.
+static const DyldSharedCache* objcRuntimeCache()
+{
+	if ( !dyld::gObjCRuntimeIsSharedCache )
+		return nullptr;
+	return (const DyldSharedCache*)dyld::imMemorySharedCacheHeader();
+}
+
 static const objc_opt::objc_opt_t* inMemoryObjCOpt()
 {
-	const DyldSharedCache* cache = (const DyldSharedCache*)dyld::imMemorySharedCacheHeader();
+	const DyldSharedCache* cache = objcRuntimeCache();
 	return (cache != nullptr) ? cache->objcOpt() : nullptr;
 }
 
@@ -2399,7 +2417,7 @@ static void forEachObjCName(const char* name,
 {
 	if ( dyld::gLogAPIs )
 		dyld::log("%s(%s)\n", protocols ? "_dyld_for_each_objc_protocol" : "_dyld_for_each_objc_class", name);
-	const DyldSharedCache* cache = (const DyldSharedCache*)dyld::imMemorySharedCacheHeader();
+	const DyldSharedCache* cache = objcRuntimeCache();
 	const objc_opt::objc_opt_t* opt = (cache != nullptr) ? cache->objcOpt() : nullptr;
 	if ( opt == nullptr )
 		return;

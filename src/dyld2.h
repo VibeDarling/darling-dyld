@@ -67,6 +67,7 @@ namespace dyld {
 	extern struct dyld_all_image_infos*		gProcessInfo;
 	extern bool								gLogAPIs;
 	extern bool								gLogObjCNotifications;
+	extern bool								gObjCRuntimeIsSharedCache;	// latched by _dyld_objc_register_callbacks
 #if SUPPORT_ACCELERATE_TABLES
 	extern bool								gLogAppAPIs;
 #endif

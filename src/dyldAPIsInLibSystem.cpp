@@ -2316,12 +2316,20 @@ const char* _dyld_get_objc_selector(const char* selName)
     return nullptr;
 }
 
+// The loader decides whether its objc tables fit the libobjc in the process, so these forward to it
+// like the enumerations below; libdyld's own copy of the cache's table (gObjCOpt) answers selectors only.
 const void* _dyld_for_objc_header_opt_ro(void)
 {
     if ( gUseDyld3 )
         return dyld3::_dyld_for_objc_header_opt_ro();
 
-    return (gObjCOpt != nullptr) ? gObjCOpt->headeropt_ro() : nullptr;
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef const void* (*funcType)(void);
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_for_objc_header_opt_ro", &p);
+	return p();
 }
 
 void* _dyld_for_objc_header_opt_rw(void)
@@ -2329,7 +2337,13 @@ void* _dyld_for_objc_header_opt_rw(void)
     if ( gUseDyld3 )
         return dyld3::_dyld_for_objc_header_opt_rw();
 
-    return (gObjCOpt != nullptr) ? gObjCOpt->headeropt_rw() : nullptr;
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef void* (*funcType)(void);
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_for_objc_header_opt_rw", &p);
+	return p();
 }
 
 uint32_t _dyld_objc_class_count(void)
@@ -2337,11 +2351,13 @@ uint32_t _dyld_objc_class_count(void)
     if ( gUseDyld3 )
         return dyld3::_dyld_objc_class_count();
 
-    const objc_opt::objc_opt_t* opt = gObjCOpt;
-    if ( opt == nullptr )
-        return 0;
-    const objc::ClassHashTable* classes = opt->classOpt();
-    return (classes != nullptr) ? classes->classCount() : 0;
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef uint32_t (*funcType)(void);
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_objc_class_count", &p);
+	return p();
 }
 
 struct _dyld_section_info_result _dyld_lookup_section_info(const struct mach_header* mh,

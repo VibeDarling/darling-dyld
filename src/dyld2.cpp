@@ -329,6 +329,7 @@ static const char*					sSharedCacheSplitPolicy;	// DYLD_SHARED_CACHE_SPLIT_POLIC
 ImageLoader::LinkContext			gLinkContext;
 bool								gLogAPIs = false;
 bool								gLogObjCNotifications = false;
+bool								gObjCRuntimeIsSharedCache = false;
 #if SUPPORT_ACCELERATE_TABLES
 bool								gLogAppAPIs = false;
 #endif
