@@ -25,7 +25,7 @@ arm64 dyld2 must load it and the six dyld4 objc SPIs must answer from the cache.
 
 | # | Prints one OKMARK line proving |
 |---|--------------------------------|
-| 01 | the image behind `objc_getClass` lies inside the shared cache range (and reports whether a disk copy exists); the driver pairs this with the loader's own `policy=` line for libobjc |
+| 01 | the image behind `objc_getClass` lies inside the shared cache range (and reports whether a disk copy exists); the driver pairs this with the loader's own `policy=` line for libobjc (printed under `DYLD_PRINT_CACHE_POLICY=1`) and fails check 01 unless it says `policy=cache` |
 | 02 | `objc_getClass("NSObject")` returns a class whose name and isa (read with `object_getClass`, not a raw load: arm64e isas are signed or packed) are in the cache, and the measured `rw_loaded=` bit count |
 | 03 | `objc_allocateClassPair`/`class_createInstance` produce a live instance |
 | 04 | `objc_msgSend` answers `-hash` with the object itself and agrees with `isEqual:` |
@@ -105,7 +105,10 @@ DARLING_GUEST_BUILD=<build> PROBE_DIR=<build dir of build_l5.py> CACHE_DIR=<spli
   run_l5.sh l5- 1 1
 ```
 
-The boot runs `c3` (cache variable set, the proof), `c1` (control, no variable: check 01 must fail
+The boot runs `c3` (cache variable set, the proof; it also sets `DYLD_PRINT_OBJC_NOTIFICATIONS=1` and
+`DYLD_PRINT_CACHE_POLICY=1`, inside the guest and never on the launcher, because dyld prints the
+`policy=` line check 01 reads only under the latter and the objc lines check 07 reads only under the
+former; the driver's check children inherit both), `c1` (control, no variable: check 01 must fail
 and say the image is outside the shared cache range) and the selftests. T10 reads the logs and
 expects `c3` to print `SUMMARY ... ok=8 not_ok=0` with eight OKMARK lines; no pass is claimed for
 `c1`, only that its 01 line shows the image was not served from the cache. The run ends with
