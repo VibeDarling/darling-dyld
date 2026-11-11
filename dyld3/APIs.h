@@ -124,6 +124,10 @@ void _dyld_objc_notify_register(_dyld_objc_notify_mapped    mapped,
                                 _dyld_objc_notify_init      init,
                                 _dyld_objc_notify_unmapped  unmapped) TEMP_HIDDEN;
 
+void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks) TEMP_HIDDEN;
+
+const mach_header* _dyld_get_dlopen_image_header(void* handle) TEMP_HIDDEN;
+
 const mach_header* dyld_image_header_containing_address(const void* addr) TEMP_HIDDEN;
 
 const mach_header* _dyld_get_image_header_containing_address(const void* address) TEMP_HIDDEN;

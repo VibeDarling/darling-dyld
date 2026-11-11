@@ -146,6 +146,7 @@ namespace dyld {
 	bool						dladdrFromCache(const void* address, Dl_info* info);
 	bool						isPathInCache(const char* path);
 	const char*					getPathFromIndex(unsigned cacheIndex);
+	const mach_header*			cacheImageMachHeader(void* handle);
 #endif
 #if defined(__x86_64__)
 	bool 						isTranslated();

@@ -5130,6 +5130,17 @@ const char* getPathFromIndex(unsigned cacheIndex)
 	return sAllCacheImagesProxy->getIndexedPath(cacheIndex);
 }
 
+const mach_header* cacheImageMachHeader(void* handle)
+{
+	if ( sAllCacheImagesProxy == NULL )
+		return NULL;
+	unsigned index;
+	uint8_t flags;
+	if ( !sAllCacheImagesProxy->isCacheHandle(handle, &index, &flags) )
+		return NULL;
+	return sAllCacheImagesProxy->machHeaderForIndex(index);
+}
+
 void* dlsymFromCache(void* handle, const char* symName, unsigned index)
 {
 	if ( sAllCacheImagesProxy == NULL )

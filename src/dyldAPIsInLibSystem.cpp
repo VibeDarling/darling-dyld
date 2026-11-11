@@ -2262,6 +2262,38 @@ void _dyld_objc_notify_register(_dyld_objc_notify_mapped    mapped,
 	p(mapped, init, unmapped);
 }
 
+void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
+{
+	if ( gUseDyld3 )
+		return dyld3::_dyld_objc_register_callbacks(callbacks);
+
+	DYLD_LOCK_THIS_BLOCK;
+    typedef void (*funcType)(const struct _dyld_objc_callbacks*);
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_objc_register_callbacks", &p);
+	p(callbacks);
+}
+
+// RTLD_SELF names the image that called this function, so it is answered here: forwarded to the loader,
+// the return address would be this frame instead. Everything else the loader resolves.
+const struct mach_header* _dyld_get_dlopen_image_header(void* handle)
+{
+	if ( handle == RTLD_SELF )
+		return _dyld_get_image_header_containing_address(__builtin_return_address(0));
+	if ( gUseDyld3 )
+		return dyld3::_dyld_get_dlopen_image_header(handle);
+
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef const struct mach_header* (*funcType)(void*);
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_get_dlopen_image_header", &p);
+	return p(handle);
+}
+
 void _dyld_missing_symbol_abort()
 {
     return dyld3::_dyld_missing_symbol_abort();

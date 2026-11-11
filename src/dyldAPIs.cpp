@@ -59,6 +59,7 @@
 #include "MachOFile.h"
 #ifdef DARLING
 #include "DarlingArm64eAdapters.h"
+#include "DarlingObjCCallbacks.h"
 #endif
 
 #undef _POSIX_C_SOURCE
@@ -217,6 +218,7 @@ static const struct dyld_func dyld_funcs[] = {
     {"__dyld_dlopen_preflight",							(void*)dlopen_preflight_compat },
 	{"__dyld_image_count",								(void*)_dyld_image_count },
     {"__dyld_get_image_header",							(void*)_dyld_get_image_header },
+    {"__dyld_get_dlopen_image_header",					(void*)_dyld_get_dlopen_image_header },
     {"__dyld_get_image_vmaddr_slide",					(void*)_dyld_get_image_vmaddr_slide },
     {"__dyld_get_image_name",							(void*)_dyld_get_image_name },
     {"__dyld_get_image_slide",							(void*)_dyld_get_image_slide },
@@ -243,6 +245,7 @@ static const struct dyld_func dyld_funcs[] = {
     {"__dyld_get_image_header_containing_address",		(void*)dyld_image_header_containing_address },
     {"__dyld_is_memory_immutable",						(void*)_dyld_is_memory_immutable },
     {"__dyld_objc_notify_register",						(void*)_dyld_objc_notify_register },
+    {"__dyld_objc_register_callbacks",					(void*)_dyld_objc_register_callbacks },
     {"__dyld_for_objc_header_opt_ro",					(void*)_dyld_for_objc_header_opt_ro },
     {"__dyld_for_objc_header_opt_rw",					(void*)_dyld_for_objc_header_opt_rw },
     {"__dyld_objc_class_count",							(void*)_dyld_objc_class_count },
@@ -418,6 +421,26 @@ const struct mach_header* _dyld_get_image_header(uint32_t image_index)
 	if ( dyld::gLogAPIs )
 		dyld::log("%s(%u)\n", __func__, image_index);
 	return allImagesIndexedMachHeader(image_index);
+}
+
+// RTLD_SELF is answered in libdyld, which still sees its caller's return address; this side never sees it.
+const struct mach_header* _dyld_get_dlopen_image_header(void* handle)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s(%p)\n", __func__, handle);
+
+	if ( handle == RTLD_MAIN_ONLY )
+		return dyld::mainExecutable()->machHeader();
+	if ( (handle == RTLD_DEFAULT) || (handle == RTLD_NEXT) || (handle == RTLD_SELF) )
+		return NULL;
+#if SUPPORT_ACCELERATE_TABLES
+	if ( dyld::isCacheHandle(handle) )
+		return dyld::cacheImageMachHeader(handle);
+#endif
+	ImageLoader* image = (ImageLoader*)(((uintptr_t)handle) & (-4));	// clear mode bits
+	if ( dyld::validImage(image) )
+		return image->machHeader();
+	return NULL;
 }
 
 intptr_t _dyld_get_image_vmaddr_slide(uint32_t image_index)
@@ -2261,6 +2284,27 @@ void _dyld_objc_notify_register(_dyld_objc_notify_mapped    mapped,
                                 _dyld_objc_notify_unmapped  unmapped)
 {
 	dyld::registerObjCNotifiers(mapped, init, unmapped);
+}
+
+// The block a v3/v4 mapped callback is handed, called when libobjc makes a cache image's data mutable
+// before remapping a class or protocol reference. The cache runtime maps each mapping with the cache
+// header's protections, and the data mapping's include write (dyld3/SharedCacheRuntime.cpp:601, :634), so
+// there is nothing to change; the line is the guest evidence that libobjc asked.
+static void markImageMutableImpl(void*, uint32_t objcImageIndex)
+{
+	dyld::log("dyld: objc mark_image_mutable index=%u\n", objcImageIndex);
+}
+
+void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s(%p)\n", __func__, callbacks);
+
+	dyld3::darling::ObjCCallbackState& state = dyld3::darling::objcCallbackState();
+	state.markImageMutableInvoke = markImageMutableImpl;
+	if ( !state.registerCallbacks(callbacks) )
+		dyld::halt(state.error);
+	dyld::registerObjCNotifiers(dyld3::darling::objcMappedThunk, dyld3::darling::objcInitThunk, dyld3::darling::objcUnmappedThunk);
 }
 
 

@@ -43,6 +43,7 @@
 #include "dlfcn.h"
 
 #include "AllImages.h"
+#include "DarlingObjCCallbacks.h"
 #include "Loading.h"
 #include "Logging.h"
 #include "Diagnostics.h"
@@ -722,6 +723,25 @@ void _dyld_objc_notify_register(_dyld_objc_notify_mapped    mapped,
     gAllImages.setObjCNotifiers(mapped, init, unmapped);
 }
 
+// The block a v3/v4 mapped callback is handed. libobjc calls it when it makes a cache image's data
+// mutable before remapping a class or protocol reference. This loader maps the cache's data writable
+// already, so there is nothing to change; the line is the guest evidence that it was asked.
+static void markImageMutableImpl(void*, uint32_t objcImageIndex)
+{
+    log_apis("darling: objc mark_image_mutable index=%u\n", objcImageIndex);
+}
+
+void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
+{
+    log_apis("_dyld_objc_register_callbacks(%p)\n", callbacks);
+
+    darling::ObjCCallbackState& state = darling::objcCallbackState();
+    state.markImageMutableInvoke = markImageMutableImpl;
+    if ( !state.registerCallbacks(callbacks) )
+        halt(state.error);
+    gAllImages.setObjCNotifiers(darling::objcMappedThunk, darling::objcInitThunk, darling::objcUnmappedThunk);
+}
+
 
 const mach_header* dyld_image_header_containing_address(const void* addr)
 {
@@ -935,6 +955,26 @@ int dlclose(void* handle)
         setErrorString("invalid handle passed to dlclose()");
         return -1;
     }
+}
+
+const mach_header* _dyld_get_dlopen_image_header(void* handle)
+{
+    log_apis("_dyld_get_dlopen_image_header(%p)\n", handle);
+
+    if ( handle == RTLD_MAIN_ONLY )
+        return (const mach_header*)gAllImages.mainExecutable();
+    if ( (handle == RTLD_DEFAULT) || (handle == RTLD_NEXT) || (handle == RTLD_SELF) )
+        return nullptr;
+
+    const MachOLoaded*  mh;
+    bool                dontContinue;
+    parseDlHandle(handle, &mh, &dontContinue);
+
+    __block bool validHandle = false;
+    gAllImages.infoForImageWithLoadAddress(mh, ^(const LoadedImage& foundImage) {
+        validHandle = true;
+    });
+    return validHandle ? (const mach_header*)mh : nullptr;
 }
 
 
