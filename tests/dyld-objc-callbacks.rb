@@ -33,6 +33,7 @@ D3HDR = File.read("#{ROOT}/dyld3/APIs.h")
 APIS = File.read("#{ROOT}/src/dyldAPIs.cpp")
 WRAPPERS = File.read("#{ROOT}/src/dyldAPIsInLibSystem.cpp")
 CALLBACKS = File.read("#{ROOT}/dyld3/DarlingObjCCallbacks.h")
+ADAPTERS = File.read("#{ROOT}/dyld3/DarlingArm64eAdapters.h")
 
 # --- wiring: both translation units define the SPIs and register the shared thunks -----------------
 table = APIS[/static const struct dyld_func dyld_funcs\[\] = \{(.*?)\n\};/m, 1]
@@ -78,6 +79,15 @@ SHIM = <<~'CPP'
   };
   typedef void (*_dyld_objc_notify_unmapped)(const char* path, const struct mach_header* mh);
   typedef struct _dyld_section_location_info_s* _dyld_section_location_info_t;
+CPP
+
+# Literal values of the real <mach/machine.h> constants the callbacks header uses (CPU_TYPE_ARM64 0x0100000c).
+SHIM_MACHINE = <<~'CPP'
+  #pragma once
+  typedef int cpu_subtype_t;
+  #define CPU_SUBTYPE_MASK 0xff000000
+  #define CPU_SUBTYPE_ARM64E ((cpu_subtype_t) 2)
+  #define CPU_TYPE_ARM64 0x0100000c
 CPP
 
 DRIVER = <<~'CPP'
@@ -185,6 +195,7 @@ DRIVER = <<~'CPP'
                         _dyld_objc_mark_image_mutable callback)
   {
       ++mappedCalls;
+      if ( chunkCounts < 8 ) chunkSizes[chunkCounts++] = count;
       for ( unsigned i = 0; i < count; ++i ) recordInfo(&infos[i]);
       blockSeen = (const ObjCBlockLayout*)callback;
       blockInvokeField = blockSeen->invoke;
@@ -199,6 +210,37 @@ DRIVER = <<~'CPP'
 
   static void onUnmapped(const char*, const struct mach_header*) { ++unmappedCalls; }
   static void onPatch(const struct mach_header*, void*, const struct mach_header*, const void*) { ++patchCalls; }
+
+  // The loader's skip log: one call per logged line, with the path it names.
+  static const char* loggedPaths[16];
+  static unsigned loggedLines;
+  static bool loggedFormatNamesPath;
+  static void recordSkipLog(const char* format, const char* path)
+  {
+      if ( loggedLines < 16 ) loggedPaths[loggedLines] = path;
+      ++loggedLines;
+      loggedFormatNamesPath = strstr(format, "%s") != nullptr && strstr(format, "unsigned plain arm64") != nullptr;
+  }
+
+  static unsigned loggedFor(const char* path)
+  {
+      unsigned n = 0;
+      for ( unsigned i = 0; i < loggedLines && i < 16; ++i )
+          if ( loggedPaths[i] == path ) ++n;
+      return n;
+  }
+
+  // Registers a v4 struct signed the way the arm64e libobjc signs it.
+  static bool registerV4(ObjCCallbackState& s)
+  {
+      _dyld_objc_callbacks_v4 v4;
+      v4.version = 4;
+      v4.mapped = reinterpret_cast<_dyld_objc_notify_mapped3>(signCallbackIB((uint64_t)(uintptr_t)onMapped3, modifier((uint64_t)(uintptr_t)&v4.mapped, kMappedDisc)));
+      v4.init = reinterpret_cast<_dyld_objc_notify_init2>(signCallbackIB((uint64_t)(uintptr_t)onInit2, modifier((uint64_t)(uintptr_t)&v4.init, kInitDisc)));
+      v4.unmapped = reinterpret_cast<_dyld_objc_notify_unmapped>(signCallbackIB((uint64_t)(uintptr_t)onUnmapped, modifier((uint64_t)(uintptr_t)&v4.unmapped, kUnmappedDisc)));
+      v4.patches = reinterpret_cast<_dyld_objc_notify_patch_class>(signCallbackIB((uint64_t)(uintptr_t)onPatch, modifier((uint64_t)(uintptr_t)&v4.patches, kPatchDisc)));
+      return s.registerCallbacks(asCallbacks(&v4));
+  }
 
   static void recordMutable(void* block, uint32_t objcImageIndex)
   {
@@ -377,6 +419,122 @@ DRIVER = <<~'CPP'
           objcUnmappedThunk(paths[0], &cacheMh);
           expect("the unmapped thunk forwards", unmappedCalls == 1);
       }
+    // The arm64e runtime (v4) must not be handed plain arm64 images. Header values are literals here:
+    // CPU_TYPE_ARM64 0x0100000c, ARM64_ALL 0, ARM64E 2, and the ptrauth ABI bits in the subtype's high byte.
+    {
+        struct mach_header cacheArm64e = {};
+        cacheArm64e.cputype = 0x0100000c;
+        cacheArm64e.cpusubtype = 0x81000002;
+        cacheArm64e.flags = MH_DYLIB_IN_CACHE;
+        struct mach_header diskArm64e = {};
+        diskArm64e.cputype = 0x0100000c;
+        diskArm64e.cpusubtype = 0x00000002;
+        struct mach_header plainA = {};
+        plainA.cputype = 0x0100000c;
+        plainA.cpusubtype = 0x00000000;
+        struct mach_header plainB = {};
+        plainB.cputype = 0x0100000c;
+        plainB.cpusubtype = 0x80000000;
+        struct mach_header foreign = {};
+        foreign.cputype = 0x01000007;
+        foreign.cpusubtype = 0x00000002;
+        const char* mixPaths[4] = { "disk/libplainA.dylib", "cache/libobjc.A.dylib", "disk/libplainB.dylib", "disk/libarm64e.dylib" };
+        const struct mach_header* mix[4] = { &plainA, &cacheArm64e, &plainB, &diskArm64e };
+
+        ObjCCallbackState s;
+        s.logSkip = recordSkipLog;
+        expect("v4 registers for the arm64e filter", registerV4(s));
+        resetRecorder();
+        loggedLines = 0;
+        s.notifyMapped(4, mixPaths, mix);
+        expect("v4 delivers exactly the arm64e images", mappedCalls == 1 && recordedCount == 2);
+        expect("v4 keeps the batch order", recordedMhs[0] == &cacheArm64e && recordedMhs[1] == &diskArm64e);
+        expect("v4 keeps the paths with their images", recordedPaths[0] == mixPaths[1] && recordedPaths[1] == mixPaths[3]);
+        expect("v4 refs-optimized bits follow the delivered images", recordedRefs[0] == 1 && recordedRefs[1] == 0);
+        expect("v4 logs each plain image once", loggedLines == 2 && loggedFor(mixPaths[0]) == 1 && loggedFor(mixPaths[2]) == 1);
+        expect("the log line names the path and the reason", loggedFormatNamesPath);
+        expect("the arm64e images are not logged", loggedFor(mixPaths[1]) == 0 && loggedFor(mixPaths[3]) == 0);
+
+        resetRecorder();
+        const char* onlyPlainPaths[2] = { mixPaths[0], mixPaths[2] };
+        const struct mach_header* onlyPlain[2] = { &plainA, &plainB };
+        s.notifyMapped(2, onlyPlainPaths, onlyPlain);
+        expect("a batch of only plain images makes no mapped call", mappedCalls == 0 && recordedCount == 0);
+
+        resetRecorder();
+        const char* foreignPath = "disk/libforeign.dylib";
+        const struct mach_header* foreignMhs[1] = { &foreign };
+        s.notifyMapped(1, &foreignPath, foreignMhs);
+        expect("the arm64e subtype under another cputype is not arm64e", mappedCalls == 0 && loggedLines == 5);
+
+        resetRecorder();
+        s.notifyInit(mixPaths[0], &plainA);
+        expect("init for a plain image makes no call", initCalls == 0);
+        s.notifyInit(mixPaths[1], &cacheArm64e);
+        expect("init for a cache arm64e image makes one call", initCalls == 1 && recordedMhs[0] == &cacheArm64e && recordedRefs[0] == 1);
+        s.notifyInit(mixPaths[3], &diskArm64e);
+        expect("init for a disk arm64e image makes one call", initCalls == 2 && recordedMhs[1] == &diskArm64e && recordedRefs[1] == 0);
+        expect("init makes no log line", loggedLines == 5);
+
+        resetRecorder();
+        s.notifyUnmapped(mixPaths[0], &plainA);
+        expect("v4 unmapped is still delivered for a plain image", unmappedCalls == 1);
+
+        // The subtype is compared without the ptrauth ABI byte: 1 (ARM64_V8) and 3 are not arm64e, 0xC0000002 is.
+        static const struct { uint32_t subtype; bool delivered; } subtypes[] = {
+            { 0x00000001, false }, { 0x00000003, false }, { 0x80000001, false }, { 0xC0000002, true }, { 0x01000002, true },
+        };
+        for ( const auto& row : subtypes ) {
+            struct mach_header one = {};
+            one.cputype = 0x0100000c;
+            one.cpusubtype = row.subtype;
+            const char* onePath = "disk/libsubtype.dylib";
+            const struct mach_header* oneMh[1] = { &one };
+            resetRecorder();
+            s.notifyMapped(1, &onePath, oneMh);
+            char what[64];
+            snprintf(what, sizeof what, "subtype 0x%08x is %sdelivered", row.subtype, row.delivered ? "" : "not ");
+            expect(what, mappedCalls == (row.delivered ? 1u : 0u));
+        }
+
+        static const struct mach_header* many[130];
+        static const char* manyPaths[130];
+        static struct mach_header manyMh[130];
+        for ( unsigned i = 0; i < 130; ++i ) {
+            const bool plain = i >= 64 && i < 128;
+            manyMh[i].cputype = 0x0100000c;
+            manyMh[i].cpusubtype = plain ? 0 : 2;
+            many[i] = &manyMh[i];
+            manyPaths[i] = "p";
+        }
+        ObjCCallbackState big;
+        registerV4(big);
+        resetRecorder();
+        big.notifyMapped(130, manyPaths, many);
+        expect("a chunk of only plain images makes no call", mappedCalls == 2 && chunkCounts == 2 && chunkSizes[0] == 64 && chunkSizes[1] == 2);
+        expect("the delivered chunks omit exactly the plain run", recordedCount == 66 && recordedMhs[63] == many[63] && recordedMhs[64] == many[128]);
+    }
+    {
+        struct mach_header plain = {};
+        plain.cputype = 0x0100000c;
+        const char* plainPath = "disk/libplain.dylib";
+        const struct mach_header* plainMhs[1] = { &plain };
+        ObjCCallbackState s2;
+        s2.logSkip = recordSkipLog;
+        s2.registerCallbacks(asCallbacks(&v2));
+        resetRecorder();
+        loggedLines = 0;
+        s2.notifyMapped(1, &plainPath, plainMhs);
+        s2.notifyInit(plainPath, &plain);
+        expect("v2 still receives plain images", mappedCalls == 1 && recordedCount == 2 && initCalls == 1 && loggedLines == 0);
+        ObjCCallbackState s3;
+        s3.logSkip = recordSkipLog;
+        s3.registerCallbacks(asCallbacks(&v3));
+        resetRecorder();
+        s3.notifyMapped(1, &plainPath, plainMhs);
+        s3.notifyInit(plainPath, &plain);
+        expect("v3 still receives plain images", mappedCalls == 1 && recordedCount == 2 && initCalls == 1 && loggedLines == 0);
+    }
       {
           fflush(stdout);
           pid_t pid = fork();
@@ -637,10 +795,13 @@ def build_handle(dir, source)
   [st.success?, o + e]
 end
 
-def build_and_run(dir, callbacks_text, block_text)
+def build_and_run(dir, callbacks_text, block_text, adapters_text = ADAPTERS)
   work = File.join(dir, 'work')
   FileUtils.rm_rf(work)
   FileUtils.mkdir_p(File.join(work, 'mach-o'))
+  FileUtils.mkdir_p(File.join(work, 'mach'))
+  File.write(File.join(work, 'mach', 'machine.h'), SHIM_MACHINE)
+  File.write(File.join(work, 'DarlingArm64eAdapters.h'), adapters_text)
   File.write(File.join(work, 'mach-o', 'dyld_priv.h'), SHIM + block_text + "\n")
   File.write(File.join(work, 'DarlingObjCCallbacks.h'), callbacks_text)
   File.write(File.join(work, 'test.cpp'), DRIVER)
@@ -685,6 +846,18 @@ Dir.mktmpdir('dyld-objc-callbacks-') do |dir|
      'markImageMutable.invoke = (uint64_t)(uintptr_t)markImageMutableInvoke;', true, :callbacks],
     ['the invoke is signed with key IA', '.inst 0xDAC10211', '.inst 0xDAC11211', true, :callbacks],
     ['batches are chunked at 64', 'kMaxBatch = 64', 'kMaxBatch = 65', false, :callbacks],
+    ['the arm64e check includes the cputype',
+     'mh->cputype == CPU_TYPE_ARM64 && ', '', false, :callbacks],
+    ['the filter keeps arm64e images', 'return !arm64eRuntime || machHeaderIsArm64e(mh);',
+     'return !arm64eRuntime || !machHeaderIsArm64e(mh);', false, :callbacks],
+    ['only a v4 runtime is filtered', 'arm64eRuntime = kV4RuntimeIsArm64e && callbacksVersion == 4;', 'arm64eRuntime = kV4RuntimeIsArm64e;', false, :callbacks],
+    ['init is filtered too', "if ( !acceptsImage(mh) )\n\t\t\treturn;", "if ( false )\n\t\t\treturn;", false, :callbacks],
+    ['an emptied chunk makes no call', "if ( delivered == 0 )\n\t\t\t\tcontinue;", "if ( false )\n\t\t\t\tcontinue;", false, :callbacks],
+    ['a skipped image is logged', 'if ( logSkip != nullptr )', 'if ( false )', false, :callbacks],
+    ['a v4 runtime is not filtered on unmapped', 'if ( unmapped != nullptr )', 'if ( unmapped != nullptr && acceptsImage(mh) )', false, :callbacks],
+    ['the subtype is the arm64e one, not any nonzero', '(subtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E', '(subtype & ~CPU_SUBTYPE_MASK) != 0', false, :adapters],
+    ['the subtype is the arm64e one, not any at least it', '(subtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E', '(subtype & ~CPU_SUBTYPE_MASK) >= CPU_SUBTYPE_ARM64E', false, :adapters],
+    ['the subtype ABI byte is masked off', '(subtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E', 'subtype == CPU_SUBTYPE_ARM64E', false, :adapters],
     ['version 2 is the v2 struct', 'callbacksVersion == 2', 'callbacksVersion == 1', false, :callbacks],
     ['a null unmapped callback is not called', 'if ( unmapped != nullptr )', 'if ( true )', false, :callbacks],
     ['RTLD_MAIN_ONLY answers the main executable',
@@ -702,9 +875,14 @@ Dir.mktmpdir('dyld-objc-callbacks-') do |dir|
       puts "skip probe #{name} (no pointer authentication on this host)"
       next
     end
-    source = kind == :handle ? handle : CALLBACKS
+    source = { handle: handle, adapters: ADAPTERS }.fetch(kind, CALLBACKS)
     abort "probe text not found: #{name}" unless source.include?(from)
-    ok, out = kind == :handle ? build_handle(dir, source.sub(from, to)) : build_and_run(dir, source.sub(from, to), block)
+    mutated = source.sub(from, to)
+    ok, out = case kind
+              when :handle then build_handle(dir, mutated)
+              when :adapters then build_and_run(dir, CALLBACKS, block, mutated)
+              else build_and_run(dir, mutated, block)
+              end
     if out.start_with?('build failed')
       abort "probe does not compile: #{name}\n#{out}"
     elsif ok

@@ -18,6 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <mach-o/dyld_priv.h>
+#include "DarlingArm64eAdapters.h"
 
 // loader.h carries this when it is the SDK's; dyld2.cpp keeps the same fallback for MH_HAS_OBJC.
 #ifndef MH_DYLIB_IN_CACHE
@@ -26,6 +27,11 @@
 
 namespace dyld3 {
 namespace darling {
+
+static inline bool machHeaderIsArm64e(const struct mach_header* mh)
+{
+	return mh->cputype == CPU_TYPE_ARM64 && cpusubtypeIsArm64e(mh->cpusubtype);
+}
 
 #if defined(__aarch64__) || defined(__arm64__)
 
@@ -72,6 +78,14 @@ static inline uint64_t authenticateCallback(uint64_t pointer, uint64_t) { return
 static inline uint64_t authenticateBlockInvoke(uint64_t invoke, uint64_t) { return invoke; }
 static inline uint64_t signBlockInvoke(uint64_t invoke, uint64_t) { return invoke; }
 
+#endif
+
+// A v4 struct that registered on arm64 had its fields authenticated, so its runtime is arm64e libobjc; on
+// another CPU v4 says nothing about the architecture.
+#if defined(__aarch64__) || defined(__arm64__)
+static const bool kV4RuntimeIsArm64e = true;
+#else
+static const bool kV4RuntimeIsArm64e = false;
 #endif
 
 // An authentication that succeeded leaves a canonical pointer, so stripping it changes nothing; a failed
@@ -130,6 +144,8 @@ struct ObjCCallbackState {
 	_dyld_objc_notify_patch_class	patches		= nullptr;
 	ObjCBlockInvoke					markImageMutableInvoke = nullptr;
 	ObjCBlockLayout					markImageMutable = { nullptr, 0, 0, 0, nullptr };
+	bool							arm64eRuntime = false;	// a v4 registration on arm64: libobjc authenticates the metadata it reads
+	void							(*logSkip)(const char* format, const char* path) = nullptr;
 
 	// Stores the callbacks the struct names. Returns false and sets `error` for a version other than 2-4
 	// and for a v4 field that does not authenticate (a zeroed or forged signature). Versions 2 and 3 are
@@ -175,6 +191,7 @@ struct ObjCCallbackState {
 			return false;
 		}
 		version = callbacksVersion;
+		arm64eRuntime = kV4RuntimeIsArm64e && callbacksVersion == 4;
 		return true;
 	}
 
@@ -195,23 +212,34 @@ struct ObjCCallbackState {
 		for ( unsigned base = 0; base < count; base += kMaxBatch ) {
 			const unsigned batch = (count - base < kMaxBatch) ? count - base : kMaxBatch;
 			_dyld_objc_notify_mapped_info infos[kMaxBatch];
+			unsigned delivered = 0;
 			for ( unsigned i = 0; i < batch; ++i ) {
-				infos[i].mh = mhs[base + i];
-				infos[i].path = paths[base + i];
-				infos[i].sectionLocationMetadata = nullptr;
-				infos[i].dyldObjCRefsOptimized = (mhs[base + i]->flags & MH_DYLIB_IN_CACHE) ? 1 : 0;
-				infos[i].flags = 0;
+				if ( !acceptsImage(mhs[base + i]) ) {
+					if ( logSkip != nullptr )
+						logSkip("dyld: objc skipping %s: its metadata is unsigned plain arm64, which the arm64e runtime cannot authenticate\n", paths[base + i]);
+					continue;
+				}
+				infos[delivered].mh = mhs[base + i];
+				infos[delivered].path = paths[base + i];
+				infos[delivered].sectionLocationMetadata = nullptr;
+				infos[delivered].dyldObjCRefsOptimized = (mhs[base + i]->flags & MH_DYLIB_IN_CACHE) ? 1 : 0;
+				infos[delivered].flags = 0;
+				++delivered;
 			}
+			if ( delivered == 0 )
+				continue;
 			if ( version >= 3 )
-				mapped3(batch, infos, (_dyld_objc_mark_image_mutable)&markImageMutable);
+				mapped3(delivered, infos, (_dyld_objc_mark_image_mutable)&markImageMutable);
 			else
-				mapped2(batch, infos);
+				mapped2(delivered, infos);
 		}
 	}
 
 	void notifyInit(const char* path, const struct mach_header* mh) const
 	{
 		if ( init2 == nullptr )
+			return;
+		if ( !acceptsImage(mh) )
 			return;
 		_dyld_objc_notify_mapped_info info;
 		info.mh = mh;
@@ -229,6 +257,12 @@ struct ObjCCallbackState {
 	}
 
 private:
+	// An arm64e runtime authenticates the objc metadata it reads, which plain arm64 images store unsigned.
+	bool acceptsImage(const struct mach_header* mh) const
+	{
+		return !arm64eRuntime || machHeaderIsArm64e(mh);
+	}
+
 	// Authenticates one v4 field and stores its plain value in `stored`. An all-zero field is null, which
 	// stands as null: a callback the runtime did not provide is not a signature failure.
 	bool authenticateField(uintptr_t signedValue, const volatile void* field, uint16_t discriminator, uint64_t& stored)

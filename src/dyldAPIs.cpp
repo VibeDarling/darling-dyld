@@ -2297,6 +2297,11 @@ static void markImageMutableImpl(void*, uint32_t objcImageIndex)
 	dyld::log("dyld: objc mark_image_mutable index=%u\n", objcImageIndex);
 }
 
+static void logObjCSkip(const char* format, const char* path)
+{
+	dyld::log(format, path);
+}
+
 void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
 {
 	if ( dyld::gLogAPIs )
@@ -2304,6 +2309,7 @@ void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
 
 	dyld3::darling::ObjCCallbackState& state = dyld3::darling::objcCallbackState();
 	state.markImageMutableInvoke = markImageMutableImpl;
+	state.logSkip = logObjCSkip;
 	if ( !state.registerCallbacks(callbacks) )
 		dyld::halt(state.error);
 	dyld::registerObjCNotifiers(dyld3::darling::objcMappedThunk, dyld3::darling::objcInitThunk, dyld3::darling::objcUnmappedThunk);

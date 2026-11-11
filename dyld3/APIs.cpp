@@ -731,12 +731,18 @@ static void markImageMutableImpl(void*, uint32_t objcImageIndex)
     log_apis("darling: objc mark_image_mutable index=%u\n", objcImageIndex);
 }
 
+static void logObjCSkip(const char* format, const char* path)
+{
+    log_apis(format, path);
+}
+
 void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
 {
     log_apis("_dyld_objc_register_callbacks(%p)\n", callbacks);
 
     darling::ObjCCallbackState& state = darling::objcCallbackState();
     state.markImageMutableInvoke = markImageMutableImpl;
+    state.logSkip = logObjCSkip;
     if ( !state.registerCallbacks(callbacks) )
         halt(state.error);
     gAllImages.setObjCNotifiers(darling::objcMappedThunk, darling::objcInitThunk, darling::objcUnmappedThunk);
