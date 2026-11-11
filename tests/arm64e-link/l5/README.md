@@ -8,7 +8,7 @@ arm64 dyld2 must load it and the six dyld4 objc SPIs must answer from the cache.
 ## Files
 
 - `l5_test.c`: the probe. It reuses `../abi/abi_harness.c` (put, `run_one`'s fork plus 12 s watchdog,
-  image capture) with its `main` renamed, and adds the driver, ten selftests and checks 01-08.
+  image capture) with its `main` renamed, and adds the driver, eleven selftests and checks 01-08.
 - `l5_decl.h`: the runtime and SPI declarations plus the callback and section-info layouts.
 - `l5_imports.txt`: the runtime names (`objc_*`, `class_*`, `object_*`, `sel_*`) the test imports from libobjc. The build fails if the test
   gains an import that is neither an SDK libSystem export nor listed here, or if a listed name goes
@@ -29,8 +29,22 @@ arm64 dyld2 must load it and the six dyld4 objc SPIs must answer from the cache.
 | 04 | `objc_msgSend` answers `-hash` with the object itself and agrees with `isEqual:` |
 | 05 | a registered subclass with `class_addMethod` answers 42 and reports NSObject as its superclass |
 | 06 | class count 221074, `__objc_classlist` size 0x28, the absent swift5 protos section, `ro`/`rw` non-null, and `_dyld_get_dlopen_image_header` matching the image |
-| 07 | the version 4 callbacks are registered and the mapped pass reports libobjc served from the cache (`dyldObjCRefsOptimized`) and swiftCore not |
+| 07 | libobjc's own callback registration, seen through the loader's log lines (below): one version 4 registration, libobjc reported with `refs_optimized=1` and this disk-served arm64e executable with `refs_optimized=0`, at least one init callback; the child itself proves the executable is outside and libobjc inside the cache range |
 | 08 | `object_dispose` on a runtime-created object returns, then the two commpage words libobjc loads (0xd0 and 0xd8) are printed as `d0=`/`d8=`; it asserts neither value (T6 characterises them) |
+
+Check 07 registers nothing: the loader keeps one callback state, so a second registration would replace
+libobjc's. The driver reads these loader lines from the child's output (line starts only, `dyld: ` prefix
+optional) and the verdict fails without them:
+
+```
+dyld: objc register_callbacks version=<n>          once per successful registration
+dyld: objc mapped <path> refs_optimized=<0|1>      per image handed to the mapped callback
+dyld: objc init <path> refs_optimized=<0|1>        per image handed to the init callback
+```
+
+The test executable carries an empty `__objc_imageinfo` section (the build asserts it sits in a `__DATA*` segment, which is what dyld2 keys on), so
+the loader reports it to the runtime; it is arm64e and disk-served, hence bit 0 beside libobjc's bit 1.
+The executable path in the mapped line must equal the child's `dladdr` name (no spaces in it).
 
 Check 02 measures the header-opt rw loaded bits; it does not assume nonzero. On the dyld2 path that
 count is expected to be 0 until a libobjc notifier exists, and the check prints what it measured.
@@ -39,7 +53,7 @@ count is expected to be 0 until a libobjc notifier exists, and the check prints 
 
 ```
 python3 -I build_l5.py native --out /tmp/l5_native          # builds the harness on the host
-/tmp/l5_native selftest                                     # ok=5 not_ok=5 expect_mismatches=0
+/tmp/l5_native selftest                                     # ok=6 not_ok=5 expect_mismatches=0
 python3 -I build_l5.py build --out /tmp/l5_build            # needs LD64 and SDKROOT
 python3 -I build_l5.py check /tmp/l5_build/l5_probe [--prefix DIR]
 LD64=... SDKROOT=... [PREFIX=...] ruby arm64e-l5-probe.rb

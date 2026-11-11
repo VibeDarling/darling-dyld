@@ -41,8 +41,7 @@ ARM64E_LD_ARGS = ["-init_offsets"]               # signed __mod_init_func pointe
 REQUIRED_IMPORTS = {
     LIBSYSTEM: ["__dyld_objc_class_count", "__dyld_for_objc_header_opt_ro",
                 "__dyld_for_objc_header_opt_rw", "__dyld_get_dlopen_image_header",
-                "__dyld_lookup_section_info", "__dyld_objc_register_callbacks",
-                "__dyld_get_shared_cache_range", "_dladdr"],
+                "__dyld_lookup_section_info", "__dyld_get_shared_cache_range", "_dladdr"],
     OBJC: ["_objc_getClass", "_objc_msgSend", "_objc_allocateClassPair", "_class_addMethod",
            "_object_dispose", "_object_getClass", "_sel_registerName"],
 }
@@ -169,6 +168,12 @@ def check_exe(path, prefix=None):
     if deps != DEPENDENCIES:
         problems.append("dependencies %s, expected %s" % (deps, DEPENDENCIES))
     sections = {s["name"] for seg in m.segments for s in seg["sections"]}
+    # dyld2 reports an image to libobjc (ImageLoaderMachO.cpp: fNotifyObjC) when a __DATA* segment holds
+    # __objc_imageinfo; check 07's per-image bit for this executable depends on it
+    if not any(s["name"] == "__objc_imageinfo" and seg["name"].startswith("__DATA")
+               for seg in m.segments for s in seg["sections"]):
+        problems.append("no __objc_imageinfo in a __DATA* segment: dyld would not report this executable "
+                        "to libobjc")
     if "__mod_init_func" in sections:
         problems.append("__mod_init_func holds signed pointers dyld would call raw")
     pac = build_abi.text_words(path)

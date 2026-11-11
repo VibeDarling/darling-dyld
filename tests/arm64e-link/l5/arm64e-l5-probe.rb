@@ -59,7 +59,7 @@ st = selftests.scan(/\{"(l5_selftest_\w+)", (l5_st_\w+), "(\w+)"\}/).map { |n, _
 expected_st = [%w[l5_selftest_ok ok], %w[l5_selftest_failed failed],
                %w[l5_selftest_exit0_without_mark failed], %w[l5_selftest_hang hung],
                %w[l5_selftest_fault faulted], %w[l5_selftest_hash_ok ok],
-               %w[l5_selftest_hash_rejects_skew ok], %w[l5_selftest_policy_line ok],
+               %w[l5_selftest_hash_rejects_skew ok], %w[l5_selftest_policy_line ok], %w[l5_selftest_objc_lines ok],
                %w[l5_selftest_mark_match ok], %w[l5_selftest_double_mark failed]]
 check 'the selftests cover every verdict class and the double-mark and hash rules, with their expected verdicts',
       st == expected_st, st.inspect
@@ -70,6 +70,10 @@ SPIS = %w[_dyld_objc_class_count _dyld_get_dlopen_image_header _dyld_objc_regist
         _dyld_lookup_section_info _dyld_for_objc_header_opt_rw _dyld_for_objc_header_opt_ro]
 check 'l5_imports.txt names none of the dyld4 objc SPIs (they are imported from libSystem)',
       (IMPORTS & SPIS).empty?, (IMPORTS & SPIS).inspect
+check 'check 07 observes libobjc\'s registration through the loader log: the test never registers callbacks of its own',
+      !SRC.include?('_dyld_objc_register_callbacks') && !DECL.include?('_dyld_objc_register_callbacks') &&
+      %w[objc\ register_callbacks\ version= objc\ mapped\  objc\ init\ ].all? { |t| SRC.include?(t) } &&
+      SRC[/^static int l5_check07\(void\) \{.*?^\}/m].to_s.include?('loader=?')
 sources = %w[l5_test.c l5_decl.h l5_imports.txt build_l5.py].map { |f| File.read(File.join(HERE, f)) }
 check 'no home path or user name in the l5 sources',
       sources.none? { |t| t.match?(%r{/home/|/Users/}) }
@@ -84,7 +88,7 @@ Dir.mktmpdir('l5-native-') do |dir|
   next unless st.success?
   out, st = Open3.capture2e(bin, 'selftest')
   check 'the selftest set passes: every verdict class classified as expected, no mismatch',
-        st.success? && out.include?('ok=5 not_ok=5 expect_mismatches=0'), out.lines.last
+        st.success? && out.include?('ok=6 not_ok=5 expect_mismatches=0'), out.lines.last
   out, st = Open3.capture2e(bin, 'selftest-wrong')
   check 'a wrong expected verdict makes the driver exit 1 with an EXPECT-MISMATCH',
         !st.success? && out.include?('EXPECT-MISMATCH expected=hung'), out.lines.grep(/MISMATCH/).first

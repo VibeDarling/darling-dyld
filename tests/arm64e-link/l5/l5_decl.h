@@ -49,8 +49,8 @@ extern int access(const char *, int);
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
-// dyld4 objc SPIs (F14). The callback interface is version 4: four plain fields that the cache's
-// arm64e libobjc fills with ptrauth-signed pointers, which this test signs the same way.
+// dyld4 objc SPIs (F14). The callback registration is libobjc's own and is observed through the loader's
+// log (check 07); this test never registers callbacks.
 typedef struct _dyld_section_location_info_s *l5_section_location_info_t;
 
 enum l5_section_location_kind {
@@ -90,51 +90,6 @@ extern struct l5_section_info_result _dyld_lookup_section_info(const struct l5_m
                                                                l5_section_location_info_t handle,
                                                                enum l5_section_location_kind kind);
 extern const struct l5_mach_header *_dyld_get_dlopen_image_header(void *handle);
-struct l5_objc_callbacks {
-    uintptr_t version;
-};
-extern void _dyld_objc_register_callbacks(const struct l5_objc_callbacks *callbacks);
-
-// The v4 callbacks and the batch a mapped notification carries (dyld_priv.h). The refs-optimized bit
-// is bit 0 of the word after sectionLocationMetadata; the loader sets it for cache-served images.
-struct l5_mapped_info {
-    const struct l5_mach_header *mh;
-    const char                  *path;
-    void                        *sectionLocationMetadata;
-    uint32_t                     dyldObjCRefsOptimized : 1,
-                                 flags                 : 31;
-};
-#define L5_REFS_OPTIMIZED(info) ((info)->dyldObjCRefsOptimized != 0)
-
-typedef void (^l5_mark_image_mutable)(uint32_t objcImageIndex);
-typedef void (*l5_mapped3)(unsigned count, const struct l5_mapped_info infos[],
-                           l5_mark_image_mutable markMutable);
-typedef void (*l5_init2)(const struct l5_mapped_info *info);
-typedef void (*l5_unmapped)(const char *path, const struct l5_mach_header *mh);
-typedef void (*l5_patches)(const struct l5_mach_header *originalMH, void *originalClass,
-                           const struct l5_mach_header *replacementMH, const void *replacementClass);
-
-struct l5_objc_callbacks_v4 {
-    uintptr_t  version;
-    l5_mapped3 mapped;     // signed IB, "_dyld_objc_notify_mapped4"
-    l5_init2   init;       // signed IB, "_dyld_objc_notify_init3"
-    l5_unmapped unmapped;  // signed IB, "_dyld_objc_notify_unmapped2"
-    l5_patches patches;    // signed IB, "_dyld_objc_notify_patch_class2"
-};
-
-// The callback fields are ptrauth-signed the way the arm64e libobjc signs them: IB, address
-// diversification against the field, and a string discriminator. A plain build stores the plain
-// pointer; the loader treats an unsigned field as a signature failure only on an arm64e host, where
-// it could not have been produced by this test's compiler anyway.
-#if __has_feature(ptrauth_intrinsics)
-#define L5_SIGN_CALLBACK(fn, field, name)                                                     \
-    ((void *)__builtin_ptrauth_sign_unauthenticated(                                          \
-        (void *)(fn), 1 /* ptrauth_key_process_dependent_code, IB */,                         \
-        __builtin_ptrauth_blend_discriminator((void *)(field),                                \
-                                              __builtin_ptrauth_string_discriminator(name))))
-#else
-#define L5_SIGN_CALLBACK(fn, field, name) ((void *)(fn))
-#endif
 
 // libobjc entry points (objc/runtime.h, libobjc.A's exports). Messages go through objc_msgSend, which
 // this file declares with no prototype and every call casts.

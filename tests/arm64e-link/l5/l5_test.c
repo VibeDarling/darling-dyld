@@ -72,6 +72,122 @@ static int l5_policy_from_log(const char *out, char *policy, int sz) {
     return 0;
 }
 
+// Check 07's evidence: what the loader logs about libobjc's own callback registration, behind the log's
+// "dyld: " prefix, one line each:
+//   objc register_callbacks version=<n>                 once per successful registration
+//   objc mapped <path> refs_optimized=<0|1>             per image handed to the mapped callback
+//   objc init <path> refs_optimized=<0|1>               per image handed to the init callback
+// Only line starts count, so a line the child's own output merely embeds cannot supply them. Like check 01's
+// policy line this trusts the child's code (this file) not to print a loader line itself: the loader and the
+// child share one stream and nothing in it marks the loader's lines.
+struct l5_objc_seen {
+    int registers, version, libobjc_bit, exe_bit, inits;   // bits are -1 until a line names the image
+    int repeats;                                           // mapped lines naming an image already seen
+};
+
+static int l5_eq_n(const char *a, int n, const char *b) {
+    int i = 0;
+    for (; i < n; i++)
+        if (!b[i] || a[i] != b[i])
+            return 0;
+    return !b[i];
+}
+
+// `s` is the tail of a line after the verb: "<path> refs_optimized=<b>". Returns the bit, or -1 when the
+// tail has no such suffix; *plen is the path length.
+static int l5_path_and_bit(const char *s, int *plen) {
+    static const char tag[] = " refs_optimized=";
+    const char *last = 0;
+    const char *e = s;
+    while (*e && *e != '\n')
+        e++;
+    for (const char *p = s; p < e; p++)
+        if (l5_starts(p, tag))
+            last = p;
+    if (!last)
+        return -1;
+    const char *v = last + sizeof tag - 1;
+    if ((v[0] != '0' && v[0] != '1') || v + 1 != e)
+        return -1;
+    *plen = (int)(last - s);
+    return v[0] - '0';
+}
+
+static void l5_objc_scan(const char *out, const char *exe, struct l5_objc_seen *seen) {
+    static const char libobjc[] = "/usr/lib/libobjc.A.dylib";
+    seen->registers = 0; seen->version = -1; seen->libobjc_bit = -1; seen->exe_bit = -1; seen->inits = 0;
+    seen->repeats = 0;
+    for (const char *p = out; *p; ) {
+        const char *h = l5_starts(p, "dyld: ") ? p + 6 : p;
+        int n = 0, bit;
+        if (l5_starts(h, "objc register_callbacks version=")) {
+            const char *v = h + sizeof "objc register_callbacks version=" - 1;
+            seen->registers++;
+            seen->version = (v[0] >= '0' && v[0] <= '9' && (v[1] == '\n' || !v[1])) ? v[0] - '0' : -2;
+        } else if (l5_starts(h, "objc mapped ")) {
+            const char *r = h + sizeof "objc mapped " - 1;
+            if ((bit = l5_path_and_bit(r, &n)) >= 0) {
+                // an image is mapped once; a repeat could hide a wrong bit behind a right one
+                if (l5_eq_n(r, n, libobjc)) {
+                    seen->repeats += seen->libobjc_bit >= 0;
+                    seen->libobjc_bit = bit;
+                }
+                if (exe && l5_eq_n(r, n, exe)) {
+                    seen->repeats += seen->exe_bit >= 0;
+                    seen->exe_bit = bit;
+                }
+            }
+        } else if (l5_starts(h, "objc init ")) {
+            if (l5_path_and_bit(h + sizeof "objc init " - 1, &n) >= 0)
+                seen->inits++;
+        }
+        while (*p && *p != '\n')
+            p++;
+        if (*p)
+            p++;
+    }
+}
+
+// The verdict on a scan: null when the loader's lines prove libobjc registered version 4 callbacks once,
+// was reported cache-served (bit 1) and this disk-served executable was reported with bit 0.
+static const char *l5_objc_verdict(const struct l5_objc_seen *s) {
+    if (s->registers != 1)
+        return "the loader did not log exactly one objc register_callbacks line";
+    if (s->version != 4)
+        return "libobjc did not register version 4 callbacks";
+    if (s->repeats)
+        return "the loader reported an image to the mapped callback more than once";
+    if (s->libobjc_bit != 1)
+        return "the loader did not report the cache-served libobjc with refs_optimized=1";
+    if (s->exe_bit != 0)
+        return "the loader did not report the disk-served executable with refs_optimized=0";
+    if (s->inits < 1)
+        return "the loader logged no objc init callback";
+    return 0;
+}
+
+// The value after `tag` up to a space or the line end, copied into buf; 0 when absent or too long.
+static int l5_token(const char *line, const char *tag, char *buf, int sz) {
+    const char *e = line;
+    while (*e && *e != '\n')
+        e++;
+    for (const char *p = line; p < e; p++) {
+        if (l5_starts(p, tag)) {
+            const char *v = p;
+            for (const char *t = tag; *t; t++)
+                v++;
+            int n = 0;
+            while (v + n < e && v[n] != ' ' && n < sz - 1) {
+                buf[n] = v[n];
+                n++;
+            }
+            buf[n] = 0;
+            return n > 0 && v + n <= e && (v + n == e || v[n] == ' ');
+        }
+    }
+    return 0;
+}
+
 // Lines starting with `prefix`: a check prints exactly one OKMARK line, so a second one is a failure.
 static int l5_count_lines(const char *out, const char *prefix) {
     int n = 0;
@@ -109,24 +225,22 @@ static void l5_echo_line(const char *line) {
     nl();
 }
 
-// Check 01's line as the child printed it, with the driver's measured policy in place of "policy=?".
-static void l5_echo_policy_line(const char *line, const char *policy) {
-    static const char tag[] = "policy=";
+// A child's OKMARK line up to and including `tag`; the caller puts the driver's measured value after it.
+// A line without the tag is echoed whole and 0 is returned.
+static int l5_echo_through(const char *line, const char *tag) {
     const char *end = line;
     while (*end && *end != '\n')
         end++;
-    for (const char *p = line; p + 7 <= end; p++) {
-        int i = 0;
-        while (tag[i] && p[i] == tag[i])
-            i++;
-        if (!tag[i]) {
-            write(1, line, (size_t)(p + i - line));
-            put(policy);
-            nl();
-            return;
+    for (const char *p = line; p < end; p++) {
+        if (l5_starts(p, tag)) {
+            const char *after = p;
+            while (*tag++) after++;
+            write(1, line, (size_t)(after - line));
+            return 1;
         }
     }
     l5_echo_line(line);
+    return 0;
 }
 
 static const char *l5_image_name(uintptr_t a) {
@@ -231,6 +345,23 @@ static int l5_driver(const char *self, const char *setname, const struct check *
                 why = "no loader policy line for /usr/lib/libobjc.A.dylib";
             }
         }
+        // Check 07's proof is what the loader logged about libobjc's own registration, not the child's claim.
+        struct l5_objc_seen seen;
+        seen.registers = 0;
+        if (i == 7 && !use_expect && streq(verdict, "ok")) {
+            char exe[256];
+            if (!markline || !l5_token(markline, " exe=", exe, sizeof exe)) {
+                verdict = "failed";
+                why = "check 07's line names no executable path";
+            } else {
+                l5_objc_scan(out, exe, &seen);
+                const char *bad = l5_objc_verdict(&seen);
+                if (bad) {
+                    verdict = "failed";
+                    why = bad;
+                }
+            }
+        }
         if (use_expect) {
             const char *expect = t[i - 1].expect;
             if (wrong_expect && i == 1)
@@ -243,10 +374,20 @@ static int l5_driver(const char *self, const char *setname, const struct check *
             }
             nl();
         } else if (streq(verdict, "ok")) {
-            if (i == 1)
-                l5_echo_policy_line(markline, policy);
-            else
+            if (i == 1) {
+                if (l5_echo_through(markline, "policy=")) {
+                    put(policy); nl();
+                }
+            } else if (i == 7) {
+                if (l5_echo_through(markline, "loader=")) {
+                    put("registered_version="); putdec(seen.version);
+                    put(" libobjc_bit="); putdec(seen.libobjc_bit);
+                    put(" exe_bit="); putdec(seen.exe_bit);
+                    put(" inits="); putdec(seen.inits); nl();
+                }
+            } else {
                 l5_echo_line(markline);
+            }
         } else if (streq(verdict, "hung")) {
             put("HUNG check="); l5_put2(i); nl();
         } else if (streq(verdict, "faulted")) {
@@ -281,6 +422,53 @@ static int l5_st_fail(void) { return l5_fail("deliberate failure, no OKMARK"); }
 static int l5_st_exit0(void) { return 0; }
 static int l5_st_hang(void) { for (;;) { } }
 static int l5_st_fault(void) { *(volatile int *)8 = 1; return 0; }
+
+static int l5_st_objc_lines(void) {
+    static const char good[] =
+        "dyld: objc register_callbacks version=4\n"
+        "dyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\n"
+        "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\n"
+        "dyld: objc init /tmp/a b/l5_probe refs_optimized=0\n";
+    static const char exe[] = "/tmp/a b/l5_probe";
+    struct l5_objc_seen s;
+    l5_objc_scan(good, exe, &s);
+    if (l5_objc_verdict(&s) || s.version != 4 || s.libobjc_bit != 1 || s.exe_bit != 0 || s.inits != 1)
+        return l5_fail("objc line parse rejected the good lines");
+    static const char *const bad[] = {
+        "dyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\ndyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\n"
+        "dyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",                                   // no register line
+        "dyld: objc register_callbacks version=3\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\n"
+        "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\ndyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",
+        "dyld: objc register_callbacks version=4\ndyld: objc register_callbacks version=4\n"
+        "dyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\ndyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\n"
+        "dyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",                                   // two registrations
+        "dyld: objc register_callbacks version=4\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=0\n"
+        "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\ndyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",
+        "dyld: objc register_callbacks version=4\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\n"
+        "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=1\ndyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",
+        "dyld: objc register_callbacks version=4\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\n"
+        "dyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",                                   // exe never mapped
+        "dyld: objc register_callbacks version=4\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\n"
+        "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\n",                                 // no init
+        "dyld: objc register_callbacks version=4\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=0\n"
+        "dyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\ndyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\n"
+        "dyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",                                   // wrong bit, then right
+        "dyld: objc register_callbacks version=4\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\n"
+        "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=1\ndyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\n"
+        "dyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",
+        "OKMARK 07 dyld: objc register_callbacks version=4\ndyld: objc mapped /usr/lib/libobjc.A.dylib refs_optimized=1\n"
+        "dyld: objc mapped /tmp/a b/l5_probe refs_optimized=0\ndyld: objc init /tmp/a b/l5_probe refs_optimized=0\n",
+    };
+    for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        l5_objc_scan(bad[i], exe, &s);
+        if (!l5_objc_verdict(&s)) {
+            put("bad sample accepted: "); putdec((long)i); nl();
+            return l5_fail("objc line parse accepted a bad sample");
+        }
+    }
+    l5_ok(g_check);
+    return 0;
+}
 
 static int l5_st_hash_ok(void) {
     uintptr_t a = 0x1000;
@@ -347,6 +535,7 @@ static const struct check l5_selftests[] = {
     {"l5_selftest_hash_ok", l5_st_hash_ok, "ok"},
     {"l5_selftest_hash_rejects_skew", l5_st_hash_skew, "ok"},
     {"l5_selftest_policy_line", l5_st_policy, "ok"},
+    {"l5_selftest_objc_lines", l5_st_objc_lines, "ok"},
     {"l5_selftest_mark_match", l5_st_mark, "ok"},
     {"l5_selftest_double_mark", l5_st_double_mark, "failed"},
 };
@@ -529,68 +718,29 @@ static int l5_check06(void) {
     return 0;
 }
 
-// 07: register v4 callbacks and read back what the loader reports: the images notified, the
-// per-image refs-optimized bit (1 cache-served libobjc, 0 disk-served libswiftCore) and init calls.
-static uint32_t g_cb_images, g_cb_optimized, g_cb_init;
-static int g_cb_libobjc = -1, g_cb_swiftcore = -1;
-
-static int l5_path_ends_with(const char *path, const char *suffix) {
-    size_t n = 0, m = 0;
-    while (suffix[m])
-        m++;
-    while (path[n])
-        n++;
-    return n >= m && streq(path + n - m, suffix);
-}
-
-static void l5_cb_mapped(unsigned count, const struct l5_mapped_info *infos,
-                         l5_mark_image_mutable mark) {
-    (void)mark;
-    for (unsigned i = 0; i < count; i++) {
-        int bit = L5_REFS_OPTIMIZED(&infos[i]) ? 1 : 0;
-        g_cb_images++;
-        g_cb_optimized += (uint32_t)bit;
-        if (infos[i].path && l5_path_ends_with(infos[i].path, "libobjc.A.dylib"))
-            g_cb_libobjc = bit;
-        if (infos[i].path && l5_path_ends_with(infos[i].path, "libswiftCore.dylib"))
-            g_cb_swiftcore = bit;
-    }
-}
-
-static void l5_cb_init(const struct l5_mapped_info *info) { (void)info; g_cb_init++; }
-static void l5_cb_unmapped(const char *path, const struct l5_mach_header *mh) {
-    (void)path; (void)mh;
-}
-static void l5_cb_patches(const struct l5_mach_header *original, void *originalClass,
-                          const struct l5_mach_header *replacement, const void *replacementClass) {
-    (void)original; (void)originalClass; (void)replacement; (void)replacementClass;
-}
+// 07: libobjc's own callback registration, seen through the loader's log lines (the driver parses them: dyld
+// keeps one callback state, so this test must not register a second set over libobjc's). The child proves the
+// two images the driver looks for differ: the cache-served libobjc and this disk-served arm64e executable,
+// which carries an __objc_imageinfo section so the loader reports it to the runtime (bit 0, not optimized).
+__attribute__((used, section("__DATA,__objc_imageinfo"))) static const unsigned l5_objc_imageinfo[2] = {0, 0};
 
 static int l5_check07(void) {
-    static struct l5_objc_callbacks_v4 cb;   // the loader keeps the pointer, so it must outlive the call
-    cb.version = 4;
-    cb.mapped = (l5_mapped3)L5_SIGN_CALLBACK(l5_cb_mapped, &cb.mapped, "_dyld_objc_notify_mapped4");
-    cb.init = (l5_init2)L5_SIGN_CALLBACK(l5_cb_init, &cb.init, "_dyld_objc_notify_init3");
-    cb.unmapped =
-        (l5_unmapped)L5_SIGN_CALLBACK(l5_cb_unmapped, &cb.unmapped, "_dyld_objc_notify_unmapped2");
-    cb.patches =
-        (l5_patches)L5_SIGN_CALLBACK(l5_cb_patches, &cb.patches, "_dyld_objc_notify_patch_class2");
-    _dyld_objc_register_callbacks((const struct l5_objc_callbacks *)&cb);
-    if (g_cb_images == 0)
-        return l5_fail("the mapped callback was never called");
-    if (g_cb_optimized < 1)
-        return l5_fail("no reported image carried dyldObjCRefsOptimized");
-    if (g_cb_libobjc != 1)
-        return l5_fail("the cache-served libobjc's refs-optimized bit is not 1");
-    if (g_cb_swiftcore != 0)
-        return l5_fail("the disk-served libswiftCore's refs-optimized bit is not 0");
-    if (g_cb_init < 1)
-        return l5_fail("the init callback was never called");
-    put("OKMARK 07 callbacks version=4 map_images="); putdec(g_cb_images);
-    put(" refs_optimized="); putdec(g_cb_optimized);
-    put(" libobjc_bit="); putdec(g_cb_libobjc);
-    put(" swiftcore_bit="); putdec(g_cb_swiftcore);
-    put(" init="); putdec(g_cb_init); nl();
+    struct l5_dl_info exe, objc;
+    size_t len = 0;
+    const void *base = _dyld_get_shared_cache_range(&len);
+    if (!dladdr(STRIP((void *)l5_check07), &exe) || !exe.dli_fname)
+        return l5_fail("dladdr found no image for the test executable");
+    if (!dladdr(STRIP((void *)objc_getClass), &objc) || !objc.dli_fname)
+        return l5_fail("dladdr found no image for objc_getClass");
+    uintptr_t e = (uintptr_t)exe.dli_fbase, o = (uintptr_t)objc.dli_fbase, b = (uintptr_t)base;
+    int exe_in = base && b <= e && e < b + len;
+    int objc_in = base && b <= o && o < b + len;
+    if (exe_in)
+        return l5_fail("the test executable lies inside the shared cache range");
+    if (!objc_in)
+        return l5_fail("libobjc lies outside the shared cache range");
+    put("OKMARK 07 callbacks observed_by=driver exe_in_cache=0 libobjc_in_cache=1 exe=");
+    put(exe.dli_fname); put(" loader=?"); nl();
     return 0;
 }
 
