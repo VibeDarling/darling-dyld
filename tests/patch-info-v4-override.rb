@@ -45,7 +45,7 @@ OVERRIDE_MAIN = <<~CPP
   }
   static uint64_t stubAddress(const std::string &symbol) {
     static const std::map<std::string, uint64_t> stubs = {{"_alpha", 0x111100001000ull}, {"_gamma", 0x111100002000ull}, {"_delta_data", 0x111100003000ull},
-      {"_bravo", 0x111100004000ull}, {"_unexplained", 0x111100006000ull}};   // _charlie has none: missing; _beta is of an export kind that is not understood
+      {"_bravo", 0x111100004000ull}, {"_unexplained", 0x111100006000ull}, {"_beta", 0x111100005000ull}};   // _charlie has none: missing; _beta is of an export kind that is not understood (7), or kind 8 in mainKind
     auto it = stubs.find(symbol); return it == stubs.end() ? 0 : it->second;
   }
   struct Snapshot { std::vector<uint64_t> words; };
@@ -145,6 +145,39 @@ OVERRIDE_MAIN = <<~CPP
     return failures != 0;
   }
 
+  // Export kind 8 (objc class and class-alias exports) is a plain address, another nonzero kind is not understood: the fixture's _beta
+  // (kind 7, authenticated data-key slot) gets the kind in argv[3] written into the mapped export table before exporter 1 is patched.
+  static unsigned gLogged; static std::string gLoggedLine;
+  static void captureLog(const char *format, ...) { va_list ap; va_start(ap, format); char buf[256]; vsnprintf(buf, sizeof buf, format, ap); va_end(ap); ++gLogged; gLoggedLine = buf; }
+  static int mainKind(const std::string &dir, unsigned kind) {
+    const Fixture f = loadManifest(dir);
+    const DyldSharedCache *cache = mapFixture(dir);
+    size_t beta = 0; while (f.exports[beta].name != "_beta") ++beta;
+    const uint64_t nameWord = f.arrays.at("imageExports").first + 8 * beta + 4;
+    uint32_t nameKind; memcpy(&nameKind, (void *)nameWord, 4);
+    CHECK((nameKind >> 28) == 7);
+    poke(nameWord, 4, (nameKind & 0x0fffffffu) | ((uint64_t)kind << 28));
+    const Snapshot before = snapshot(f);
+    __block std::vector<std::string> seenSymbols;
+    auto resolver = ^bool(const char *symbol, uint64_t *address) { seenSymbols.push_back(symbol); *address = stubAddress(symbol); return *address != 0; };
+    DyldSharedCache::PatchOverrideStats stats;
+    CHECK(cache->overridePatchGotSlots(1, resolver, captureLog, &stats) == nullptr);
+    const bool plainAddress = kind == 0 || kind == 8;
+    CHECK(stats.exports == 4 && stats.slots == 7 && stats.patched == (plainAddress ? 7u : 6u) && stats.unexplained == (plainAddress ? 0u : 1u));
+    CHECK(gLogged == (plainAddress ? 0u : 1u));
+    if ( !plainAddress ) CHECK(gLoggedLine.find("'_beta'") != std::string::npos && gLoggedLine.find("not understood") != std::string::npos);
+    CHECK(seenSymbols == (plainAddress ? std::vector<std::string>{"_alpha", "_beta", "_gamma", "_delta_data"} : std::vector<std::string>{"_alpha", "_gamma", "_delta_data"}));
+    const Snapshot after = snapshot(f);
+    for (const Got &g : f.got) {
+      if ( g.symbol != "_beta" ) continue;
+      if ( !plainAddress ) { CHECK(word(after, f, g.slot) == word(before, f, g.slot)); continue; }
+      // the slot is the stub's address signed as the slot's flags say (data key, no address diversity, discriminator 1)
+      CHECK(g.auth && g.keyData && !g.addrDiv && authenticates(1, word(after, f, g.slot), g.disc, stubAddress("_beta") + g.addend));
+    }
+    printf(failures ? "RESULT failed (%d)\\n" : "RESULT ok\\n", failures);
+    return failures != 0;
+  }
+
   // Refusals that stop the override before it writes: each must leave the GOT mapping read-only and untouched.
   static int mainErrors(const std::string &dir) {
     const Fixture f = loadManifest(dir);
@@ -212,6 +245,7 @@ OVERRIDE_MAIN = <<~CPP
   int main(int argc, char **argv) {
     assert(argc >= 3);
     const std::string mode = argv[2];
+    if ( mode.rfind("kind", 0) == 0 ) return mainKind(argv[1], (unsigned)atoi(mode.c_str() + 4));
     return mode == "errors" ? mainErrors(argv[1]) : mode == "nopatch" ? mainNoPatchInfo(argv[1]) : mainOverride(argv[1]);
   }
 CPP
@@ -225,7 +259,8 @@ Dir.mktmpdir('patch-info-v4-override-') do |dir|
   # patch_high puts the GOT 4 GiB above the cache base, so the high word of every GOT offset is used
   out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/fxh", '--variant', 'patch_high', '--base', base)
   abort out unless st.success?
-  [%w[fx override], %w[fx errors], %w[fxh override]].each do |fixture, mode|
+  # kind 8 is patched like kind 0; the nonzero kinds around it (and the unused 15) are not understood
+  [%w[fx override], %w[fx errors], %w[fxh override], %w[fx kind8], %w[fx kind0], %w[fx kind1], %w[fx kind7], %w[fx kind9], %w[fx kind15]].each do |fixture, mode|
     out, st = Open3.capture2e("#{dir}/test", "#{dir}/#{fixture}", mode)
     puts out
     abort "patch info v4 override test (#{fixture} #{mode}) failed" unless st.success? && out.include?('RESULT ok')

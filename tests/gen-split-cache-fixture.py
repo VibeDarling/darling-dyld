@@ -76,7 +76,7 @@ PATCH_IMAGES = [            # index 1.. (index 0 is libmini); each header sits i
 ]
 # Exports per exporter image index: (name, implementation offset from the exporter's header, kind)
 PATCH_EXPORTS = {
-    1: [("_alpha", 0x1000, 0), ("_beta", 0x1040, 8), ("_gamma", 0x1080, 0), ("_delta_data", 0x2000, 0), ("_plain_only", 0x1100, 0)],
+    1: [("_alpha", 0x1000, 0), ("_beta", 0x1040, 7), ("_gamma", 0x1080, 0), ("_delta_data", 0x2000, 0), ("_plain_only", 0x1100, 0)],
     2: [("_bravo", 0x1000, 0), ("_charlie", 0x1010, 0), ("_unexplained", 0x1020, 0)],
 }
 

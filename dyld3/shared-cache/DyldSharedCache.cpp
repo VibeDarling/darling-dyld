@@ -1400,8 +1400,9 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
         uint64_t address = 0;
         ++stats->exports;
         stats->slots += e.locationsCount;
-        // the kind bits of the name word are not interpreted here: leave those exports alone
-        if ( (t.exports[e.imageExportIndex].nameKind >> 28) != 0 ) {
+        // kind 8 is inferred (observed for objc class and class-alias exports; not defined in the open-source headers), other kinds are left alone
+        const uint32_t kind = t.exports[e.imageExportIndex].nameKind >> 28;
+        if ( (kind != 0) && (kind != 8) ) {
             stats->unexplained += e.locationsCount;
             if ( logFunc != nullptr )
                 logFunc("dyld: GOT slots of '%s' have an export kind that is not understood, left as the cache's pointers\n", symbol);
