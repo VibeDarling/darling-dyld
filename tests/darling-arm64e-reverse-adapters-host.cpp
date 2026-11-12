@@ -441,10 +441,13 @@ static void checkOutCodeArgument()
 	}
 	gWriteOut = false;
 	// a lookup that failed wrote nothing: the memory is not touched
+	const uint64_t untouched = signedDifferently(0x77);
+	CHECK(oracleSign(untouched, 0) != untouched,
+	      "the failed-lookup sentinel is a fixed point of its own signature: a fix-up of the out argument would authenticate it and go unseen");
 	gResult = 0;
-	out = 0x77;
+	out = untouched;
 	f(kS[0], (uint64_t)&out, 0, 0, 0, 0, 0, 0);
-	CHECK(out == 0x77, "the out argument of a failed lookup was touched");
+	CHECK(out == untouched, "the out argument of a failed lookup was touched");
 	// an address that does not authenticate (unsigned, another modifier, corrupted) stops the process, naming the symbol
 	for (uint64_t bad : { target, oracleSign(target, 1), oracleSign(target, 0) ^ (uint64_t)(1ULL << 50) }) {
 		fflush(stdout);
