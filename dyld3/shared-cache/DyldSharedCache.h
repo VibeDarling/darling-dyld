@@ -265,6 +265,13 @@ public:
 
 
     //
+    // The table of dyld_cache_image_info entries: the split table of a split cache, else the legacy one
+    //
+    const dyld_cache_image_info* imageTable(uint32_t& count) const;
+    bool                isSplitCache() const;
+
+
+    //
     // Get local symbols nlist entries
     //
     const void*         getLocalNlistEntries() const;
@@ -454,6 +461,53 @@ public:
 
         DataConstLazyScopedWriter writer;
     };
+
+    // Version 4 patch info of a split macOS cache (see dyld_cache_patch_info_v4). Every read is bounds-checked
+    // against the mapped patch info; the check functions return nullptr or a specific message.
+    struct PatchInfoV4Counts {
+        uint64_t    images, exports, clients, plainLocations, gotExports, gotLocations;
+    };
+
+    // One patch location of an exporter's symbol, decoded.
+    struct PatchLocationV4 {
+        const char*                     symbol;
+        uint32_t                        exportIndex;
+        uint32_t                        kind;           // bits 28-31 of the table's name word, not interpreted
+        uint32_t                        implOffset;     // from the exporter's mach header
+        uint64_t*                       slot;           // mapped address of the pointer
+        uint32_t                        flags;
+        dyld_cache_patch_encoding_v4    encoding;
+        bool                            explained;      // false: the flags have a bit the decoder cannot explain
+    };
+
+    // slots counts every GOT location of the exporter, so patched + unexplained + missingSlots == slots.
+    struct PatchOverrideStats {
+        uint64_t    exports, slots, patched, unexplained, missingExports, missingSlots;
+        bool        alreadyApplied;
+    };
+
+    // A split cache whose patch info is version 4 and lies in a mapping. Nothing below is meaningful without it.
+    bool        hasPatchInfoV4() const;
+    #if !BUILDING_DYLD
+    // The header and the extents, bounds and alignment of the nine arrays: cheap, what the runtime does on every use.
+    const char* checkPatchInfoV4Headers() const;
+    // The headers plus everything one exporter's GOT slices and exports reach.
+    const char* checkPatchInfoV4Exporter(uint32_t imageIndex) const;
+    // The whole table, including every plain location: for tools and tests (88 MB in a real cache).
+    const char* checkPatchInfoV4(PatchInfoV4Counts* counts) const;
+    // These check the exporter's slices first and call the handler only on success.
+    const char* forEachPatchGotLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location)) const;
+    const char* forEachPatchPlainLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location, uint32_t clientIndex)) const;
+    #endif
+    // Overwrites the exporter's coalesced GOT slots with the address resolve() gives for the slot's symbol, signed as
+    // the slot's encoding says. Does nothing a second time for the same exporter. Leaves a slot alone (and counts it)
+    // when resolve() has no address for its symbol (missing), or the encoding or the export kind is not understood
+    // (unexplained); the plain table is never applied. Only the DATA_CONST mappings that a slot is written into are made
+    // writable, each around its writes. Not thread safe: the caller holds dyld's lock. Returns nullptr or why it stopped.
+    // classExport is true for a kind 8 export (objc classes, Swift class metadata, block classes, xpc types), which resolve()
+    // refuses for a plain image: an arm64e runtime never realizes its classes. A refusal counts as missing.
+    const char* overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, bool classExport, uint64_t* address),
+                                      DataConstLogFunc logFunc, PatchOverrideStats* stats) const;
 #endif
 
 #if !(BUILDING_LIBDYLD || BUILDING_DYLD)

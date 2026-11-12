@@ -1,0 +1,15 @@
+# C names the l5 test imports from /usr/lib/libobjc.A.dylib (the cache's runtime). build_l5 links
+# them from a link-only stub generated from this list; every name here must be undefined in the
+# compiled test and every undefined name must be here or an export of the SDK's libSystem family.
+# The six dyld4 objc SPIs are not here: the cache's libobjc imports them from libSystem.
+class_addMethod
+class_createInstance
+class_getName
+class_getSuperclass
+objc_allocateClassPair
+objc_getClass
+objc_msgSend
+objc_registerClassPair
+object_dispose
+object_getClass
+sel_registerName
