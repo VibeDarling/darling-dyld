@@ -108,6 +108,9 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       const void* mh = nullptr;
       uint32_t overrides = 0;
       const void* machHeader() const { return mh; }
+      const char* install = nullptr;     // the image's own install name
+      const char* getInstallPath() const { return install; }
+      bool inSharedCache() const { return tag == 1; }
       void setOverridesCachedDylib(uint32_t n) { overrides = n; }
     };
     static ImageLoader gPool[64]; static int gPoolUsed = 0;
@@ -129,8 +132,11 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       ImageLoader* findLoadedImage(const struct stat&) { return nullptr; }
       static ImageLoader* checkandAddImage(ImageLoader* image, const LoadContext&) { return image; }
       ImageLoader* gOpenReturns = nullptr;   // an image that is already loaded under the same install name
+      const char* gOpenInstall = nullptr;    // install name of a freshly opened disk image
       static ImageLoader* loadPhase5open(const char*, const LoadContext&, const struct stat&, std::vector<const char*>*) {
-        ++seen.diskCalls; return gOpenReturns ? gOpenReturns : newImage(2);
+        ++seen.diskCalls;
+        if ( gOpenReturns ) return gOpenReturns;
+        ImageLoader* i = newImage(2); i->install = gOpenInstall; return i;
       }
       bool sandboxBlockedStat(const char*) { return false; }
       const char* mkstringf(const char*, ...) { return ""; }

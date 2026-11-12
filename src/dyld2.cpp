@@ -3707,8 +3707,13 @@ static bool useCacheImageWithoutClosure(const char* path, const dyld3::SharedCac
 }
 
 // the patch-table override must know which cache image a disk image stands in for
-static void recordDiskOverrideOfCacheImage(const ImageLoader* image, const dyld3::SharedCacheFindDylibResults& found)
+static void recordDiskOverrideOfCacheImage(const ImageLoader* image, const dyld3::SharedCacheFindDylibResults& foundByPath)
 {
+	dyld3::SharedCacheFindDylibResults found = foundByPath;
+	// a library substituted through DYLD_LIBRARY_PATH is not at a cache path, but the cache's code imports it by install name
+	// (checkandAddImage can hand back the cache image already loaded under that install name: not an override of itself)
+	if ( (found.cacheImageIndex == dyld3::kNoCacheImageIndex) && (image->getInstallPath() != nullptr) && !image->inSharedCache() )
+		dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, image->getInstallPath(), &found);
 	if ( (found.image == nullptr) && (found.cacheImageIndex != dyld3::kNoCacheImageIndex)
 	  && sSharedCacheLoadInfo.loadAddress->isSplitCache() ) {
 		// loading can hand back an image that is already loaded under the same install name

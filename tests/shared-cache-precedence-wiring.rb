@@ -98,6 +98,9 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       const void* mh = nullptr;
       uint32_t overrides = 0;
       const void* machHeader() const { return mh; }
+      const char* install = nullptr;     // the image's own install name
+      const char* getInstallPath() const { return install; }
+      bool inSharedCache() const { return tag == 1; }
       void setOverridesCachedDylib(uint32_t n) { overrides = n; }
     };
     static ImageLoader gPool[64]; static int gPoolUsed = 0;
@@ -119,8 +122,11 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       ImageLoader* findLoadedImage(const struct stat&) { return nullptr; }
       static ImageLoader* checkandAddImage(ImageLoader* image, const LoadContext&) { return image; }
       ImageLoader* gOpenReturns = nullptr;   // an image that is already loaded under the same install name
+      const char* gOpenInstall = nullptr;    // install name of a freshly opened disk image
       static ImageLoader* loadPhase5open(const char*, const LoadContext&, const struct stat&, std::vector<const char*>*) {
-        ++seen.diskCalls; return gOpenReturns ? gOpenReturns : newImage(2);
+        ++seen.diskCalls;
+        if ( gOpenReturns ) return gOpenReturns;
+        ImageLoader* i = newImage(2); i->install = gOpenInstall; return i;
       }
       bool sandboxBlockedStat(const char*) { return false; }
       const char* mkstringf(const char*, ...) { return ""; }
@@ -195,6 +201,35 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       CHECK(load("/usr/lib/libnotincache.dylib") == 2 && dyld::sDiskOverridesOfCacheImages.empty());
       dyld3::gDisk.clear();
       CHECK(load("/usr/lib/libnotincache.dylib") == 0);
+      // a disk image substituted for a cache image (DYLD_LIBRARY_PATH) is at no cache path: its install name finds the cache image
+      const char* kSide = "/side/libobjc.A.dylib";
+      dyld3::gDisk.clear(); dyld3::gDisk[kSide] = 558; dyld::sDiskOverridesOfCacheImages.clear();
+      dyld::gOpenInstall = kObjc;
+      CHECK(load(kSide, &img) == 2 && dyld::seen.cacheCalls == 0);
+      CHECK(dyld::sDiskOverridesOfCacheImages.size() == 1 && dyld::sDiskOverridesOfCacheImages[0].image == img
+            && dyld::sDiskOverridesOfCacheImages[0].cacheImageIndex == 1);
+      // loading hands back the cache image already loaded under that install name (checkandAddImage): not an override of itself
+      dyld::sDiskOverridesOfCacheImages.clear();
+      ImageLoader* cached = newImage(1); cached->install = kObjc;
+      dyld::gOpenReturns = cached;
+      CHECK(load(kSide, &img) == 1 && img == cached && dyld::sDiskOverridesOfCacheImages.empty());
+      dyld::gOpenReturns = nullptr;
+      dyld::sDiskOverridesOfCacheImages.clear();
+      // an install name that is not a cache image records nothing
+      dyld::sDiskOverridesOfCacheImages.clear(); dyld::gOpenInstall = "/usr/lib/libnotincache.dylib";
+      CHECK(load(kSide) == 2 && dyld::sDiskOverridesOfCacheImages.empty());
+      // an image without an install name records nothing
+      dyld::gOpenInstall = nullptr;
+      CHECK(load(kSide) == 2 && dyld::sDiskOverridesOfCacheImages.empty());
+      // an old (non-split) cache records no override this way
+      dyld::gOpenInstall = kObjc; f.cache.split = false;
+      CHECK(load(kSide) == 2 && dyld::sDiskOverridesOfCacheImages.empty());
+      f.cache.split = true;
+      // no cache at all (a process that has none): nothing recorded, no null dereference (findInSharedCacheImage answers no)
+      dyld::sSharedCacheLoadInfo.loadAddress = nullptr;
+      CHECK(load(kSide) == 2 && dyld::sDiskOverridesOfCacheImages.empty());
+      dyld::sSharedCacheLoadInfo = { &f.cache, 0 };
+      dyld::gOpenInstall = nullptr; dyld3::gDisk.clear();
       // a canonical path the cache gives back that is unusable is just not allow-listed: today's rule
       f.libz[0] = '\0'; dyld3::gDisk.clear(); dyld3::gDisk[kLibz] = 1;
       CHECK(load(kLibz) == 2);
