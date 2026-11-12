@@ -724,7 +724,9 @@ const char* validateReverseRows(const ReverseRow* rows, size_t count)
 		}
 		if ( (r.evidence == nullptr) || (r.evidence[0] == '\0') )
 			return "a row has no evidence";
-		const bool acts = (r.signMask != 0) || r.authReturn;
+		const bool acts = (r.signMask != 0) || r.authReturn || (r.structArg != 0);
+		if ( (r.structArg == 0) && ((r.structWords != 0) || (r.structSignMask != 0)) )
+			return "a row without a struct argument describes a struct";
 		if ( r.status == AdapterStatus::Unsupported ) {
 			if ( acts )
 				return "a row without an adapter has an action";
@@ -738,6 +740,14 @@ const char* validateReverseRows(const ReverseRow* rows, size_t count)
 			return "a row takes more than eight register arguments";
 		if ( (r.argCount < 8) && ((r.signMask >> r.argCount) != 0) )
 			return "a sign mask names an argument the row does not have";
+		if ( r.structArg != 0 ) {
+			if ( r.structArg > r.argCount )
+				return "a struct argument is out of range";
+			if ( (r.structWords == 0) || (r.structWords > 8) || (r.structSignMask == 0) || ((r.structSignMask >> r.structWords) != 0) )
+				return "a struct has no words, more than eight, or a sign mask outside them";
+			if ( (r.signMask >> (r.structArg - 1)) & 1 )
+				return "the struct argument is also in the sign mask";
+		}
 	}
 	return nullptr;
 }
@@ -750,17 +760,34 @@ const char* validateReverseRows(const ReverseRow* rows, size_t count)
 //
 // isEntry is the predicate the caller of reverseAdaptedTarget gave when this thunk was made; it travels in the thunk's own
 // literals, so two predicates never see each other's thunks.
+static uint64_t signPlainCode(uint64_t value, FunctionEntryPredicate isEntry)
+{
+	if ( (value != 0) && (((isEntry != nullptr) && isEntry(value)) || wasHandedBack(value)) )
+		return AdapterSign::signPointer(value, nullptr, false, 0, 0);
+	return value;
+}
+
 static uint64_t callReverseRow(uint64_t* regs, const ReverseRow* row, uint64_t real, FunctionEntryPredicate isEntry)
 {
 	uint64_t a[8];
 	memcpy(a, regs, sizeof(a));
 	for (unsigned i = 0; i != 8; ++i) {
-		if ( ((row->signMask >> i) & 1) == 0 )
-			continue;
-		if ( a[i] == 0 )
-			continue;
-		if ( ((isEntry != nullptr) && isEntry(a[i])) || wasHandedBack(a[i]) )
-			a[i] = AdapterSign::signPointer(a[i], nullptr, false, 0, 0);
+		if ( (row->signMask >> i) & 1 )
+			a[i] = signPlainCode(a[i], isEntry);
+	}
+	uint64_t calleeStruct[8];
+	if ( (row->structArg != 0) && (a[row->structArg - 1] != 0) ) {
+		const Access access = copyThroughPipe(calleeStruct, (const void*)a[row->structArg - 1], row->structWords * sizeof(uint64_t));
+		if ( access == Access::Ok ) {
+			for (unsigned i = 0; i != row->structWords; ++i) {
+				if ( (row->structSignMask >> i) & 1 )
+					calleeStruct[i] = signPlainCode(calleeStruct[i], isEntry);
+			}
+			a[row->structArg - 1] = (uint64_t)calleeStruct;
+		}
+		else
+			dyld::warn("arm64e adapters: %s could not %s its struct argument, so the callee gets the unsigned original\n", row->symbol,
+					   (access == Access::NoResource) ? "make a pipe to read" : "read");
 	}
 	uint64_t result = ((Call8)real)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
 	if ( row->authReturn && !isSpecialHandler(result) ) {

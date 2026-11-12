@@ -13,12 +13,14 @@ __Unwind_RaiseException	S	unwind.h arg0:exception_object:struct _Unwind_Exceptio
 __Unwind_Resume	S	unwind.h arg0:exception_object:struct _Unwind_Exception.exception_cleanup	OK	T0
 ___cxa_atexit	A	cxxabi.h (declaration in header comment, line 141) arg0::fnptr	OK	T0
 ___cxa_throw	A	cxxabi.h arg2:dest:fnptr	?	T0
+___platform_sigaction	S	signal.h arg1::struct __sigaction_u.__sa_handler;arg2::struct __sigaction_u.__sa_handler	OK	sweep
 __dyld_for_each_objc_class	A	mach-o/dyld_priv.h arg1:callback:block	OK	T0
 __dyld_for_each_objc_protocol	A	mach-o/dyld_priv.h arg1:callback:block	OK	T0
 __dyld_process_info_for_each_aot_image	A	mach-o/dyld_process_info.h arg1:callback:block	OK	T0
 __dyld_register_for_bulk_image_loads	A	mach-o/dyld_priv.h arg0:func:fnptr	OK	T0
 __dyld_register_func_for_remove_image	A	mach-o/dyld.h arg0:func:fnptr	OK	T0
 __os_activity_initiate	A	os/activity.h arg3:activity_block:block	OK	T0
+__os_alloc_once	A	os/alloc_once_impl.h arg2:init:fnptr	OK	sweep
 __os_once	A	os/once_private.h arg2:function:fnptr	OK	T0
 _aio_error	S	sys/aio.h arg0:aiocbp:struct sigevent.sigev_notify_function	OK	T0
 _aio_read	S	sys/aio.h arg0:aiocbp:struct sigevent.sigev_notify_function	OK	T0
@@ -123,6 +125,7 @@ _getnameinfo_async_start	A	netdb_async.h arg4:callback:fnptr	OK	T0
 _glob	A	glob.h arg2::fnptr	OK	T0
 _globfree	S	glob.h arg0::struct union (anonymous at <sdk>/usr/include/glob.h:56:2).gl_errfunc	OK	T0
 _kxld_create_context	A	kxld.h arg1:allocate_callback:fnptr;arg2:log_callback:fnptr	MISSING	T0
+_mach_msg_server_once	A	mach/mach.h arg0:demux:fnptr	OK	sweep
 _malloc_destroy_zone	S	malloc/malloc.h arg0:zone:struct _malloc_zone_t.size	OK	T0
 _malloc_get_zone_name	S	malloc/malloc.h arg0:zone:struct _malloc_zone_t.size	OK	T0
 _malloc_set_zone_name	S	malloc/malloc.h arg0:zone:struct _malloc_zone_t.size	OK	T0

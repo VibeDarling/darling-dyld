@@ -50,7 +50,8 @@ Dir.mktmpdir('rev-adapters') do |dir|
   # pointer parameter, the handler getters authenticate a result, set_* sign argument 0 and authenticate the old handler.
   rows, = AdapterSupport.run(exe, 'rows')
   table = rows.lines.map { |l| s, m, ret, c, status = l.split; [s, [m.to_i(16), ret == '1', c.to_i, status.to_i]] }.to_h
-  check('the table has 25 rows, 2 of them unsupported', table.size == 25 && table.values.count { |v| v[3] == 3 } == 2, table.size.to_s)
+  structs = rows.lines.map { |l| f = l.split; [f[0], [f[5].to_i, f[6].to_i, f[7].to_i(16)]] }.to_h
+  check('the table has 26 rows, 2 of them unsupported', table.size == 26 && table.values.count { |v| v[3] == 3 } == 2, table.size.to_s)
   cache = (ENV['CACHE_EXPORTS'] ? File.readlines(ENV['CACHE_EXPORTS'], chomp: true) : [])
   expected_pf = cache.select { |n| n.include?('PF') && !n.include?('money_get') }
   check('every cache export with a function-pointer parameter has a supported row (skipped without the export list)',
@@ -62,6 +63,8 @@ Dir.mktmpdir('rev-adapters') do |dir|
       check("#{sym}: a getter authenticates the result and signs nothing", auth_return && mask == 0 && argc == 0)
     elsif sym =~ /set_(terminate|unexpected|new_handler)P/
       check("#{sym}: sets sign argument 0 and authenticate the old handler", mask == 1 && auth_return && argc == 1)
+    elsif sym == '__libc_initializer'
+      check('__libc_initializer signs no argument and returns no handler, but the words of its argument 0 struct: version, then 5 code pointers (struct _libc_functions)', mask == 0 && !auth_return && argc == 1 && structs[sym] == [1, 6, 0x3E])
     elsif sym == '___cxa_throw'
       check('___cxa_throw signs the destructor (argument 2)', mask == 4 && !auth_return && argc == 3)
     else
@@ -84,20 +87,35 @@ Dir.mktmpdir('rev-adapters') do |dir|
     puts 'SKIP thunk bytes: llvm-mc not found'
   end
 
+  # the rows file: a mutant of the __libc_initializer row must change what the driver reports
+  rows_file = File.read(File.join(root, 'dyld3/DarlingArm64eReverseRows.inc'))
+  {
+    'the __libc_initializer row signs the version word and no dirhelper' => ['0x3E },', '0x1F },'],
+    'the __libc_initializer row misses atfork_failed' => ['1, 6, 0x3E },', '1, 5, 0x1E },'],
+    'the __libc_initializer row has no struct' => ['1, 6, 0x3E },', '0, 0, 0 },'],
+    'the __libc_initializer row is dropped' => [/^\t\{ "__libc_initializer",.*\n/, ''],
+  }.each do |name, (from, to)|
+    check("rows mutant applies: #{name}", rows_file.scan(from).size == 1)
+    rexe, = AdapterSupport.build(root, dir, 'rowsmutant', driver, reverse_rows_text: rows_file.sub(from, to))
+    rout, = rexe ? AdapterSupport.run(rexe, 'rows') : ['', nil]
+    row = rout.lines.map(&:split).find { |f| f[0] == '__libc_initializer' }
+    check("rows probe killed: #{name}", rexe.nil? || row.nil? || row[5..7] != ['1', '6', '3e'])
+  end
+
   # mutation probes
   adapters = File.read(File.join(root, 'dyld3/DarlingArm64eAdapters.cpp'))
-  sign_line = 'a[i] = AdapterSign::signPointer(a[i], nullptr, false, 0, 0);'
-  entry_test = '((isEntry != nullptr) && isEntry(a[i])) || wasHandedBack(a[i])'
+  sign_line = 'return AdapterSign::signPointer(value, nullptr, false, 0, 0);'
+  entry_test = '((isEntry != nullptr) && isEntry(value)) || wasHandedBack(value)'
   mutants = {
-    'signing is skipped' => [sign_line, ';'],
-    'signing uses the IB key' => [sign_line, 'a[i] = AdapterSign::signPointer(a[i], nullptr, false, 0, 1);'],
-    'signing uses a non-zero discriminator' => [sign_line, 'a[i] = AdapterSign::signPointer(a[i], nullptr, false, 1, 0);'],
-    'signing is address diversified' => [sign_line, 'a[i] = AdapterSign::signPointer(a[i], &a[i], true, 0, 0);'],
-    'the entry check is removed' => ["if ( #{entry_test} )", 'if ( true )'],
-    'the entry check is replaced by the handed-back ring only' => [entry_test, 'wasHandedBack(a[i])'],
-    'the handed-back ring is removed' => [entry_test, '((isEntry != nullptr) && isEntry(a[i]))'],
+    'signing is skipped' => [sign_line, 'return value;'],
+    'signing uses the IB key' => [sign_line, 'return AdapterSign::signPointer(value, nullptr, false, 0, 1);'],
+    'signing uses a non-zero discriminator' => [sign_line, 'return AdapterSign::signPointer(value, nullptr, false, 1, 0);'],
+    'signing is address diversified' => [sign_line, 'return AdapterSign::signPointer(value, &value, true, 0, 0);'],
+    'the entry check is removed' => ["if ( (value != 0) && (#{entry_test}) )", 'if ( value != 0 )'],
+    'the entry check is replaced by the handed-back ring only' => [entry_test, 'wasHandedBack(value)'],
+    'the handed-back ring is removed' => [entry_test, '((isEntry != nullptr) && isEntry(value))'],
     'the handed-back ring accepts any value' => ['return ringHolds(sHandedBack, pointer);', 'return pointer != 0;'],
-    'a missing predicate signs' => ['((isEntry != nullptr) && isEntry(a[i]))', '((isEntry == nullptr) || isEntry(a[i]))'],
+    'a missing predicate signs' => ['((isEntry != nullptr) && isEntry(value))', '((isEntry == nullptr) || isEntry(value))'],
     'the authenticated handler is not remembered' => ['recordHandedBack(authenticatedResult);', ';'],
     # (removing the NULL skip is an equivalent mutant: signPointer returns 0 for 0)
     'the returned handler is stripped instead of authenticated' => ['const uint64_t authenticatedResult = authenticateIA(result, 0);', 'const uint64_t authenticatedResult = stripCode(result);'],
@@ -107,7 +125,7 @@ Dir.mktmpdir('rev-adapters') do |dir|
     'a failed authentication stops without naming the symbol' => ['it is not handed to plain code\\n", row->symbol);', 'it is not handed to plain code\\n", "?");'],
     'special values are authenticated' => ['if ( row->authReturn && !isSpecialHandler(result) )', 'if ( row->authReturn )'],
     'every result is authenticated' => ['if ( row->authReturn && !isSpecialHandler(result) )', 'if ( !isSpecialHandler(result) )'],
-    'the mask bit is read from the wrong argument' => ["if ( ((row->signMask >> i) & 1) == 0 )\n\t\t\tcontinue;\n\t\tif ( a[i] == 0 )", "if ( ((row->signMask >> (i + 1)) & 1) == 0 )\n\t\t\tcontinue;\n\t\tif ( a[i] == 0 )"],
+    'the mask bit is read from the wrong argument' => ["if ( (row->signMask >> i) & 1 )\n\t\t\ta[i] = signPlainCode", "if ( (row->signMask >> (i + 1)) & 1 )\n\t\t\ta[i] = signPlainCode"],
     'the thunk calls the forward helper' => ['return emitCallThunkWith(words, row, real, (uint64_t)isEntry, (uint64_t)&callReverseRow);', 'return emitCallThunkWith(words, row, real, (uint64_t)isEntry, callThunkHelperAddress());'],
     'the thunk does not carry its predicate' => ['putLiteral(&words[18], aux);', 'putLiteral(&words[18], 0);'],
     'the thunk cache ignores the predicate' => ['(sThunks[i].row == row) && (sThunks[i].real == real) && (sThunks[i].aux == aux)', '(sThunks[i].row == row) && (sThunks[i].real == real)'],
@@ -121,6 +139,19 @@ Dir.mktmpdir('rev-adapters') do |dir|
     'the terminator is ignored' => ["if ( delta == 0 )\n\t\t\tbreak;", ';'],
     'the ULEB shift is unbounded' => ['(shift > 63)', '(false)'],
     'a delta that overflows the address is accepted' => ['if ( delta > UINT64_MAX - address )', 'if ( false )'],
+    'the struct is not copied: the callee gets the caller\'s' => ['a[row->structArg - 1] = (uint64_t)calleeStruct;', ';'],
+    'the struct words are not signed' => ['calleeStruct[i] = signPlainCode(calleeStruct[i], isEntry);', ';'],
+    'the struct words are signed without the entry check' => ['calleeStruct[i] = signPlainCode(calleeStruct[i], isEntry);', 'calleeStruct[i] = AdapterSign::signPointer(calleeStruct[i], nullptr, false, 0, 0);'],
+    'every struct word is signed whatever the mask says' => ['if ( (row->structSignMask >> i) & 1 )', 'if ( true )'],
+    'the struct mask is read off by one word' => ['if ( (row->structSignMask >> i) & 1 )', 'if ( (row->structSignMask >> (i + 1)) & 1 )'],
+    'only the first word of the struct is copied' => ['row->structWords * sizeof(uint64_t))', 'sizeof(uint64_t))'],
+    'the struct is read with a plain memcpy' => ['copyThroughPipe(calleeStruct, (const void*)a[row->structArg - 1], row->structWords * sizeof(uint64_t))', '(memcpy(calleeStruct, (const void*)a[row->structArg - 1], row->structWords * sizeof(uint64_t)), Access::Ok)'],
+    'a struct argument is ignored' => ["if ( (row->structArg != 0) && (a[row->structArg - 1] != 0) ) {\n\t\tconst Access access = copyThroughPipe(calleeStruct", "if ( false ) {\n\t\tconst Access access = copyThroughPipe(calleeStruct"],
+    'an unreadable struct passes without a warning' => ["\t\telse\n\t\t\tdyld::warn(\"arm64e adapters: %s could not %s its struct argument", "\t\telse if ( access == Access::NoResource )\n\t\t\tdyld::warn(\"arm64e adapters: %s could not %s its struct argument"],
+    'the struct argument is read from the wrong register' => ['a[row->structArg - 1], row->structWords', 'a[row->structArg], row->structWords'],
+    'the validator accepts a struct mask outside the words' => ['((r.structSignMask >> r.structWords) != 0)', 'false'],
+    'the validator accepts a struct argument that is also masked' => ['if ( (r.signMask >> (r.structArg - 1)) & 1 )', 'if ( false )'],
+    'the validator accepts a struct argument past the row\'s arguments' => ['if ( r.structArg > r.argCount )', 'if ( false )'],
     'the validator accepts a row that does nothing' => ["\t\tif ( !acts )\n\t\t\treturn \"a row does nothing\";\n\t\tif ( r.argCount > 8 )", "\t\tif ( r.argCount > 8 )"],
     'the validator accepts an unsupported row with an action' => ["\t\t\tif ( acts )\n\t\t\t\treturn \"a row without an adapter has an action\";\n\t\t\tcontinue;\n\t\t}\n\t\tif ( r.status == AdapterStatus::HandledElsewhere )", "\t\t\tcontinue;\n\t\t}\n\t\tif ( r.status == AdapterStatus::HandledElsewhere )"],
   }

@@ -1,8 +1,9 @@
 // The rows of the opposite-direction adapter table (a PLAIN importer binding an export of an arm64e image).
-// symbol, signMask, authReturn, argCount, status, evidence. Argument numbers count from 0; for a member function argument 0 is this.
+// symbol, signMask, authReturn, argCount, status, evidence, then structArg, structWords, structSignMask when the row has a struct. Argument numbers count from 0; for a member function argument 0 is this.
 // Provenance: public prototypes of libc++/libc++abi (the C++ standard headers and cxxabi.h) for every export of the shared cache's
 // libc++ and libc++abi (L4-facts-data export lists) whose mangled name has a function-pointer parameter, plus the three handler
-// getters; the exports that Darling's plain libraries import are listed by the enumeration in the notes.
+// getters; the exports that Darling's plain libraries import are listed by the enumeration in the notes. __libc_initializer is a C export
+// found by the adapter sweep.
 	{ "__ZSt13set_terminatePFvvE", 0x1, true, 1, AdapterStatus::Probed, "C++ <exception>/<new>: terminate_handler set_terminate(terminate_handler) noexcept; the cache stores the pointer and re-signs it for the exception header (L4 c3 checks y1, y2); libobjc calls it with a plain pointer (objc-exception.mm)" },
 	{ "__ZSt14set_unexpectedPFvvE", 0x1, true, 1, AdapterStatus::ShapeOnly, "C++ <exception>/<new>: unexpected_handler set_unexpected(unexpected_handler); the shape of set_terminate" },
 	{ "__ZSt15set_new_handlerPFvvE", 0x1, true, 1, AdapterStatus::ShapeOnly, "C++ <exception>/<new>: new_handler set_new_handler(new_handler) noexcept; the shape of set_terminate" },
@@ -28,3 +29,4 @@
 	{ "__ZNSt3__18ios_base17register_callbackEPFvNS0_5eventERS0_iEi", 0x2, false, 3, AdapterStatus::ShapeOnly, "libc++ <ios>: ios_base::register_callback(event_callback, int); stored and called later" },
 	{ "__ZNSt3__19money_getIcNS_19istreambuf_iteratorIcNS_11char_traitsIcEEEEE8__do_getERS4_S4_bRKNS_6localeEjRjRbRKNS_5ctypeIcEERNS_10unique_ptrIcPFvPvEEERPcSM_", 0x0, false, 0, AdapterStatus::Unsupported, "libc++ <locale>: money_get::__do_get takes a unique_ptr whose deleter is a code pointer held in a struct; not convertible by a register thunk" },
 	{ "__ZNSt3__19money_getIwNS_19istreambuf_iteratorIwNS_11char_traitsIwEEEEE8__do_getERS4_S4_bRKNS_6localeEjRjRbRKNS_5ctypeIwEERNS_10unique_ptrIwPFvPvEEERPwSM_", 0x0, false, 0, AdapterStatus::Unsupported, "libc++ <locale>: money_get::__do_get takes a unique_ptr whose deleter is a code pointer held in a struct; not convertible by a register thunk" },
+	{ "__libc_initializer", 0x0, false, 1, AdapterStatus::ShapeOnly, "libc/sys/_libc_init.c:46-58, libc/darwin/libc_private.h:33-42: _libc_initializer(funcs, envp, apple, vars); funcs is plain libSystem.B's read-only struct _libc_functions (libsystem/init.c:234-255) whose atfork_prepare, atfork_parent, atfork_child, dirhelper and atfork_failed words arm64e libsystem_c calls authenticated (libc/sys/fork.c:34-86, confstr.c:85-99); it keeps them, not the struct", 1, 6, 0x3E },

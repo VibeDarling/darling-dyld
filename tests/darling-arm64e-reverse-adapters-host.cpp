@@ -41,10 +41,15 @@ __attribute__((target("arch=armv8.3-a"))) static uint64_t oracleStrip(uint64_t p
 static uint64_t gSeen[8];
 static int gCalls;
 static uint64_t gResult;
+// when non-zero, the callee reads this many words from its first argument while it runs (the copy lives for the call only)
+static unsigned gCaptureWords;
+static uint64_t gCaptured[8];
 static uint64_t fakeCallee(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
 	const uint64_t a[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
 	memcpy(gSeen, a, sizeof(a));
+	if ( gCaptureWords != 0 )
+		memcpy(gCaptured, (const void*)a0, gCaptureWords * sizeof(uint64_t));
 	++gCalls;
 	return gResult;
 }
@@ -111,6 +116,20 @@ static void checkTable()
 	CHECK(validateReverseRows(noev, 1) != nullptr, "a row without evidence was accepted");
 	ReverseRow unsupportedActs[1] = { { "_a", 1, false, 1, AdapterStatus::Unsupported, "e" } };
 	CHECK(validateReverseRows(unsupportedActs, 1) != nullptr, "an unsupported row with an action was accepted");
+	const AdapterStatus st = AdapterStatus::ShapeOnly;
+	ReverseRow okStruct[1] = { { "_a", 0, false, 1, st, "e", 1, 6, 0x3E } };
+	CHECK(validateReverseRows(okStruct, 1) == nullptr, "a valid struct row was refused");
+	ReverseRow badStructs[] = {
+		{ "_a", 0, false, 1, st, "e", 2, 6, 0x3E },		// the struct argument is beyond the row's arguments
+		{ "_a", 0, false, 1, st, "e", 1, 0, 0x3E },		// no words
+		{ "_a", 0, false, 1, st, "e", 1, 9, 0x3E },		// more than eight words
+		{ "_a", 0, false, 1, st, "e", 1, 6, 0x40 },		// a sign mask outside the words
+		{ "_a", 0, false, 1, st, "e", 1, 6, 0 },		// a struct that signs nothing
+		{ "_a", 1, false, 1, st, "e", 1, 6, 0x3E },		// the struct argument is also masked
+		{ "_a", 1, false, 1, st, "e", 0, 6, 0x3E },		// a struct described for no argument
+	};
+	for (const ReverseRow& bad : badStructs)
+		CHECK(validateReverseRows(&bad, 1) != nullptr, "a malformed struct row was accepted (struct argument %u, words %u, mask %x)", bad.structArg, bad.structWords, bad.structSignMask);
 }
 
 static void checkSetHandler()
@@ -341,6 +360,50 @@ static void checkArgPositions()
 	CHECK(gSeen[0] == args[0] && gSeen[1] == oracleSign(args[1], 0), "the manipulator was not signed");
 }
 
+// _libc_initializer(funcs, envp, apple, vars): plain libSystem.B passes a read-only struct _libc_functions { version, prepare, parent,
+// child, dirhelper, failed } and arm64e libsystem_c calls the pointers in it authenticated. The callee gets a signed copy.
+static void checkStructArgument()
+{
+	Fn8 f = thunkFor("__libc_initializer");
+	uint8_t* page = (uint8_t*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	CHECK(page != MAP_FAILED, "no page for the read-only struct");
+	if ( page == MAP_FAILED )
+		return;
+	const uint64_t original[6] = { goodCode(5), goodCode(1), goodCode(2), goodCode(3), 0, goodCode(4) };
+	memcpy(page, original, sizeof(original));
+	mprotect(page, 4096, PROT_READ);
+	uint64_t args[8]; memcpy(args, kS, sizeof(args));
+	args[0] = (uint64_t)page;
+	gCaptureWords = 6;
+	callWith(f, args);
+	gCaptureWords = 0;
+	CHECK(gSeen[0] != (uint64_t)page, "the callee was given the caller's read-only struct");
+	CHECK(gSeen[1] == kS[1] && gSeen[2] == kS[2] && gSeen[3] == kS[3], "the other arguments changed");
+	CHECK(gCaptured[0] == original[0], "the version word was signed or changed: %llx", (unsigned long long)gCaptured[0]);
+	for (int i : { 1, 2, 3, 5 })
+		CHECK(gCaptured[i] == oracleSign(original[i], 0), "function word %d came out as %llx, not signed (IA, 0)", i, (unsigned long long)gCaptured[i]);
+	CHECK(gCaptured[4] == 0, "a NULL dirhelper was changed");
+	CHECK(memcmp(page, original, sizeof(original)) == 0, "the caller's struct was written");
+	// a word that is not a plain function entry stays as it is, so the callee fails to authenticate it
+	const uint64_t mixed[6] = { 2, goodCode(1) + 4, kArm64eLow + 0x40, 0x0000000200001000ULL, 0, 0xdeadbeef };
+	gCaptureWords = 6;
+	args[0] = (uint64_t)mixed;
+	callWith(f, args);
+	gCaptureWords = 0;
+	for (int i = 1; i != 6; ++i)
+		CHECK(gCaptured[i] == mixed[i], "word %d, which is no plain function entry, was signed: %llx", i, (unsigned long long)gCaptured[i]);
+	// NULL, and a pointer that cannot be read, go through as they are without crashing the caller
+	args[0] = 0;
+	callWith(f, args);
+	CHECK(gSeen[0] == 0, "a NULL struct pointer was changed");
+	args[0] = 0x1234;
+	gWarnings.clear();
+	callWith(f, args);
+	CHECK(gSeen[0] == 0x1234, "an unreadable struct pointer was replaced");
+	CHECK(gWarnings.find("__libc_initializer") != std::string::npos, "an unreadable struct passed unsigned without a warning");
+	munmap(page, 4096);
+}
+
 static void checkPolicy()
 {
 	CHECK(reverseAdaptedTarget("__ZSt13set_terminatePFvvE", 0x1234, false, &isEntry) == 0x1234, "an exporter that is plain was adapted");
@@ -382,6 +445,8 @@ static void checkEveryRow()
 		if ( row.status == AdapterStatus::Unsupported )
 			continue;
 		++supported;
+		if ( row.structArg != 0 )
+			continue;	// checkStructArgument
 		Fn8 f = thunkFor(row.symbol);
 		uint64_t args[8]; memcpy(args, kS, sizeof(args));
 		for (unsigned i = 0; i != 8; ++i)
@@ -395,7 +460,7 @@ static void checkEveryRow()
 		}
 		CHECK(result == (row.authReturn ? goodCode(30) : 0x5a5a), "%s: result %llx", row.symbol, (unsigned long long)result);
 	}
-	CHECK(supported == 23, "supported rows: %d", supported);
+	CHECK(supported == 24, "supported rows: %d", supported);
 }
 
 static void checkReport()
@@ -431,7 +496,7 @@ int main(int argc, char** argv)
 	if ( argc >= 2 && strcmp(argv[1], "rows") == 0 ) {
 		size_t n = 0; const ReverseRow* rows = reverseRows(&n);
 		for (size_t i = 0; i != n; ++i)
-			printf("%s %x %d %d %d\n", rows[i].symbol, rows[i].signMask, rows[i].authReturn, rows[i].argCount, (int)rows[i].status);
+			printf("%s %x %d %d %d %u %u %x\n", rows[i].symbol, rows[i].signMask, rows[i].authReturn, rows[i].argCount, (int)rows[i].status, rows[i].structArg, rows[i].structWords, rows[i].structSignMask);
 		return 0;
 	}
 	if ( argc >= 3 && strcmp(argv[1], "reverse-thunk") == 0 ) {
@@ -454,6 +519,7 @@ int main(int argc, char** argv)
 	checkRingIsolation();
 	checkFunctionStarts();
 	checkArgPositions();
+	checkStructArgument();
 	checkEveryRow();
 	checkPolicy();
 	checkReport();

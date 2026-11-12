@@ -136,10 +136,12 @@ REPLAY = <<~'CPP'
   };
 
   // the fake arm64e callee of a reverse thunk
-  static uint64_t gSeen[8];
+  static uint64_t gSeen[8], gCaptured[6];
+  static bool gCapture;
   static uint64_t fakeCallee(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
     const uint64_t a[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
     memcpy(gSeen, a, sizeof(a));
+    if ( gCapture ) memcpy(gCaptured, (const void*)a0, sizeof(gCaptured));
     return 0;
   }
   typedef uint64_t (*Fn8)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
@@ -258,6 +260,26 @@ REPLAY = <<~'CPP'
     Fn8 reverse = (Fn8)viaBindAt;
     const uint64_t args[] = { P + 0x1040, P + 0x1044, A + 0x1000, C + 0x1000, 0, 0x1234 };
     for (uint64_t a : args) { reverse(a, 1, 2, 3, 4, 5, 6, 7); CHECK(gSeen[0] == (a == P + 0x1040 ? oracleSign(a, 0) : a), "argument %llx came out as %llx", (unsigned long long)a, (unsigned long long)gSeen[0]); }
+
+    // _libc_initializer: plain libSystem.B binds it and passes its struct _libc_functions of fork handlers, which the arm64e
+    // libsystem_c calls authenticated. Through the real bind hook and the real predicate, the callee gets a signed copy.
+    const char* libcInit = "__libc_initializer";
+    const uint64_t libcThunk = hook4(&plainImporter, BIND_TYPE_POINTER, libcInit, 0, callee, &calleeImage);
+    CHECK(libcThunk != callee, "a plain image's bind of _libc_initializer got no thunk");
+    CHECK(plainImporter.bind(libcInit, 0, callee, &calleeImage) == libcThunk, "the dyld-info and the chained-fixups binds of _libc_initializer made different thunks");
+    CHECK(hook4(&arm64eImporter, BIND_TYPE_POINTER, libcInit, 0, callee, &calleeImage) == callee, "an arm64e importer of _libc_initializer was thunked");
+    const uint64_t funcs[6] = { 2, P + 0x1000, P + 0x1040, P + 0x1044, 0, A + 0x1000 };
+    const uint64_t funcsBefore[6] = { 2, P + 0x1000, P + 0x1040, P + 0x1044, 0, A + 0x1000 };
+    gCapture = true;
+    ((Fn8)libcThunk)((uint64_t)funcs, 1, 2, 3, 4, 5, 6, 7);
+    gCapture = false;
+    CHECK(gSeen[0] != (uint64_t)funcs, "_libc_initializer got the caller's struct, not a copy");
+    CHECK(gCaptured[0] == 2, "the version word changed: %llx", (unsigned long long)gCaptured[0]);
+    CHECK(gCaptured[1] == oracleSign(P + 0x1000, 0) && gCaptured[2] == oracleSign(P + 0x1040, 0), "a fork handler of the plain image was not signed");
+    CHECK(gCaptured[3] == P + 0x1044, "a mid-function word was signed");
+    CHECK(gCaptured[4] == 0, "a NULL word changed");
+    CHECK(gCaptured[5] == A + 0x1000, "a word in an arm64e image was signed");
+    CHECK(memcmp(funcs, funcsBefore, sizeof(funcs)) == 0, "the caller's struct was written");
 
     // hook 3
     void* callerArm64e = (void*)0x1500; void* callerPlain = (void*)0x2500;

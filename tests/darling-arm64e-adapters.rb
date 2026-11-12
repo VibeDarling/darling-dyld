@@ -45,6 +45,7 @@ HAND = {
   '_dispatch_once' => [0x0, 2, 0, 0, 2, 0],                # (predicate*, block)
   '_sigaction' => [0x0, 0, 2, 0, 3, 0],                    # (sig, const struct sigaction* act, struct sigaction* oact)
   '_signal' => [0x2, 0, 0, 1, 2, 0],                       # sig_t signal(int, sig_t)
+  '___platform_sigaction' => [0x0, 0, 2, 0, 3, 1],         # libplatform sigaction.c:47 (sig, const struct sigaction* nsv, struct sigaction* osv): the shape of sigaction
   '__Block_copy' => [0x0, 0, 0, 2, 1, 0],                  # void* _Block_copy(const void*)
   '__tlv_atexit' => [0x1, 0, 0, 0, 2, 1],                  # (void (*termFunc)(void*), void* objAddr); not in the T0 lists
   # The two enumerations take a block, but dyld calls it through a stripped invoke itself: no thunk.
@@ -222,6 +223,9 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     'the row of _atexit authenticates the wrong argument' => ['{ "_atexit", 0x1,', '{ "_atexit", 0x2,', :rows],
     'the row of _pthread_create authenticates the wrong argument' => ['{ "_pthread_create", 0x4,', '{ "_pthread_create", 0x2,', :rows],
     'the row of _signal has no return fix' => ['0x2, 0, 0, ReturnFix::SignInstalledHandler,', '0x2, 0, 0, ReturnFix::None,', :rows],
+    'the row of __os_alloc_once authenticates the wrong argument' => ['{ "__os_alloc_once", 0x4,', '{ "__os_alloc_once", 0x2,', :rows],
+    'the row of _mach_msg_server_once is dropped' => [/^\t\{ "_mach_msg_server_once",.*\n/, '', :rows],
+    'the row of ___platform_sigaction has no struct argument' => ['{ "___platform_sigaction", 0x0, 0, 2,', '{ "___platform_sigaction", 0x0, 0, 0,', :rows],
     'the row of _qsort is dropped' => [/^\t\{ "_qsort",.*\n/, '', :rows],
     'a row of the facts (_glob) is dropped' => [/^\t\{ "_glob",.*\n/, '', :rows],
     'a row of the facts (_dispatch_after_f) has the wrong argument' => ['{ "_dispatch_after_f", 0x8,', '{ "_dispatch_after_f", 0x4,', :rows],

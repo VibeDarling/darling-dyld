@@ -119,6 +119,12 @@ struct ReverseRow {
 	uint8_t			argCount;		// register arguments up to the last one the row touches, at most 8; 0 for a getter
 	AdapterStatus	status;			// Probed, ShapeOnly or Unsupported (HandledElsewhere does not exist in this direction)
 	const char*		evidence;		// never empty
+	// A pointer to a struct that holds code pointers (a read-only table of callbacks that plain code passes at init). The callee
+	// gets a private copy with those words signed, as for a masked argument; the original is never written. The copy lives for
+	// the call only, so this is for structs whose pointers the callee copies out. An unreadable struct goes through as it is.
+	uint8_t			structArg = 0;		// argument number + 1, 0 for none
+	uint8_t			structWords = 0;	// size of the struct in 8-byte words, 1 to 8
+	uint8_t			structSignMask = 0;	// bit i: word i is a code pointer to sign (IA, discriminator 0)
 };
 
 // true when `address` may be signed for an arm64e callee: a function entry of a loaded plain image

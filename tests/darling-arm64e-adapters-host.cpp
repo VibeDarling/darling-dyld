@@ -992,6 +992,13 @@ static void checkSigaction()
 	t(26, 0, 0, 0, 0, 0, 0, 0);
 	CHECK(gSeen[1] == 0 && gSeen[2] == 0, "sigaction: NULL act and oact");
 	gHook = nullptr;
+	// arm64e libsystem_c's sigaction forwards to ___platform_sigaction, a row of the same shape
+	Act viaPlatform = { handler, 0x11, 0x22 };
+	gHook = [](const uint64_t* a) { if (a[1]) memcpy(&seen, (const void*)a[1], sizeof(seen)); };
+	gFakeResult = 0;
+	thunkFor("___platform_sigaction")(15, (uint64_t)&viaPlatform, 0, 0, 0, 0, 0, 0);
+	CHECK(gSeen[0] == 15 && seen.handler == plainHandler && seen.mask == 0x11, "___platform_sigaction: the handler reached the callee as 0x%llx", (unsigned long long)seen.handler);
+	gHook = nullptr;
 }
 
 static void checkBind()
