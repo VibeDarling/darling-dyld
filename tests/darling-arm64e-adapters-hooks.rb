@@ -284,6 +284,29 @@ REPLAY = <<~'CPP'
     CHECK(gCaptured[5] == A + 0x1000, "a word in an arm64e image was signed");
     CHECK(memcmp(funcs, funcsBefore, sizeof(funcs)) == 0, "the caller's struct was written");
 
+    // _atexit and ___cxa_atexit: plain code registers a plain function (every C++ static destructor, the destructor() that wrapgen puts in
+    // a native shim) and the arm64e libsystem_c's __cxa_finalize_ranges calls it with blraaz at exit. Through the real bind hook and the
+    // real predicate, the callee gets an entry of the plain image signed, and any other value as it came. The values are chosen per
+    // process so that none is a fixed point of its own signature.
+    const uint64_t midFunction = notAFixedPoint(P + 0x1004, P + 0x1040, 4);
+    const uint64_t inArm64e = notAFixedPoint(A + 0x1000, A + 0x1040, 4);
+    CHECK((midFunction != 0) && (inArm64e != 0), "no value free of PAC fixed points for the atexit checks");
+    const char* const atexitSymbols[] = { "_atexit", "___cxa_atexit" };
+    for (const char* atexitSymbol : atexitSymbols) {
+      const uint64_t atexitBound = hook4(&plainImporter, BIND_TYPE_POINTER, atexitSymbol, 0, callee, &calleeImage);
+      CHECK(atexitBound != callee, "a plain image's bind of %s got no thunk", atexitSymbol);
+      CHECK(plainImporter.bind(atexitSymbol, 0, callee, &calleeImage) == atexitBound, "the dyld-info and the chained-fixups binds of %s made different thunks", atexitSymbol);
+      CHECK(hook4(&arm64eImporter, BIND_TYPE_POINTER, atexitSymbol, 0, callee, &calleeImage) == callee, "an arm64e importer of %s was thunked", atexitSymbol);
+      ((Fn8)atexitBound)(P + 0x1040, 0x7001, 0x7002, 3, 4, 5, 6, 7);
+      CHECK(gSeen[0] == oracleSign(P + 0x1040, 0), "%s: a plain handler was not signed (IA, 0)", atexitSymbol);
+      CHECK(gSeen[1] == 0x7001 && gSeen[2] == 0x7002, "%s: the argument and the dso handle changed", atexitSymbol);
+      const uint64_t others[] = { midFunction, inArm64e, 0 };
+      for (uint64_t other : others) {
+        ((Fn8)atexitBound)(other, 0x7001, 0x7002, 3, 4, 5, 6, 7);
+        CHECK(gSeen[0] == other, "%s: %llx, which is no entry of a plain image, was signed", atexitSymbol, (unsigned long long)other);
+      }
+    }
+
     // _dyld_func_lookup: the arm64e libdyld hands back an address signed IA 0 (Darling's dyld signs it for the arm64e libdyld) and
     // plain libSystem.B binds the function and passes it to plain libsystem_kernel in its _libkernel_functions table, which calls the
     // result with a plain BLR. Through the real bind hook, what libsystem_kernel calls must hand back a raw address.

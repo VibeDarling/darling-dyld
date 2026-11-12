@@ -421,6 +421,37 @@ static void checkStructArgument()
 	munmap(page, 4096);
 }
 
+// tls_private_key_create(desc, ctx, ctx_release): desc (argument 0) is { type, union { rsa { size, sign, decrypt }, ecdsa { size, curve, sign } } }, so
+// words 2 and 3 are code pointers whichever member is in use, except that an ECDSA curve is a number and passes. ctx_release is
+// argument 2. The callee gets a signed copy of desc and the caller's descriptor is not written. ctx (argument 1) is kept by the
+// callee (tls_handshake.c:79), so it must arrive as the caller's own pointer, not a copy on the thunk's stack.
+static void checkPrivateKeyDescriptor()
+{
+	Fn8 f = thunkFor("_tls_private_key_create");
+	const uint64_t rsa[4] = { 0, 256, goodCode(1), goodCode(2) };
+	const uint64_t rsaBefore[4] = { 0, 256, goodCode(1), goodCode(2) };
+	uint64_t ctx[4] = { goodCode(5), 7, 8, 9 };
+	uint64_t args[8]; memcpy(args, kS, sizeof(args));
+	args[0] = (uint64_t)rsa; args[1] = (uint64_t)ctx; args[2] = goodCode(3);
+	gCaptureWords = 4;
+	callWith(f, args);
+	gCaptureWords = 0;
+	CHECK(gSeen[0] != (uint64_t)rsa, "the callee was given the caller's descriptor");
+	CHECK(gSeen[1] == (uint64_t)ctx, "the callee got %llx, not the caller's ctx (a copy on the thunk's stack would dangle)", (unsigned long long)gSeen[1]);
+	CHECK(ctx[0] == goodCode(5), "the caller's ctx was written");
+	CHECK(gSeen[2] == oracleSign(goodCode(3), 0), "ctx_release was not signed");
+	CHECK(gCaptured[0] == 0 && gCaptured[1] == 256, "the type or the size changed");
+	CHECK(gCaptured[2] == oracleSign(rsa[2], 0) && gCaptured[3] == oracleSign(rsa[3], 0), "an RSA sign or decrypt function was not signed");
+	CHECK(memcmp(rsa, rsaBefore, sizeof(rsa)) == 0, "the caller's descriptor was written");
+	const uint64_t ecdsa[4] = { 1, 32, 23, goodCode(4) };
+	args[0] = (uint64_t)ecdsa;
+	gCaptureWords = 4;
+	callWith(f, args);
+	gCaptureWords = 0;
+	CHECK(gCaptured[2] == 23, "an ECDSA curve number was signed");
+	CHECK(gCaptured[3] == oracleSign(ecdsa[3], 0), "an ECDSA sign function was not signed");
+}
+
 // _dyld_func_lookup(name, &address): the arm64e libdyld hands back a signed address and plain callers (libSystem.B, and the
 // libsystem_kernel that it passes the function to) call it with a plain BLR, so it comes back raw.
 static void checkOutCodeArgument()
@@ -533,7 +564,7 @@ static void checkEveryRow()
 		}
 		CHECK(result == (row.authReturn ? goodCode(30) : 0x5a5a), "%s: result %llx", row.symbol, (unsigned long long)result);
 	}
-	CHECK(supported == 25, "supported rows: %d", supported);
+	CHECK(supported == 62, "supported rows: %d", supported);
 }
 
 static void checkReport()
@@ -593,6 +624,7 @@ int main(int argc, char** argv)
 	checkFunctionStarts();
 	checkArgPositions();
 	checkStructArgument();
+	checkPrivateKeyDescriptor();
 	checkOutCodeArgument();
 	checkEveryRow();
 	checkPolicy();

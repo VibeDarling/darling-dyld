@@ -52,7 +52,30 @@ Dir.mktmpdir('rev-adapters') do |dir|
   table = rows.lines.map { |l| s, m, ret, c, status = l.split; [s, [m.to_i(16), ret == '1', c.to_i, status.to_i]] }.to_h
   outs = rows.lines.to_h { |l| f = l.split; [f[0], f[8].to_i] }
   structs = rows.lines.map { |l| f = l.split; [f[0], [f[5].to_i, f[6].to_i, f[7].to_i(16)]] }.to_h
-  check('the table has 27 rows, 2 of them unsupported', table.size == 27 && table.values.count { |v| v[3] == 3 } == 2, table.size.to_s)
+  check('the table has 65 rows, 3 of them unsupported', table.size == 65 && table.values.count { |v| v[3] == 3 } == 3, table.size.to_s)
+  # the C exports found by the sweep of every plain image against the arm64e set (tests/darling-arm64e-reverse-callback-imports.tsv, the
+  # argument numbers from the DWARF of the exporter): R and RS have a row signing exactly those arguments, U an unsupported row, and
+  # B (blocks, which need a caller built for arm64e), N (arm64e code never calls the pointer) and T (a returned table) have no row
+  sweep = File.readlines(File.join(root, 'tests/darling-arm64e-reverse-callback-imports.tsv'), chomp: true).drop(1).map { |l| l.split("\t") }
+  sweep_by_symbol = sweep.to_h { |f| [f[0], f] }
+  check('the sweep file has no repeated symbol', sweep_by_symbol.size == sweep.size, sweep.size.to_s)
+  sweep.each do |sym, _exporter, kind, args|
+    row = table[sym]
+    case kind
+    when 'R', 'RS'
+      want = args.split(',').sum { |i| 1 << i.to_i }
+      check("#{sym}: the swept code-pointer arguments #{args} are the sign mask, no result is a handler",
+            row && row[3] != 3 && row[0] == want && !row[1] && row[2] == args.split(',').map(&:to_i).max + 1, row.inspect)
+    when 'U'
+      check("#{sym}: an unsupported row, not a silent skip", row && row[3] == 3, row.inspect)
+    else
+      check("#{sym}: class #{kind} has no row (a block-taking export needs a caller built for arm64e and gets no tolerance)", row.nil?, row.inspect)
+    end
+  end
+  check('every row of a C export is in the sweep file',
+        table.keys.reject { |n| n.start_with?('__Z', '___cxa_throw') || %w[__libc_initializer __dyld_func_lookup].include?(n) }.all? { |n| sweep_by_symbol.key?(n) },
+        table.keys.reject { |n| n.start_with?('__Z', '___cxa_throw') || %w[__libc_initializer __dyld_func_lookup].include?(n) || sweep_by_symbol.key?(n) }.inspect)
+  check('the tls_private_key_create struct is argument 0 (desc, structArg 1): words 2 and 3 of 4 (rsa sign and decrypt, or ecdsa curve and sign)', structs['_tls_private_key_create'] == [1, 4, 0xC], structs['_tls_private_key_create'].inspect)
   cache = (ENV['CACHE_EXPORTS'] ? File.readlines(ENV['CACHE_EXPORTS'], chomp: true) : [])
   expected_pf = cache.select { |n| n.include?('PF') && !n.include?('money_get') }
   check('every cache export with a function-pointer parameter has a supported row (skipped without the export list)',
@@ -68,6 +91,8 @@ Dir.mktmpdir('rev-adapters') do |dir|
       check('__libc_initializer signs no argument and returns no handler, but the words of its argument 0 struct: version, then 5 code pointers (struct _libc_functions)', mask == 0 && !auth_return && argc == 1 && structs[sym] == [1, 6, 0x3E])
     elsif sym == '__dyld_func_lookup'
       check('__dyld_func_lookup signs nothing and returns no handler, but authenticates its argument 1 out parameter (void** address)', mask == 0 && !auth_return && argc == 2 && outs[sym] == 2)
+    elsif sweep_by_symbol.key?(sym)
+      next # checked against the sweep above
     elsif sym == '___cxa_throw'
       check('___cxa_throw signs the destructor (argument 2)', mask == 4 && !auth_return && argc == 3)
     else
@@ -115,6 +140,38 @@ Dir.mktmpdir('rev-adapters') do |dir|
     rout, = rexe ? AdapterSupport.run(rexe, 'rows') : ['', nil]
     row = rout.lines.map(&:split).find { |f| f[0] == '__dyld_func_lookup' }
     check("rows probe killed: #{name}", rexe.nil? || row.nil? || row[8] != '2')
+  end
+
+  # the sweep rows: a mutant of the rows file must break one of the sweep expectations, which are read from the DWARF-derived file
+  # and not from the table (a violation count of 0 on the real table, above 0 on each mutant)
+  # (the driver's `rows` columns: symbol mask authReturn argCount status structArg structWords structSignMask outCodeArg)
+  violations = lambda do |text|
+    t = text.lines.to_h { |l| f = l.split; [f[0], { mask: f[1].to_i(16), argc: f[3].to_i, status: f[4].to_i, struct: [f[5].to_i, f[6].to_i, f[7].to_i(16)] }] }
+    bad = sweep.count do |sym, _e, kind, args|
+      row = t[sym]
+      case kind
+      when 'R', 'RS' then !(row && row[:status] != 3 && row[:mask] == args.split(',').sum { |i| 1 << i.to_i } && row[:argc] == args.split(',').map(&:to_i).max + 1)
+      when 'U' then !(row && row[:status] == 3)
+      else !row.nil?
+      end
+    end
+    bad + (t['_tls_private_key_create'] && t['_tls_private_key_create'][:struct] == [1, 4, 0xC] ? 0 : 1)
+  end
+  check('the sweep expectations hold on the real rows', violations.call(rows) == 0, violations.call(rows).to_s)
+  {
+    'the _atexit row signs the wrong argument' => ['{ "_atexit", 0x1, false, 1,', '{ "_atexit", 0x2, false, 2,'],
+    'the ___cxa_atexit row is dropped' => [/^\t\{ "___cxa_atexit",.*\n/, ''],
+    'the _qsort row signs the base, not the comparison' => ['{ "_qsort", 0x8, false, 4,', '{ "_qsort", 0x1, false, 1,'],
+    'the _funopen row misses its close function' => ['{ "_funopen", 0x1E, false, 5,', '{ "_funopen", 0xE, false, 5,'],
+    'the _tls_private_key_create struct misses the decrypt word' => ['1, 4, 0xC },', '1, 4, 0x4 },'],
+    'the _tls_private_key_create struct is argument 1 (ctx), not argument 0 (desc)' => ['1, 4, 0xC },', '2, 4, 0xC },'],
+    'a block-taking export gets a tolerance row' => ["\t{ \"__dyld_func_lookup\",", "\t{ \"_dispatch_async\", 0x2, false, 2, AdapterStatus::ShapeOnly, \"x\" },\n\t{ \"__dyld_func_lookup\","],
+    'the unsupported _tls_handshake_set_callbacks row is dropped' => [/^\t\{ "_tls_handshake_set_callbacks",.*\n/, ''],
+  }.each do |name, (from, to)|
+    check("sweep mutant applies: #{name}", rows_file.scan(from).size == 1)
+    rexe, = AdapterSupport.build(root, dir, 'rowsmutant', driver, reverse_rows_text: rows_file.sub(from) { to })
+    rout, = rexe ? AdapterSupport.run(rexe, 'rows') : ['', nil]
+    check("sweep probe killed: #{name}", rexe.nil? || violations.call(rout) > 0)
   end
 
   # mutation probes
