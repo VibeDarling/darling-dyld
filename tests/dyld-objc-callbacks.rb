@@ -34,6 +34,7 @@ APIS = File.read("#{ROOT}/src/dyldAPIs.cpp")
 WRAPPERS = File.read("#{ROOT}/src/dyldAPIsInLibSystem.cpp")
 CALLBACKS = File.read("#{ROOT}/dyld3/DarlingObjCCallbacks.h")
 ADAPTERS = File.read("#{ROOT}/dyld3/DarlingArm64eAdapters.h")
+ARRAY = File.read("#{ROOT}/dyld3/Array.h")
 
 # --- wiring: both translation units define the SPIs and register the shared thunks -----------------
 table = APIS[/static const struct dyld_func dyld_funcs\[\] = \{(.*?)\n\};/m, 1]
@@ -121,6 +122,37 @@ SHIM_MACHINE = <<~'CPP'
   #define CPU_TYPE_ARM64 0x0100000c
 CPP
 
+# The Mach VM calls dyld3/Array.h's OverflowSafeArray makes when a batch outgrows its stack storage, backed by calloc
+# and counted so a test can tell whether the overflow path ran.
+SHIM_MACH = <<~'CPP'
+  #pragma once
+  #include <stdint.h>
+  #include <stdlib.h>
+  typedef int kern_return_t;
+  typedef uintptr_t vm_address_t;
+  typedef uintptr_t vm_size_t;
+  typedef int mach_port_t;
+  #define KERN_SUCCESS 0
+  #define VM_FLAGS_ANYWHERE 1
+  inline unsigned gVmAllocs, gVmFrees;
+  inline mach_port_t mach_task_self() { return 1; }
+  inline vm_size_t round_page(vm_size_t size) { return (size + 4095) & ~(vm_size_t)4095; }
+  inline kern_return_t vm_allocate(mach_port_t, vm_address_t* address, vm_size_t size, int)
+  {
+      void* memory = calloc(1, size);
+      if ( memory == nullptr ) return 1;
+      *address = (vm_address_t)memory;
+      ++gVmAllocs;
+      return KERN_SUCCESS;
+  }
+  inline kern_return_t vm_deallocate(mach_port_t, vm_address_t address, vm_size_t)
+  {
+      free((void*)address);
+      ++gVmFrees;
+      return KERN_SUCCESS;
+  }
+CPP
+
 DRIVER = <<~'CPP'
   #include <stdint.h>
   #include <stddef.h>
@@ -188,7 +220,7 @@ DRIVER = <<~'CPP'
   static unsigned recordedCount;
   static unsigned mappedCalls, initCalls, unmappedCalls, patchCalls;
   static bool metadataAlwaysNull = true;
-  static unsigned chunkCounts, chunkSizes[8];
+  static unsigned lastBatchCount;
   static const ObjCBlockLayout* blockSeen;
   static uint64_t blockInvokeField, blockInvokeAuth;
   static unsigned mutableCalls;
@@ -197,7 +229,8 @@ DRIVER = <<~'CPP'
 
   static void resetRecorder()
   {
-      recordedCount = mappedCalls = initCalls = unmappedCalls = patchCalls = chunkCounts = 0;
+      recordedCount = mappedCalls = initCalls = unmappedCalls = patchCalls = lastBatchCount = 0;
+      gVmAllocs = gVmFrees = 0;
       metadataAlwaysNull = true;
       blockSeen = nullptr;
       blockInvokeField = blockInvokeAuth = 0;
@@ -218,7 +251,7 @@ DRIVER = <<~'CPP'
   static void onMapped2(unsigned count, const struct _dyld_objc_notify_mapped_info infos[])
   {
       ++mappedCalls;
-      if ( chunkCounts < 8 ) chunkSizes[chunkCounts++] = count;
+      lastBatchCount = count;
       for ( unsigned i = 0; i < count; ++i ) recordInfo(&infos[i]);
   }
 
@@ -226,7 +259,7 @@ DRIVER = <<~'CPP'
                         _dyld_objc_mark_image_mutable callback)
   {
       ++mappedCalls;
-      if ( chunkCounts < 8 ) chunkSizes[chunkCounts++] = count;
+      lastBatchCount = count;
       for ( unsigned i = 0; i < count; ++i ) recordInfo(&infos[i]);
       blockSeen = (const ObjCBlockLayout*)callback;
       blockInvokeField = blockSeen->invoke;
@@ -401,6 +434,7 @@ DRIVER = <<~'CPP'
           resetRecorder();
           s.notifyMapped(2, paths, mhs);
           expect("the mapped batch reaches the callback", mappedCalls == 1 && recordedCount == 2);
+          expect("a batch within the stack storage allocates nothing", gVmAllocs == 0);
           expect("a cache image is refs-optimized", recordedRefs[0] == 1);
           expect("a disk image is not", recordedRefs[1] == 0);
           expect("the batch carries the paths", recordedPaths[0] == paths[0] && recordedPaths[1] == paths[1]);
@@ -427,8 +461,13 @@ DRIVER = <<~'CPP'
           s.registerCallbacks(asCallbacks(&v2));
           resetRecorder();
           s.notifyMapped(130, manyPaths, many);
-          expect("a large batch is chunked at 64", chunkCounts == 3 && chunkSizes[0] == 64 && chunkSizes[1] == 64 && chunkSizes[2] == 2);
-          expect("the chunks carry the whole batch", recordedCount == 130 && recordedMhs[129] == many[129]);
+          // 130 images exceed the 64 entries of stack storage, so this batch runs through OverflowSafeArray's vm_allocate path.
+          expect("the 130-image batch outgrew the stack storage", gVmAllocs >= 1 && gVmFrees == gVmAllocs);
+          expect("a large batch makes exactly one call", mappedCalls == 1 && lastBatchCount == 130);
+          bool sameOrder = recordedCount == 130;
+          for ( unsigned i = 0; sameOrder && i < 130; ++i )
+              sameOrder = recordedMhs[i] == many[i];
+          expect("the one call carries the whole batch in order", sameOrder);
           expect("the cache bit follows each image", recordedRefs[0] == 1 && recordedRefs[1] == 0 && recordedRefs[128] == 1 && recordedRefs[129] == 0);
       }
       {
@@ -554,8 +593,10 @@ DRIVER = <<~'CPP'
         registerV4(big);
         resetRecorder();
         big.notifyMapped(130, manyPaths, many);
-        expect("a chunk of only plain images makes no call", mappedCalls == 2 && chunkCounts == 2 && chunkSizes[0] == 64 && chunkSizes[1] == 2);
-        expect("the delivered chunks omit exactly the plain run", recordedCount == 66 && recordedMhs[63] == many[63] && recordedMhs[64] == many[128]);
+        // 66 images survive the filter, still more than the 64 entries of stack storage: the overflow path again.
+        expect("a filtered large batch makes exactly one call", mappedCalls == 1 && lastBatchCount == 66 && gVmAllocs >= 1);
+        expect("the one call omits exactly the plain run and keeps the order",
+               recordedCount == 66 && recordedMhs[63] == many[63] && recordedMhs[64] == many[128] && recordedMhs[65] == many[129]);
     }
     {
         struct mach_header plain = {};
@@ -911,6 +952,9 @@ def build_and_run(dir, callbacks_text, block_text, adapters_text = ADAPTERS)
   FileUtils.mkdir_p(File.join(work, 'mach-o'))
   FileUtils.mkdir_p(File.join(work, 'mach'))
   File.write(File.join(work, 'mach', 'machine.h'), SHIM_MACHINE)
+  File.write(File.join(work, 'mach', 'mach.h'), SHIM_MACH)
+  File.write(File.join(work, 'TargetConditionals.h'), "#pragma once\n")
+  File.write(File.join(work, 'Array.h'), ARRAY)
   File.write(File.join(work, 'DarlingArm64eAdapters.h'), adapters_text)
   File.write(File.join(work, 'mach-o', 'dyld_priv.h'), SHIM + block_text + "\n")
   File.write(File.join(work, 'DarlingObjCCallbacks.h'), callbacks_text)
@@ -940,8 +984,8 @@ Dir.mktmpdir('dyld-objc-callbacks-') do |dir|
 
   probes = [
     ['cache images are refs-optimized',
-     'dyldObjCRefsOptimized = (mhs[base + i]->flags & MH_DYLIB_IN_CACHE) ? 1 : 0',
-     'dyldObjCRefsOptimized = 0', false, :callbacks],
+     'info.dyldObjCRefsOptimized = (mhs[i]->flags & MH_DYLIB_IN_CACHE) ? 1 : 0',
+     'info.dyldObjCRefsOptimized = 0', false, :callbacks],
     ['init notices carry the cache bit',
      'dyldObjCRefsOptimized = (mh->flags & MH_DYLIB_IN_CACHE) ? 1 : 0',
      'dyldObjCRefsOptimized = 0', false, :callbacks],
@@ -955,21 +999,27 @@ Dir.mktmpdir('dyld-objc-callbacks-') do |dir|
      'markImageMutable.invoke = signBlockInvoke((uint64_t)(uintptr_t)markImageMutableInvoke, (uint64_t)(uintptr_t)&markImageMutable.invoke);',
      'markImageMutable.invoke = (uint64_t)(uintptr_t)markImageMutableInvoke;', true, :callbacks],
     ['the invoke is signed with key IA', '.inst 0xDAC10211', '.inst 0xDAC11211', true, :callbacks],
-    ['batches are chunked at 64', 'kMaxBatch = 64', 'kMaxBatch = 65', false, :callbacks],
+    ['the batch is not chunked for a v2 runtime', 'mapped2((unsigned)infos.count(), infos.begin());',
+     'for ( unsigned o = 0; o < infos.count(); o += 64 ) mapped2((unsigned)std::min<uintptr_t>(64, infos.count() - o), infos.begin() + o);', false, :callbacks],
+    ['the batch is not chunked for a v3 runtime', 'mapped3((unsigned)infos.count(), infos.begin(), (_dyld_objc_mark_image_mutable)&markImageMutable);',
+     'for ( unsigned o = 0; o < infos.count(); o += 64 ) mapped3((unsigned)std::min<uintptr_t>(64, infos.count() - o), infos.begin() + o, (_dyld_objc_mark_image_mutable)&markImageMutable);', false, :callbacks],
+    ['the batch keeps its order', 'if ( infos.empty() )', "std::reverse(infos.begin(), infos.end());\n\t\tif ( infos.empty() )", false, :callbacks],
+    ['the mapped filter is applied', 'if ( !acceptsImage(mhs[i]) ) {', 'if ( false ) {', false, :callbacks],
+    ['the test batch outgrows the stack storage', 'kStackInfos = 64', 'kStackInfos = 256', false, :callbacks],
     ['the arm64e check includes the cputype',
      'mh->cputype == CPU_TYPE_ARM64 && ', '', false, :callbacks],
     ['the filter keeps arm64e images', 'return !arm64eRuntime || machHeaderIsArm64e(mh);',
      'return !arm64eRuntime || !machHeaderIsArm64e(mh);', false, :callbacks],
     ['only a v4 runtime is filtered', 'arm64eRuntime = kV4RuntimeIsArm64e && callbacksVersion == 4;', 'arm64eRuntime = kV4RuntimeIsArm64e;', false, :callbacks],
     ['init is filtered too', "if ( !acceptsImage(mh) )\n\t\t\treturn;", "if ( false )\n\t\t\treturn;", false, :callbacks],
-    ['an emptied chunk makes no call', "if ( delivered == 0 )\n\t\t\t\tcontinue;", "if ( false )\n\t\t\t\tcontinue;", false, :callbacks],
+    ['an emptied batch makes no call', "if ( infos.empty() )\n\t\t\treturn;", "if ( false )\n\t\t\treturn;", false, :callbacks],
     ['the version is logged after the registration succeeds', 'const uintptr_t callbacksVersion = callbacks->version;',
      "const uintptr_t callbacksVersion = callbacks->version;\n\t\tif ( logRegistered != nullptr )\n\t\t\tlogRegistered((unsigned)callbacks->version);", false, :callbacks],
-    ['skipped images print no mapped line', 'if ( !acceptsImage(mhs[base + i]) ) {',
-     "if ( !acceptsImage(mhs[base + i]) ) {\n\t\t\t\t\tif ( logDelivered != nullptr )\n\t\t\t\t\t\tlogDelivered(\"mapped\", paths[base + i], 0);", false, :callbacks],
+    ['skipped images print no mapped line', 'if ( !acceptsImage(mhs[i]) ) {',
+     "if ( !acceptsImage(mhs[i]) ) {\n\t\t\t\tif ( logDelivered != nullptr )\n\t\t\t\t\tlogDelivered(\"mapped\", paths[i], 0);", false, :callbacks],
     ['the mapped line carries the refs-optimized bit',
-     'logDelivered("mapped", infos[delivered].path, infos[delivered].dyldObjCRefsOptimized);',
-     'logDelivered("mapped", infos[delivered].path, infos[delivered].dyldObjCRefsOptimized ^ 1);', false, :callbacks],
+     'logDelivered("mapped", info.path, info.dyldObjCRefsOptimized);',
+     'logDelivered("mapped", info.path, info.dyldObjCRefsOptimized ^ 1);', false, :callbacks],
     ['a delivered init prints a line', 'logDelivered("init", path, info.dyldObjCRefsOptimized);', '(void)0;', false, :callbacks],
     ['a skipped image is logged', 'if ( logSkip != nullptr )', 'if ( false )', false, :callbacks],
     ['a v4 runtime is not filtered on unmapped', 'if ( unmapped != nullptr )', 'if ( unmapped != nullptr && acceptsImage(mh) )', false, :callbacks],

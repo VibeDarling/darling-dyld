@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <mach-o/dyld_priv.h>
 #include "DarlingArm64eAdapters.h"
+#include "Array.h"
 
 // loader.h carries this when it is the SDK's; dyld2.cpp keeps the same fallback for MH_HAS_OBJC.
 #ifndef MH_DYLIB_IN_CACHE
@@ -203,10 +204,11 @@ struct ObjCCallbackState {
 	// Hands the batch to the registered mapped callback, as _dyld_objc_notify_mapped_info entries whose
 	// refs-optimized bit is set for images the shared cache serves: libobjc takes its preoptimized class
 	// path only then, and the cache's own tables are what _dyld_for_each_objc_class answers from.
-	// Large batches go out in chunks, which the interface allows (a dlopen notify is a batch of one).
+	// The whole batch goes out in one call, as dyld4 does: libobjc attaches a class's preoptimized
+	// categories only for the images it has been told about.
 	void notifyMapped(unsigned count, const char* const* paths, const struct mach_header* const* mhs)
 	{
-		static const unsigned kMaxBatch = 64;
+		static const unsigned kStackInfos = 64;
 		if ( count == 0 )
 			return;
 		// The old notifiers tolerate a callback the runtime did not provide; so does this.
@@ -214,32 +216,29 @@ struct ObjCCallbackState {
 			return;
 		if ( version >= 3 )
 			markImageMutable.invoke = signBlockInvoke((uint64_t)(uintptr_t)markImageMutableInvoke, (uint64_t)(uintptr_t)&markImageMutable.invoke);
-		for ( unsigned base = 0; base < count; base += kMaxBatch ) {
-			const unsigned batch = (count - base < kMaxBatch) ? count - base : kMaxBatch;
-			_dyld_objc_notify_mapped_info infos[kMaxBatch];
-			unsigned delivered = 0;
-			for ( unsigned i = 0; i < batch; ++i ) {
-				if ( !acceptsImage(mhs[base + i]) ) {
-					if ( logSkip != nullptr )
-						logSkip("dyld: objc skipping %s: its metadata is unsigned plain arm64, which the arm64e runtime cannot authenticate\n", paths[base + i]);
-					continue;
-				}
-				infos[delivered].mh = mhs[base + i];
-				infos[delivered].path = paths[base + i];
-				infos[delivered].sectionLocationMetadata = nullptr;
-				infos[delivered].dyldObjCRefsOptimized = (mhs[base + i]->flags & MH_DYLIB_IN_CACHE) ? 1 : 0;
-				infos[delivered].flags = 0;
-				if ( logDelivered != nullptr )
-					logDelivered("mapped", infos[delivered].path, infos[delivered].dyldObjCRefsOptimized);
-				++delivered;
-			}
-			if ( delivered == 0 )
+		STACK_ALLOC_OVERFLOW_SAFE_ARRAY(_dyld_objc_notify_mapped_info, infos, kStackInfos);
+		for ( unsigned i = 0; i < count; ++i ) {
+			if ( !acceptsImage(mhs[i]) ) {
+				if ( logSkip != nullptr )
+					logSkip("dyld: objc skipping %s: its metadata is unsigned plain arm64, which the arm64e runtime cannot authenticate\n", paths[i]);
 				continue;
-			if ( version >= 3 )
-				mapped3(delivered, infos, (_dyld_objc_mark_image_mutable)&markImageMutable);
-			else
-				mapped2(delivered, infos);
+			}
+			_dyld_objc_notify_mapped_info info;
+			info.mh = mhs[i];
+			info.path = paths[i];
+			info.sectionLocationMetadata = nullptr;
+			info.dyldObjCRefsOptimized = (mhs[i]->flags & MH_DYLIB_IN_CACHE) ? 1 : 0;
+			info.flags = 0;
+			if ( logDelivered != nullptr )
+				logDelivered("mapped", info.path, info.dyldObjCRefsOptimized);
+			infos.push_back(info);
 		}
+		if ( infos.empty() )
+			return;
+		if ( version >= 3 )
+			mapped3((unsigned)infos.count(), infos.begin(), (_dyld_objc_mark_image_mutable)&markImageMutable);
+		else
+			mapped2((unsigned)infos.count(), infos.begin());
 	}
 
 	void notifyInit(const char* path, const struct mach_header* mh) const
