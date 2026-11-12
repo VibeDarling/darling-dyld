@@ -784,6 +784,85 @@ extern bool _dyld_shared_cache_optimized(void);
 // Exists in iOS 13.0 and later
 extern bool _dyld_shared_cache_is_locally_built(void);
 
+// Called only by the Swift runtime to find the shared cache's prespecialized metadata. NULL when there is none.
+extern const void* _dyld_get_swift_prespecialized_data(void);
+#define DYLD_GET_SWIFT_PRESPECIALIZED_DATA_DEFINED 1
+
+// The Swift runtime's dyld SPIs (the dyld4 declarations). Darling serves no Swift optimizations: see the definitions in
+// dyldAPIsInLibSystem.cpp.
+enum _dyld_protocol_conformance_result_kind {
+  _dyld_protocol_conformance_result_kind_found_descriptor,
+  _dyld_protocol_conformance_result_kind_found_witness_table,
+  _dyld_protocol_conformance_result_kind_not_found,
+  _dyld_protocol_conformance_result_kind_definitive_failure
+  // Unknown values will be considered to be a non-definitive failure, so we can
+  // add more response kinds later if needed without a synchronized submission.
+};
+
+struct _dyld_protocol_conformance_result {
+    // Note this is really a _dyld_protocol_conformance_result_kind in disguise
+    uintptr_t kind;
+
+    // Contains a ProtocolConformanceDescriptor iff `kind` is _dyld_protocol_conformance_result_kind_found_descriptor
+    // Contains a WitnessTable iff `kind` is _dyld_protocol_conformance_result_kind_found_witness_table
+    const void *value;
+};
+
+// Called only by Swift to see if dyld has pre-optimized protocol conformances for the given
+// protocolDescriptor/metadataType and typeDescriptor.
+extern struct _dyld_protocol_conformance_result
+_dyld_find_protocol_conformance(const void *protocolDescriptor,
+                                const void *metadataType,
+                                const void *typeDescriptor);
+
+// Called only by Swift to see if dyld has pre-optimized protocol conformances for the given
+// foreign type descriptor name and protocol
+extern struct _dyld_protocol_conformance_result
+_dyld_find_foreign_type_protocol_conformance(const void *protocol,
+                                             const char *foreignTypeIdentityStart,
+                                             size_t foreignTypeIdentityLength);
+
+// Called only by Swift to check what version of the optimizations are available.
+extern uint32_t _dyld_swift_optimizations_version(void);
+
+// Swift uses this define to guard for the above symbols being available at build time
+#define DYLD_FIND_PROTOCOL_CONFORMANCE_DEFINED 1
+
+// Called only by Swift to check if dyld has pre-optimized protocol conformances in the closure
+// for the given on-disk mach_header containing a __swift5_proto section
+extern bool _dyld_has_preoptimized_swift_protocol_conformances(const struct mach_header* mh);
+
+// Called only by Swift to see if dyld has pre-optimized protocol conformances for the given
+// protocolDescriptor/metadataType and typeDescriptor in the closure on disk.
+extern struct _dyld_protocol_conformance_result
+_dyld_find_protocol_conformance_on_disk(const void *protocolDescriptor,
+                                        const void *metadataType,
+                                        const void *typeDescriptor,
+                                        uint32_t flags);
+
+// Called only by Swift to see if dyld has pre-optimized protocol conformances for the given
+// foreign type descriptor name and protocol in the closure on disk.
+extern struct _dyld_protocol_conformance_result
+_dyld_find_foreign_type_protocol_conformance_on_disk(const void *protocol,
+                                                     const char *foreignTypeIdentityStart,
+                                                     size_t foreignTypeIdentityLength,
+                                                     uint32_t flags);
+
+// Swift uses this define to guard for the above symbols being available at build time
+#define DYLD_FIND_PROTOCOL_ON_DISK_CONFORMANCE_DEFINED 1
+
+// Called only by libobjc to check if dyld has loaded the image described by imageID, that contains pre-optimized categories
+extern bool _dyld_is_preoptimized_objc_image_loaded(uint16_t imageID);
+
+// Called by Swift runtime to query pointer hash tables.
+extern const void *_dyld_find_pointer_hash_table_entry(const void *table,
+                                                       const void *key1,
+                                                       size_t restKeysCount,
+                                                       const void **restKeys);
+
+// Swift uses this define to guard for the above symbol being available at build time
+#define DYLD_FIND_POINTER_HASH_TABLE_ENTRY_DEFINED 1
+
 //
 // Returns if the given app needs a closure built.
 //
@@ -946,6 +1025,124 @@ extern void _dyld_for_each_objc_class(const char* className,
 // Exists in iOS 13.0 and later
 extern void _dyld_for_each_objc_protocol(const char* protocolName,
                                          void (^callback)(void* protocolPtr, bool isLoaded, bool* stop));
+
+
+// dyld4 SPIs the shared cache's libobjc imports. This copy of the header predates them, so they are
+// declared here with dyld-1378's shapes. The kind order is part of the interface: dyld's
+// SectionLocations::version bumps when it changes.
+typedef struct _dyld_section_location_info_s* _dyld_section_location_info_t;
+
+enum _dyld_section_location_kind {
+    // TEXT:
+    _dyld_section_location_text_swift5_protos                  = 0x0,
+    _dyld_section_location_text_swift5_proto,
+    _dyld_section_location_text_swift5_types,
+    _dyld_section_location_text_swift5_replace,
+    _dyld_section_location_text_swift5_replace2,
+    _dyld_section_location_text_swift5_ac_funcs,
+
+    // DATA*:
+    _dyld_section_location_objc_image_info,
+    _dyld_section_location_data_sel_refs,
+    _dyld_section_location_data_msg_refs,
+    _dyld_section_location_data_class_refs,
+    _dyld_section_location_data_super_refs,
+    _dyld_section_location_data_protocol_refs,
+    _dyld_section_location_data_class_list,
+    _dyld_section_location_data_non_lazy_class_list,
+    _dyld_section_location_data_stub_list,
+    _dyld_section_location_data_category_list,
+    _dyld_section_location_data_category_list2,
+    _dyld_section_location_data_non_lazy_category_list,
+    _dyld_section_location_data_protocol_list,
+    _dyld_section_location_data_objc_fork_ok,
+    _dyld_section_location_data_raw_isa,
+
+    // Note, always add new entries before this
+    _dyld_section_location_count,
+};
+
+// found a section: { start_address_of_section, section_size }
+// unknown section: { nullptr, -1 }
+// not in dylib   : { nullptr, 0 }
+struct _dyld_section_info_result {
+    void*   buffer;
+    size_t  bufferSize;
+};
+
+extern struct _dyld_section_info_result _dyld_lookup_section_info(const struct mach_header* mh,
+                                                                  _dyld_section_location_info_t locationHandle,
+                                                                  enum _dyld_section_location_kind kind);
+
+// The cache's pre-optimized objc tables, null when the cache does not carry libobjc.
+extern const void* _dyld_for_objc_header_opt_ro(void);
+extern void* _dyld_for_objc_header_opt_rw(void);
+extern uint32_t _dyld_objc_class_count(void);
+
+
+// The dyld4 callback interface the shared cache's libobjc registers with, with dyld-1378's shapes.
+// v1 is the shape _dyld_objc_notify_register takes; v4 carries callback pointers the arm64e libobjc
+// ptrauth-signs (IB, diversity 1, a string discriminator) into plain fields, which Darling's plain
+// arm64 loader authenticates and strips by hand (dyld3/DarlingObjCCallbacks.h). The plain field
+// types below are what both loaders read; the signing is not the header's business.
+// >>> Darling dyld4 objc callbacks
+typedef void (*_dyld_objc_notify_patch_class)(const struct mach_header* originalMH, void* originalClass,
+                                              const struct mach_header* replacementMH, const void* replacementClass);
+struct _dyld_objc_notify_mapped_info {
+    const struct mach_header*       mh;
+    const char*                     path;
+    _dyld_section_location_info_t   sectionLocationMetadata;
+    uint32_t                        dyldObjCRefsOptimized   :  1,
+                                    flags                   : 31;
+};
+typedef void (*_dyld_objc_notify_mapped2)(unsigned count, const struct _dyld_objc_notify_mapped_info infos[]);
+typedef void (*_dyld_objc_notify_init2)(const struct _dyld_objc_notify_mapped_info* info);
+
+typedef void (^_dyld_objc_mark_image_mutable)(uint32_t objcImageIndex);
+typedef void (*_dyld_objc_notify_mapped3)(unsigned count, const struct _dyld_objc_notify_mapped_info infos[],
+                                          _dyld_objc_mark_image_mutable callback);
+
+struct _dyld_objc_callbacks
+{
+    uintptr_t version;
+};
+
+struct _dyld_objc_callbacks_v2
+{
+    uintptr_t                       version; // == 2
+    _dyld_objc_notify_mapped2       mapped;
+    _dyld_objc_notify_init2         init;
+    _dyld_objc_notify_unmapped      unmapped;
+    _dyld_objc_notify_patch_class   patches;
+};
+
+struct _dyld_objc_callbacks_v3
+{
+    uintptr_t                       version; // == 3
+    _dyld_objc_notify_mapped3       mapped;
+    _dyld_objc_notify_init2         init;
+    _dyld_objc_notify_unmapped      unmapped;
+    _dyld_objc_notify_patch_class   patches;
+};
+
+struct _dyld_objc_callbacks_v4
+{
+    uintptr_t                       version; // == 4
+    _dyld_objc_notify_mapped3       mapped;     // signed IB, "_dyld_objc_notify_mapped4"
+    _dyld_objc_notify_init2         init;       // signed IB, "_dyld_objc_notify_init3"
+    _dyld_objc_notify_unmapped      unmapped;   // signed IB, "_dyld_objc_notify_unmapped2"
+    _dyld_objc_notify_patch_class   patches;    // signed IB, "_dyld_objc_notify_patch_class2"
+};
+
+// Exists in Mac OS X 13.0 and later; accepts versions 2 through 4 and halts on any other.
+extern void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks*);
+// <<< Darling dyld4 objc callbacks
+
+
+// The mach header of the image a dlopen() handle names: RTLD_MAIN_ONLY for the main executable, a
+// handle from dlopen otherwise, null when the handle is not a loaded image. RTLD_SELF is answered in
+// libdyld, where the caller's return address is still visible.
+extern const struct mach_header* _dyld_get_dlopen_image_header(void* handle);
 
 
 // called by exit() before it calls cxa_finalize() so that thread_local

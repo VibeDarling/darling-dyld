@@ -27,6 +27,10 @@
 
 #include <TargetConditionals.h>
 
-
+// An arm64e build of these files needs the arm64e GradedArchs members that GradedArchs::forCurrentOS returns. No other
+// architecture is enabled here, so plain arm64 builds are unchanged.
+#if __arm64e__ && !defined(SUPPORT_ARCH_arm64e)
+  #define SUPPORT_ARCH_arm64e 1
+#endif
 
 #endif // _DYLD_SUPPORTED_ARCHS_H_

@@ -1,0 +1,92 @@
+symbol	exporter	class	code_pointer_args	definition
+_atexit	libsystem_c.dylib	R	0	libc/stdlib/FreeBSD/atexit.c:146
+___cxa_atexit	libsystem_c.dylib	R	0	libc/stdlib/FreeBSD/atexit.c:190
+__os_assumes_log_ctx	libsystem_c.dylib	R	0	libc/os/assumes.c:373
+_bsearch	libsystem_c.dylib	R	4	libc/stdlib/FreeBSD/bsearch.c:56
+_qsort	libsystem_c.dylib	R	3	libc/stdlib/FreeBSD/qsort.c:313
+_qsort_r	libsystem_c.dylib	R	4	libc/stdlib/FreeBSD/qsort.c:311
+_heapsort	libsystem_c.dylib	R	3	libc/stdlib/FreeBSD/heapsort.c:142
+_mergesort	libsystem_c.dylib	R	3	libc/stdlib/FreeBSD/merge.c:101
+_tsearch	libsystem_c.dylib	R	2	libc/stdlib/FreeBSD/tsearch.c:28
+_tfind	libsystem_c.dylib	R	2	libc/stdlib/FreeBSD/tfind.c:28
+_tdelete	libsystem_c.dylib	R	2	libc/stdlib/FreeBSD/tdelete.c:35
+_twalk	libsystem_c.dylib	R	1	libc/stdlib/FreeBSD/twalk.c:52
+_nftw	libsystem_c.dylib	R	1	libc/gen/nftw.c:271
+_scandir	libsystem_c.dylib	R	2,3	libc/gen/FreeBSD/scandir.c:66
+_fts_open	libsystem_c.dylib	R	2	libc/gen/fts.c:233
+_funopen	libsystem_c.dylib	R	1,2,3,4	libc/stdio/FreeBSD/funopen.c:45
+_glob	libsystem_c.dylib	R	2	libc/gen/FreeBSD/glob.c:277
+_dispatch_after_f	libdispatch.dylib	R	3	libdispatch/src/source.c:1416
+_dispatch_mach_create_f	libdispatch.dylib	R	3	libdispatch/src/mach.c:167
+_dispatch_mig_server	libdispatch.dylib	R	2	libdispatch/src/mach.c:3151
+_dispatch_once_f	libdispatch.dylib	R	2	libdispatch/src/once.c:52
+_dispatch_queue_set_specific	libdispatch.dylib	R	3	libdispatch/src/queue.c:2334
+_dispatch_set_finalizer_f	libdispatch.dylib	R	1	libdispatch/src/object.c:289
+_dispatch_source_set_cancel_handler_f	libdispatch.dylib	R	1	libdispatch/src/source.c:388
+_dispatch_source_set_event_handler_f	libdispatch.dylib	R	1	libdispatch/src/source.c:364
+_dispatch_sync_f	libdispatch.dylib	R	2	libdispatch/src/queue.c:1883
+_launch_data_dict_iterate	liblaunch.dylib	R	1	launchd/liblaunch/liblaunch.c:434
+_launchd_close	liblaunch.dylib	R	1	launchd/liblaunch/liblaunch.c:674
+_launchd_msg_recv	liblaunch.dylib	R	1	launchd/liblaunch/liblaunch.c:1218
+_asl_file_filter_level	libsystem_asl.dylib	R	7	syslog/libsystem_asl.tproj/src/asl_file.c:663
+_getaddrinfo_async_start	libsystem_info.dylib	R	4	Libinfo/lookup.subproj/libinfo.c:2735
+_getnameinfo_async_start	libsystem_info.dylib	R	4	Libinfo/lookup.subproj/libinfo.c:2947
+_xpc_main	libxpc.dylib	R	0	libxpc/src/runtime.m:89
+_xpc_pipe_try_receive	libxpc.dylib	R	3	libxpc/src/pipe.m:869
+_tls_handshake_internal_set_master_secret_function	libsystem_coretls.dylib	R	1	coretls/lib/tls_handshake.c:1396
+_tls_private_key_create	libsystem_coretls.dylib	RS	2	coretls/lib/tls_handshake.c:69
+_copyfile_state_set	libcopyfile.dylib	R	2	copyfile/copyfile.c:3326
+_tls_handshake_set_callbacks	libsystem_coretls.dylib	U	-	coretls/lib/tls_handshake.c:285
+_dispatch_after	libdispatch.dylib	B	2	libdispatch/src/source.c:1424
+_dispatch_apply	libdispatch.dylib	B	2	libdispatch/src/apply.c:391
+_dispatch_async	libdispatch.dylib	B	1	libdispatch/src/queue.c:905
+_dispatch_barrier_sync	libdispatch.dylib	B	1	libdispatch/src/queue.c:1928
+_dispatch_block_create_with_qos_class	libdispatch.dylib	B	3	libdispatch/src/queue.c:377
+_dispatch_data_apply	libdispatch.dylib	B	1	libdispatch/src/data.c:597
+_dispatch_data_create	libdispatch.dylib	B	3	libdispatch/src/data.c:182
+_dispatch_group_async	libdispatch.dylib	B	2	libdispatch/src/semaphore.c:397
+_dispatch_group_notify	libdispatch.dylib	B	2	libdispatch/src/semaphore.c:363
+_dispatch_io_create	libdispatch.dylib	B	3	libdispatch/src/io.c:355
+_dispatch_io_read	libdispatch.dylib	B	4	libdispatch/src/io.c:847
+_dispatch_mach_create	libdispatch.dylib	B	2	libdispatch/src/mach.c:157
+_dispatch_once	libdispatch.dylib	B	1	libdispatch/src/once.c:29
+_dispatch_read	libdispatch.dylib	B	3	libdispatch/src/io.c:916
+_dispatch_source_set_cancel_handler	libdispatch.dylib	B	1	libdispatch/src/source.c:372
+_dispatch_source_set_event_handler	libdispatch.dylib	B	1	libdispatch/src/source.c:356
+_dispatch_sync	libdispatch.dylib	B	1	libdispatch/src/queue.c:1939
+__dyld_for_each_objc_class	libdyld.dylib	B	1	dyld/src/dyldAPIsInLibSystem.cpp:2386
+__dyld_for_each_objc_protocol	libdyld.dylib	B	1	dyld/src/dyldAPIsInLibSystem.cpp:2400
+__dyld_process_info_for_each_image	libdyld.dylib	B	1	dyld/src/dyld_process_info.cpp:882
+_err_set_exit_b	libsystem_c.dylib	B	0	libc/gen/FreeBSD/err.c:174
+_qsort_b	libsystem_c.dylib	B	3	libc/stdlib/qsort_b.c:12
+__nc_table_foreach	libsystem_notify.dylib	B	1	libnotify/table.in.c:195
+__nc_table_foreach_64	libsystem_notify.dylib	B	1	libnotify/table.in.c:195
+_notify_register_dispatch	libsystem_notify.dylib	B	3	libnotify/notify_client.c:2087
+__os_activity_initiate	libsystem_trace.dylib	B	3	libtrace/libsystem_trace/os_activity.m:48
+_xpc_activity_register	libxpc.dylib	B	2	libxpc/src/activity.m:137
+_xpc_array_apply	libxpc.dylib	B	1	libxpc/src/array.m:397
+_xpc_connection_send_message_with_reply	libxpc.dylib	B	3	libxpc/src/connection.m:1119
+_xpc_connection_set_event_handler	libxpc.dylib	B	1	libxpc/src/connection.m:1082
+_xpc_dictionary_apply	libxpc.dylib	B	1	libxpc/src/dictionary.m:515
+_xpc_event_publisher_set_error_handler	libxpc.dylib	B	1	libxpc/src/event.m:78
+_xpc_event_publisher_set_handler	libxpc.dylib	B	1	libxpc/src/event.m:85
+__dyld_register_func_for_add_image	libdyld.dylib	N	dyld2 passes it on to the plain dyld	dyld/src/dyldAPIsInLibSystem.cpp:1190-1205,2319-2331: with gUseDyld3 false (src/dyld2.cpp:374) the arm64e libdyld hands the pointer raw to the plain dyld, which calls it with a plain BLR; a signed one would fault there
+__dyld_register_func_for_remove_image	libdyld.dylib	N	dyld2 passes it on to the plain dyld	dyld/src/dyldAPIsInLibSystem.cpp:1190-1205,2319-2331: with gUseDyld3 false (src/dyld2.cpp:374) the arm64e libdyld hands the pointer raw to the plain dyld, which calls it with a plain BLR; a signed one would fault there
+__dyld_objc_notify_register	libdyld.dylib	N	dyld2 passes it on to the plain dyld	dyld/src/dyldAPIsInLibSystem.cpp:1190-1205,2319-2331: with gUseDyld3 false (src/dyld2.cpp:374) the arm64e libdyld hands the pointer raw to the plain dyld, which calls it with a plain BLR; a signed one would fault there
+_signal	libsystem_c.dylib	N	arm64e code never calls the handler	libc/gen/FreeBSD/signal.c: signal, sigset and sigaction hand the pointer to the plain __platform_sigaction unchanged
+_sigset	libsystem_c.dylib	N	arm64e code never calls the handler	libc/gen/FreeBSD/signal.c: signal, sigset and sigaction hand the pointer to the plain __platform_sigaction unchanged
+_sigaction	libsystem_c.dylib	N	arm64e code never calls the handler	libc/gen/FreeBSD/signal.c: signal, sigset and sigaction hand the pointer to the plain __platform_sigaction unchanged
+_ccrng	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccrng.c:7
+_ccsha1_di	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccsha1.c:46
+_ccsha224_di	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccsha2xx.c:38
+_ccsha256_di	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccsha2xx.c:42
+_ccsha384_di	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccsha3xx.c:69
+_ccsha512_di	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccsha3xx.c:73
+_ccmd5_di	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccmd5.c:172
+_ccaes_cbc_decrypt_mode	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccaes.c:19
+_ccaes_ctr_crypt_mode	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccaes.c:33
+_ccaes_gcm_decrypt_mode	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccaes.c:16
+_ccaes_gcm_encrypt_mode	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccaes.c:15
+_ccaes_siv_decrypt_mode	libcorecrypto.dylib	T	returns a table of signed code pointers	corecrypto/src/ccaes.c:488
+_ccDRBGGetRngState	libcommonCrypto.dylib	T	returns a table of signed code pointers	commoncrypto/lib/CommonRandom.c:44
+_dbopen	libsystem_c.dylib	T	returns a table of signed code pointers	libc/db/db/FreeBSD/db.c:53
