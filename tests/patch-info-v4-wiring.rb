@@ -92,11 +92,12 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     };
     struct ImageLoader {
       struct LinkContext { bool verboseMapping = false; };
-      std::string install, path; bool inCache = false; mach_header header = {1}; std::map<std::string, uintptr_t> exports; std::map<std::string, const ImageLoader*> reexportedFrom;
+      std::string install, path; bool inCache = false; mach_header header = {1}; std::map<std::string, uintptr_t> exports; std::map<std::string, const ImageLoader*> reexportedFrom; std::vector<const ImageLoader*> reExports;
       const char *getInstallPath() const { return install.c_str(); }
       const char *getPath() const { return path.c_str(); }
       bool inSharedCache() const { return inCache; }
       const mach_header *machHeader() const { return &header; }
+      void forEachReExportDependent(void (^callback)(const ImageLoader*, bool &stop)) const { bool stop = false; for (const ImageLoader *i : reExports) { callback(i, stop); if (stop) break; } }
       // the real lookup is ImageLoader::findExportedSymbolAddress (searchReExports, resolvers run for a GOT pointer)
       bool findExportedSymbolAddress(const LinkContext &, const char *name, const ImageLoader *requestor, int ordinal, bool runResolver, const ImageLoader **foundIn, uintptr_t *address) const {
         if (requestor != nullptr || ordinal != -1 || !runResolver) return false;
@@ -183,7 +184,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       logged.clear(); cache.applied.clear(); kernel->exports.erase("_nosuchsymbol");
       overrideSplitCacheGotSlots();
       bool sawMissing = false; patchedLines = 0;
-      for (const std::string &l : logged) { sawMissing |= l.find("_nosuchsymbol") != std::string::npos && l.find("does not export") != std::string::npos; patchedLines += l.rfind("dyld: patched ", 0) == 0; }
+      for (const std::string &l : logged) { sawMissing |= l.find("_nosuchsymbol") != std::string::npos && l.find("defines _nosuchsymbol") != std::string::npos; patchedLines += l.rfind("dyld: patched ", 0) == 0; }
       CHECK(sawMissing && patchedLines == 2 && summaries() == 1);
       gLinkContext.verboseMapping = false;
 
@@ -217,7 +218,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       CHECK(cache.lastAddress.empty() && logged.empty());                  // the cache keeps its own, silently without the cache policy option
       gLogCachePolicy = true; cache.applied.clear(); logged.clear();
       overrideSplitCacheGotSlots();
-      CHECK(logged.size() == 2 && logged[0].find("class export of a non-arm64e image") != std::string::npos);   // one line per held back class, no summary line
+      CHECK(logged.size() == 3 && logged[0].find("class export of a non-arm64e image") != std::string::npos && logged[1].find("class export of a non-arm64e image") != std::string::npos);   // one line per held back class and one for the symbol nobody defines, no summary line
       gLogCachePolicy = false;
       ImageLoader *plainDefiner = image("/usr/lib/system/libsystem_c.dylib");
       ImageLoader *armFacade = image("/usr/lib/system/libsystem_kernel.dylib"); armFacade->header.cpusubtype = 2; armFacade->reexportedFrom["_close"] = plainDefiner;
@@ -230,6 +231,65 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       cache.classNames.clear(); cache.applied.clear();                     // a non-class export of a plain image is still overridden
       overrideSplitCacheGotSlots();
       CHECK(cache.lastAddress.size() == 2 && cache.lastAddress["_open"] == (0x1000 | dyld3::darling::kThunkBit));
+
+      // --- an export that is not in the stand-in is taken from the siblings that its umbrella re-exports (Darling's reallocf is in libsystem_c, not libsystem_malloc) ---
+      // the stand-in (cache image 1) lacks _close; libSystem.B re-exports it, a sibling defining _close, and a sibling that does not
+      auto familyCase = [&](ImageLoader *umbrellaExports, bool umbrellaInCache, ImageLoader *sibling, ImageLoader *other) {
+        const std::set<std::string> classes = cache.classNames; reset(cache); cache.classNames = classes;
+        sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+        ImageLoader *standIn = image("/usr/lib/system/libsystem_malloc.dylib"); standIn->exports.erase("_close"); other->exports.clear();
+        ImageLoader *umbrella = image("/usr/lib/libSystem.B.dylib"); umbrella->inCache = umbrellaInCache;
+        umbrella->reExports = {other, standIn, sibling}; if (umbrellaExports) umbrella->reExports.push_back(umbrellaExports);
+        sAllImages.push_back(sibling); sAllImages.push_back(other); sAllImages.push_back(umbrella); sAllImages.push_back(standIn);
+        sDiskOverridesOfCacheImages.push_back({standIn, 1});
+        overrideSplitCacheGotSlots();
+      };
+      auto sibling = [&](const char *install, uintptr_t close, int subtype = 1) { ImageLoader *i = image(install); i->exports = {{"_close", close}}; i->header.cpusubtype = subtype; return i; };
+      familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000), image("/usr/lib/system/libsystem_info.dylib"));
+      CHECK(cache.lastAddress.size() == 2 && cache.lastAddress["_open"] == (0x1000 | dyld3::darling::kThunkBit));
+      CHECK(cache.lastAddress["_close"] == (0x5000 | dyld3::darling::kThunkBit));              // the sibling's definition, through the adapters of a plain sibling
+      familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000, 2), image("/usr/lib/system/libsystem_info.dylib"));
+      CHECK(cache.lastAddress["_close"] == 0x5000);                                           // an arm64e sibling is bound as it is
+      CHECK(logged.empty());
+      gLinkContext.verboseMapping = true;
+      familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000), image("/usr/lib/system/libsystem_info.dylib"));
+      bool sawSibling = false; for (const std::string &l : logged) sawSibling |= l == "dyld: patched /usr/lib/system/libsystem_malloc.dylib _close -> /prefix/usr/lib/system/libsystem_c.dylib\\n";
+      CHECK(sawSibling);                                                                      // the line names the image that defines it
+      gLinkContext.verboseMapping = false;
+      // the stand-in's own definition wins over a sibling's
+      { ImageLoader *c = sibling("/usr/lib/system/libsystem_c.dylib", 0x5000); familyCase(nullptr, false, c, image("/usr/lib/system/libsystem_info.dylib"));
+        sAllImages.back()->exports["_close"] = 0x2222; cache.applied.clear(); cache.lastAddress.clear(); overrideSplitCacheGotSlots();
+        CHECK(cache.lastAddress["_close"] == (0x2222 | dyld3::darling::kThunkBit)); }
+      // two siblings define the symbol: the first in the umbrella's re-export order wins, as in dyld's own override
+      { familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000), image("/usr/lib/system/libsystem_info.dylib"));
+        ImageLoader *umbrella = nullptr, *first = nullptr; for (ImageLoader *i : sAllImages) { if (i->install == "/usr/lib/libSystem.B.dylib") umbrella = i; if (i->install == "/usr/lib/system/libsystem_info.dylib") first = i; }
+        first->exports["_close"] = 0x6000; cache.applied.clear(); cache.lastAddress.clear(); overrideSplitCacheGotSlots();
+        CHECK(cache.lastAddress["_close"] == (0x6000 | dyld3::darling::kThunkBit));              // libsystem_info is listed before libsystem_c
+        std::swap(umbrella->reExports[0], umbrella->reExports[2]); cache.applied.clear(); cache.lastAddress.clear(); overrideSplitCacheGotSlots();
+        CHECK(cache.lastAddress["_close"] == (0x5000 | dyld3::darling::kThunkBit)); }
+      // only an umbrella that re-exports the stand-in counts: with the umbrella no longer re-exporting it, nothing is borrowed
+      familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000), image("/usr/lib/system/libsystem_info.dylib"));
+      cache.applied.clear(); cache.lastAddress.clear();
+      for (ImageLoader *i : sAllImages) if (i->install == "/usr/lib/libSystem.B.dylib") i->reExports.erase(i->reExports.begin() + 1);
+      overrideSplitCacheGotSlots();
+      CHECK(cache.lastAddress.size() == 1 && cache.lastAddress.count("_close") == 0);         // the cache keeps its pointer
+      // a sibling or an umbrella that is a cache image is never a source (the cache's own definition is what is already there)
+      { ImageLoader *c = sibling("/usr/lib/system/libsystem_c.dylib", 0x5000); c->inCache = true; familyCase(nullptr, false, c, image("/usr/lib/system/libsystem_info.dylib")); }
+      CHECK(cache.lastAddress.count("_close") == 0);
+      familyCase(nullptr, true, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000), image("/usr/lib/system/libsystem_info.dylib"));
+      CHECK(cache.lastAddress.count("_close") == 0);
+      // a symbol that no Darling image defines keeps the cache's pointer and says so with the cache policy option alone
+      familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000), image("/usr/lib/system/libsystem_info.dylib"));
+      CHECK(cache.lastAddress.count("_nosuchsymbol") == 0 && logged.empty());                  // the three symbols of the stub: _nosuchsymbol is undefined everywhere
+      gLogCachePolicy = true; cache.applied.clear(); logged.clear();
+      overrideSplitCacheGotSlots();
+      { unsigned missing = 0; for (const std::string &l : logged) missing += l.find("_nosuchsymbol") != std::string::npos && l.find("the cache's own definition stays") != std::string::npos; CHECK(missing == 1 && logged.size() == 1); }
+      gLogCachePolicy = false;
+      // the class-export gate looks at the image that defines the symbol, here the sibling
+      auto classFamily = [&](int siblingSubtype) { familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000, siblingSubtype), image("/usr/lib/system/libsystem_info.dylib")); };
+      cache.classNames = {"_close"}; classFamily(1); CHECK(cache.lastAddress.count("_close") == 0);
+      classFamily(2); CHECK(cache.lastAddress["_close"] == 0x5000);
+      cache.classNames.clear();
 
       // --- the log function is passed under the cache policy option too ---
       reset(cache); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true)); shadow("/usr/lib/libSystem.B.dylib", 0);

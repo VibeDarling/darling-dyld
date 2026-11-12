@@ -1779,13 +1779,43 @@ static void runAllStaticTerminators(void* extra)
 // What the GOT override has done so far in this process.
 static struct { uint64_t patched, missing, unexplained; } sSplitCachePatchTotals;
 
+// An export can sit in another library of the libSystem family on Darling than in the cache: Apple's libsystem_malloc
+// exports reallocf, Darling's is in libsystem_c. The stand-in's clients reach both through the umbrella that re-exports
+// them, so look in the other re-exports of every loaded disk image that re-exports the stand-in. Otherwise the cache keeps
+// its own reallocf while malloc, realloc and free are Darling's, and reallocf is handed pointers its allocator never made.
+// The same rule as the override in ImageLoaderMachOCompressed::doBind (<rdar://problem/59196856>). Only siblings: the
+// stand-in's dependencies would let a symbol that Darling's libz lacks resolve to any libSystem function of that name.
+static bool findInReExportSiblings(const ImageLoader* standIn, const char* symbol, const ImageLoader** foundIn, uintptr_t* address)
+{
+	for (const ImageLoader* umbrella : sAllImages) {
+		if ( umbrella->inSharedCache() )
+			continue;
+		__block bool reExportsStandIn = false;
+		__block std::vector<const ImageLoader*> siblings;
+		umbrella->forEachReExportDependent(^(const ImageLoader* dependent, bool&) {
+			if ( dependent == standIn )
+				reExportsStandIn = true;
+			else
+				siblings.push_back(dependent);
+		});
+		if ( !reExportsStandIn )
+			continue;
+		for (const ImageLoader* sibling : siblings) {
+			if ( !sibling->inSharedCache() && sibling->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, foundIn, address) )
+				return true;
+		}
+	}
+	return false;
+}
+
 // The images of a split cache import through its coalesced GOT, whose slots the mapper has signed to the cache's own
 // exporters. For every cache exporter that this process provides from disk (the records loadPhase5 keeps of a disk
 // image standing in for a cache image), point the slots of the symbols it exports at the loaded image's definitions.
 // Runs at the end of link(), which holds dyld's lock (dlopen takes it explicitly, the other APIs through their glue, and
 // the launch is single threaded) and, for the main program, only returns when every dependent is loaded; so no cache
 // image runs before its imports are fixed. Idempotent, and a no-op without version 4 patch info or a cache image in
-// the process. A symbol the loaded image does not export keeps the cache's pointer and is counted.
+// the process. A symbol the loaded image does not export is looked up in its re-export siblings (findInReExportSiblings);
+// one that no Darling image defines keeps the cache's pointer and is counted.
 static void overrideSplitCacheGotSlots()
 {
 	const DyldSharedCache* cache = sSharedCacheLoadInfo.loadAddress;
@@ -1807,7 +1837,7 @@ static void overrideSplitCacheGotSlots()
 		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, bool classExport, uint64_t* address) {
 			const ImageLoader* foundIn;
 			uintptr_t found;
-			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) ) {
+			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) || findInReExportSiblings(image, symbol, &foundIn, &found) ) {
 				const bool foundInIsArm64e = dyld3::darling::cpusubtypeIsArm64e(foundIn->machHeader()->cpusubtype);
 				// an arm64e runtime never realizes the classes of a plain image, so cache code would get an unsigned class pointer
 				if ( classExport && !foundInIsArm64e ) {
@@ -1822,8 +1852,8 @@ static void overrideSplitCacheGotSlots()
 					dyld::log("dyld: patched %s %s -> %s\n", installPath, symbol, foundIn->getPath());
 				return true;
 			}
-			if ( verbose )
-				dyld::log("dyld: split cache GOT override: %s does not export %s, the cache's pointer stays\n", installPath, symbol);
+			if ( verbose || gLogCachePolicy )
+				dyld::log("dyld: split cache GOT override: neither %s nor a library re-exported with it defines %s, the cache's own definition stays (mixed with Darling's state if that is stateful)\n", installPath, symbol);
 			return false;
 		}, (verbose || gLogCachePolicy) ? &dyld::log : nullptr, &stats);
 		if ( error != nullptr )
