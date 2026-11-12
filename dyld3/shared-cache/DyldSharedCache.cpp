@@ -1450,7 +1450,7 @@ static uint64_t sPatchedExporters[kMaxPatchableImages / 64];
 static const DyldSharedCache* sPatchedCache;
 
 const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, bool classExport, uint64_t* address),
-                                                    DataConstLogFunc logFunc, PatchOverrideStats* stats) const
+                                                    int (^clientAction)(uint32_t clientImageIndex), DataConstLogFunc logFunc, PatchOverrideStats* stats) const
 {
     memset(stats, 0, sizeof(*stats));
     if ( imageIndex >= kMaxPatchableImages )
@@ -1459,9 +1459,12 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
         memset(sPatchedExporters, 0, sizeof(sPatchedExporters));
         sPatchedCache = this;
     }
-    if ( (sPatchedExporters[imageIndex / 64] & (1ULL << (imageIndex % 64))) != 0 ) {
+    // An exporter that is done has its GOT patched for good; it is entered again only to patch the plain locations of clients that appeared since
+    const bool gotDone = (sPatchedExporters[imageIndex / 64] & (1ULL << (imageIndex % 64))) != 0;
+    if ( gotDone ) {
         stats->alreadyApplied = true;
-        return nullptr;
+        if ( clientAction == nullptr )
+            return nullptr;
     }
     PatchMappings maps;
     PatchTablesV4 t;
@@ -1479,7 +1482,8 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
         return kPatchErrMemo;
     PatchWriter writer(maps, t.slide, logFunc);
     const dyld_cache_image_got_clients_v4& g = t.gotClients[imageIndex];
-    for (uint64_t i = g.exportsStartIndex; i != (uint64_t)g.exportsStartIndex + g.exportsCount; ++i) {
+    const uint64_t gotExportCount = gotDone ? 0 : g.exportsCount;
+    for (uint64_t i = g.exportsStartIndex; i != (uint64_t)g.exportsStartIndex + gotExportCount; ++i) {
         const dyld_cache_got_client_export_v4& e = t.gotExports[i];
         ++stats->exports;
         stats->slots += e.locationsCount;
@@ -1502,10 +1506,19 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
         }
     }
     // The clients' own data pointers to the exporter's symbols (a static allocator's malloc and free callbacks, say) are not in the
-    // coalesced GOT. Every client is patched here, loaded or not: the cache maps all of its images at launch, so a client that
-    // is dlopen'ed later finds its slots done.
-    for (uint64_t i = p.clientsStartIndex; i != (uint64_t)p.clientsStartIndex + p.clientsCount; ++i) {
+    // coalesced GOT. Only the clients the caller says are in the process are patched: the rest of the cache's data stays untouched
+    // (each write copies a page), and the caller asks again for a client that is loaded later, before it runs.
+    for (uint64_t i = p.clientsStartIndex; clientAction != nullptr && i != (uint64_t)p.clientsStartIndex + p.clientsCount; ++i) {
         const dyld_cache_patch_client_v4& client = t.clients[i];
+        const int action = clientAction(client.clientDylibIndex);
+        if ( action == kPlainClientRunning ) {
+            // an exporter that is done had this counted when it was new
+            if ( !gotDone && (client.exportsCount != 0) )
+                ++stats->plainClientsRunning;
+            continue;
+        }
+        if ( action != kPlainClientPatch )
+            continue;
         const uint64_t clientAddress = t.images[client.clientDylibIndex].address;
         for (uint64_t j = client.exportsStartIndex; j != (uint64_t)client.exportsStartIndex + client.exportsCount; ++j) {
             const dyld_cache_patch_client_export_v4& e = t.clientExports[j];
@@ -1529,7 +1542,8 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
     }
     if ( !writer.restore() )
         return kPatchErrRestore;
-    sPatchedExporters[imageIndex / 64] |= 1ULL << (imageIndex % 64);
+    if ( !gotDone )
+        sPatchedExporters[imageIndex / 64] |= 1ULL << (imageIndex % 64);
     return nullptr;
 }
 // ---- end of the patch info reader and override ----

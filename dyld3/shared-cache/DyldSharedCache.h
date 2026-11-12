@@ -485,8 +485,11 @@ public:
     struct PatchOverrideStats {
         uint64_t    exports, slots, patched, unexplained, missingExports, missingSlots;
         uint64_t    plainSlots, plainPatched, plainUnexplained, plainMissing;
+        uint64_t    plainClientsRunning;    // clients with plain locations of this exporter that the caller called running: left alone
         bool        alreadyApplied;
     };
+    // What overridePatchGotSlots does with the plain locations of one client image of the exporter (its index in the cache's image table).
+    enum { kPlainClientIgnore = 0, kPlainClientPatch = 1, kPlainClientRunning = 2 };
 
     // A split cache whose patch info is version 4 and lies in a mapping. Nothing below is meaningful without it.
     bool        hasPatchInfoV4() const;
@@ -501,15 +504,20 @@ public:
     const char* forEachPatchGotLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location)) const;
     const char* forEachPatchPlainLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location, uint32_t clientIndex)) const;
     #endif
-    // Overwrites the exporter's coalesced GOT slots and the plain locations of all its clients with the address resolve() gives
-    // for the location's symbol plus the location's addend, signed as the location's own encoding says. Does nothing a second
-    // time for the same exporter. Leaves a location alone (and counts it) when resolve() has no address for its symbol
-    // (missing), or the encoding or the export kind is not understood (unexplained); resolve() is called once per export.
-    // Only the DATA_CONST mappings that a location is written into are made writable, each around its writes. Not thread safe: the caller holds dyld's lock. Returns nullptr or why it stopped.
+    // Overwrites the exporter's coalesced GOT slots, and the plain locations of the clients clientAction names, with the address
+    // resolve() gives for the location's symbol plus the location's addend, signed as the location's own encoding says.
+    // clientAction(client image index) says what to do with the plain locations of that client: kPlainClientPatch (it is in the
+    // process and has not run), kPlainClientIgnore (not loaded: its pages stay untouched), kPlainClientRunning (it has run already
+    // and keeps the cache's pointers; counted in plainClientsRunning). nullptr means no client.
+    // The GOT is done once per exporter. Calling again for an exporter that is done (alreadyApplied) patches only the clients that
+    // are named kPlainClientPatch, which is how a client loaded later gets its slots before it runs. Leaves a location alone (and
+    // counts it) when resolve() has no address for its symbol (missing), or the encoding or the export kind is not understood
+    // (unexplained); resolve() is called once per export per call. Only the DATA_CONST mappings that a location is written into
+    // are made writable, each around its writes. Not thread safe: the caller holds dyld's lock. Returns nullptr or why it stopped.
     // classExport is true for a kind 8 export (objc classes, Swift class metadata, block classes, xpc types), which resolve()
     // refuses for a plain image: an arm64e runtime never realizes its classes. A refusal counts as missing.
     const char* overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, bool classExport, uint64_t* address),
-                                      DataConstLogFunc logFunc, PatchOverrideStats* stats) const;
+                                      int (^clientAction)(uint32_t clientImageIndex), DataConstLogFunc logFunc, PatchOverrideStats* stats) const;
 #endif
 
 #if !(BUILDING_LIBDYLD || BUILDING_DYLD)

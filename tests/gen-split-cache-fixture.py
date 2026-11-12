@@ -116,12 +116,16 @@ PATCH_PLAIN = [
     (0x38, 1, "_alpha", 3, dict(auth_=0, high7=0x2a, addend=100)),
     (0x40, 1, "_gamma", 3, dict(auth_=1, addr_div=1, disc=0x00FF, addend=2)),
     (0x48, 1, "_beta", 3, dict(auth_=1, key_data=1, disc=1)),            # export kind 7: not understood (kind 8 in the kind tests)
+    (0x80, 1, "_alpha", 2, dict(auth_=1, addr_div=1, disc=0x0ABC, addend=1)),      # a second client, image 2 (libexpb)
+    (0x88, 1, "_gamma", 2, dict(auth_=1, key_data=1, disc=7)),
     (0x50, 2, "_bravo", 3, dict(auth_=1, addr_div=1, key_data=1)),
     (0x58, 2, "_bravo", 3, dict(auth_=1, disc=0x0042, addend=4)),
     (0x60, 2, "_charlie", 3, dict(auth_=1, disc=5)),                      # the resolver has no address for _charlie
     (0x68, 2, "_charlie", 3, dict(auth_=0)),
     (0x70, 2, "_unexplained", 3, dict(auth_=1, high7=1)),                 # an encoding nobody can explain
     (0x78, 2, "_unexplained", 3, dict(auth_=1, addr_div=1, disc=0x7777, addend=1)),
+    (0x90, 2, "_bravo", 2, dict(auth_=1, disc=9)),
+    (0x98, 2, "_bravo", 2, dict(auth_=0, addend=3)),
 ]
 GOT_SLOT_OFF = 0x40         # slot i of the GOT page is at GOT_SLOT_OFF + 8 * i
 CONTROL_OFFS = (0x200, 0x208)   # chain entries in the GOT mapping that the patch info does not list

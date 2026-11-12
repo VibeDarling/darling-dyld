@@ -26,7 +26,7 @@ READER_MAIN = <<~CPP
     // --- the whole table, with the counts the generator wrote ---
     DyldSharedCache::PatchInfoV4Counts counts;
     CHECK(cache->checkPatchInfoV4(&counts) == nullptr);
-    CHECK(counts.images == f.images.size() && counts.exports == f.exports.size() && counts.clients == 2 && counts.plainLocations == f.plain.size());
+    CHECK(counts.images == f.images.size() && counts.exports == f.exports.size() && counts.clients == 4 && counts.plainLocations == f.plain.size());
     CHECK(counts.gotExports == 7 && counts.gotLocations == f.got.size());
 
     // --- exporters by install name: the image index of the existing image helpers ---
