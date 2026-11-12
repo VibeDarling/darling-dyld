@@ -788,6 +788,81 @@ extern bool _dyld_shared_cache_is_locally_built(void);
 extern const void* _dyld_get_swift_prespecialized_data(void);
 #define DYLD_GET_SWIFT_PRESPECIALIZED_DATA_DEFINED 1
 
+// The Swift runtime's dyld SPIs (the dyld4 declarations). Darling serves no Swift optimizations: see the definitions in
+// dyldAPIsInLibSystem.cpp.
+enum _dyld_protocol_conformance_result_kind {
+  _dyld_protocol_conformance_result_kind_found_descriptor,
+  _dyld_protocol_conformance_result_kind_found_witness_table,
+  _dyld_protocol_conformance_result_kind_not_found,
+  _dyld_protocol_conformance_result_kind_definitive_failure
+  // Unknown values will be considered to be a non-definitive failure, so we can
+  // add more response kinds later if needed without a synchronized submission.
+};
+
+struct _dyld_protocol_conformance_result {
+    // Note this is really a _dyld_protocol_conformance_result_kind in disguise
+    uintptr_t kind;
+
+    // Contains a ProtocolConformanceDescriptor iff `kind` is _dyld_protocol_conformance_result_kind_found_descriptor
+    // Contains a WitnessTable iff `kind` is _dyld_protocol_conformance_result_kind_found_witness_table
+    const void *value;
+};
+
+// Called only by Swift to see if dyld has pre-optimized protocol conformances for the given
+// protocolDescriptor/metadataType and typeDescriptor.
+extern struct _dyld_protocol_conformance_result
+_dyld_find_protocol_conformance(const void *protocolDescriptor,
+                                const void *metadataType,
+                                const void *typeDescriptor);
+
+// Called only by Swift to see if dyld has pre-optimized protocol conformances for the given
+// foreign type descriptor name and protocol
+extern struct _dyld_protocol_conformance_result
+_dyld_find_foreign_type_protocol_conformance(const void *protocol,
+                                             const char *foreignTypeIdentityStart,
+                                             size_t foreignTypeIdentityLength);
+
+// Called only by Swift to check what version of the optimizations are available.
+extern uint32_t _dyld_swift_optimizations_version(void);
+
+// Swift uses this define to guard for the above symbols being available at build time
+#define DYLD_FIND_PROTOCOL_CONFORMANCE_DEFINED 1
+
+// Called only by Swift to check if dyld has pre-optimized protocol conformances in the closure
+// for the given on-disk mach_header containing a __swift5_proto section
+extern bool _dyld_has_preoptimized_swift_protocol_conformances(const struct mach_header* mh);
+
+// Called only by Swift to see if dyld has pre-optimized protocol conformances for the given
+// protocolDescriptor/metadataType and typeDescriptor in the closure on disk.
+extern struct _dyld_protocol_conformance_result
+_dyld_find_protocol_conformance_on_disk(const void *protocolDescriptor,
+                                        const void *metadataType,
+                                        const void *typeDescriptor,
+                                        uint32_t flags);
+
+// Called only by Swift to see if dyld has pre-optimized protocol conformances for the given
+// foreign type descriptor name and protocol in the closure on disk.
+extern struct _dyld_protocol_conformance_result
+_dyld_find_foreign_type_protocol_conformance_on_disk(const void *protocol,
+                                                     const char *foreignTypeIdentityStart,
+                                                     size_t foreignTypeIdentityLength,
+                                                     uint32_t flags);
+
+// Swift uses this define to guard for the above symbols being available at build time
+#define DYLD_FIND_PROTOCOL_ON_DISK_CONFORMANCE_DEFINED 1
+
+// Called only by libobjc to check if dyld has loaded the image described by imageID, that contains pre-optimized categories
+extern bool _dyld_is_preoptimized_objc_image_loaded(uint16_t imageID);
+
+// Called by Swift runtime to query pointer hash tables.
+extern const void *_dyld_find_pointer_hash_table_entry(const void *table,
+                                                       const void *key1,
+                                                       size_t restKeysCount,
+                                                       const void **restKeys);
+
+// Swift uses this define to guard for the above symbol being available at build time
+#define DYLD_FIND_POINTER_HASH_TABLE_ENTRY_DEFINED 1
+
 //
 // Returns if the given app needs a closure built.
 //

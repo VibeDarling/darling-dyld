@@ -1924,6 +1924,70 @@ const void* _dyld_get_swift_prespecialized_data(void)
     return NULL;
 }
 
+// The Swift runtime's other dyld SPIs. Darling serves none of the cache's Swift or objc preoptimizations, which are tables
+// that dyld4 reads from the cache (dyld4 DyldAPIs.cpp:2719-2740, 2802-2820: no Swift optimization header answers
+// {not_found, NULL}; 2861-2886 and 2888-2905: no prebuilt loader set answers false and not_found; 4162-4177: no table
+// answers NULL; 2608-2624: no objc RW header, or no loaded bit set, answers false, and dyld2 sets no loaded bit).
+// Version 0 is "no optimizations": the Swift runtime then ignores the find_* answers and the shared cache range, and scans
+// every conformance section, which does not depend on dyld_shared_cache_some_image_overridden() being true. The exports must
+// exist: a missing one leaves the cache's GOT slot on the cache's own libdyld code, which runs against dyld state that does not exist here.
+uint32_t _dyld_swift_optimizations_version(void)
+{
+    return 0;
+}
+
+bool _dyld_has_preoptimized_swift_protocol_conformances(const struct mach_header* mh)
+{
+    (void)mh;
+    return false;
+}
+
+struct _dyld_protocol_conformance_result _dyld_find_protocol_conformance(const void* protocolDescriptor,
+                                                                         const void* metadataType,
+                                                                         const void* typeDescriptor)
+{
+    (void)protocolDescriptor; (void)metadataType; (void)typeDescriptor;
+    return { _dyld_protocol_conformance_result_kind_not_found, NULL };
+}
+
+struct _dyld_protocol_conformance_result _dyld_find_foreign_type_protocol_conformance(const void* protocol,
+                                                                                      const char* foreignTypeIdentityStart,
+                                                                                      size_t foreignTypeIdentityLength)
+{
+    (void)protocol; (void)foreignTypeIdentityStart; (void)foreignTypeIdentityLength;
+    return { _dyld_protocol_conformance_result_kind_not_found, NULL };
+}
+
+struct _dyld_protocol_conformance_result _dyld_find_protocol_conformance_on_disk(const void* protocolDescriptor,
+                                                                                 const void* metadataType,
+                                                                                 const void* typeDescriptor,
+                                                                                 uint32_t flags)
+{
+    (void)protocolDescriptor; (void)metadataType; (void)typeDescriptor; (void)flags;
+    return { _dyld_protocol_conformance_result_kind_not_found, NULL };
+}
+
+struct _dyld_protocol_conformance_result _dyld_find_foreign_type_protocol_conformance_on_disk(const void* protocol,
+                                                                                              const char* foreignTypeIdentityStart,
+                                                                                              size_t foreignTypeIdentityLength,
+                                                                                              uint32_t flags)
+{
+    (void)protocol; (void)foreignTypeIdentityStart; (void)foreignTypeIdentityLength; (void)flags;
+    return { _dyld_protocol_conformance_result_kind_not_found, NULL };
+}
+
+const void* _dyld_find_pointer_hash_table_entry(const void* table, const void* key1, size_t restKeysCount, const void** restKeys)
+{
+    (void)table; (void)key1; (void)restKeysCount; (void)restKeys;
+    return NULL;
+}
+
+bool _dyld_is_preoptimized_objc_image_loaded(uint16_t imageID)
+{
+    (void)imageID;
+    return false;
+}
+
 bool _dyld_shared_cache_is_locally_built()
 {
     if ( gUseDyld3 )
