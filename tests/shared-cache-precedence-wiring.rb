@@ -72,6 +72,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
         bool hasImagePath(const char* path, uint32_t& index) const {
           if ( !strcmp(path, "/usr/lib/libz.dylib") || !strcmp(path, "/usr/lib/libz.1.dylib") ) { index = 0; return true; }
           if ( !strcmp(path, "/usr/lib/libobjc.A.dylib") ) { index = 1; return true; }
+          if ( !strcmp(path, "/System/iOSSupport/usr/lib/libcatalyst.dylib") ) { index = 2; return true; }
           return false;
         }
         bool hasNonOverridablePath(const char*) const { return false; }
@@ -93,7 +94,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
     using namespace dyld3;
     class ImageLoader {
     public:
-      struct LinkContext { bool allowEnvVarsPath = true; const char* const* rootPaths = nullptr; };
+      struct LinkContext { bool allowEnvVarsPath = true; bool iOSonMac = false; const char* const* rootPaths = nullptr; };
       int tag = 0;                       // 1 = cache, 2 = disk
       const void* mh = nullptr;
       uint32_t overrides = 0;
@@ -145,7 +146,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       return newImage(1);
     }
 
-    struct Fixture { DyldSharedCache cache; dyld_cache_image_info images[2]; char libz[32]; char objc[32]; };
+    struct Fixture { DyldSharedCache cache; dyld_cache_image_info images[3]; char libz[32]; char objc[32]; char catalyst[64]; };
     static int failures = 0;
     #define CHECK(cond) do { if (!(cond)) { printf("FAIL line %d: %s\\n", __LINE__, #cond); ++failures; } } while (0)
 
@@ -168,9 +169,11 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
     int main() {
       Fixture f = {};
       strcpy(f.libz, "/usr/lib/libz.1.dylib"); strcpy(f.objc, "/usr/lib/libobjc.A.dylib");
-      f.cache.header.imagesOffset = offsetof(Fixture, images); f.cache.header.imagesCount = 2;
+      strcpy(f.catalyst, "/System/iOSSupport/usr/lib/libcatalyst.dylib");
+      f.cache.header.imagesOffset = offsetof(Fixture, images); f.cache.header.imagesCount = 3;
       f.images[0].address = 0x100000; f.images[0].pathFileOffset = offsetof(Fixture, libz);
       f.images[1].address = 0x200000; f.images[1].pathFileOffset = offsetof(Fixture, objc);
+      f.images[2].address = 0x300000; f.images[2].pathFileOffset = offsetof(Fixture, catalyst);
       dyld::sSharedCacheLoadInfo = { &f.cache, 0 };
       const char* kLibz = "/usr/lib/libz.1.dylib"; const char* kLibzAlias = "/usr/lib/libz.dylib"; const char* kObjc = "/usr/lib/libobjc.A.dylib";
       ImageLoader* img = nullptr;
@@ -277,6 +280,17 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       // the unprefixed path of the same load still reaches the cache
       dyld3::gDisk.clear(); dyld3::gDisk[kLibz] = 555;
       CHECK(loadRooted(kLibz, kLibz) == 1 && dyld::seen.cachePath == kLibz);
+      dyld::gLinkContext.rootPaths = nullptr;
+      // a Mac Catalyst process (iOSonMac) has root /System/iOSSupport, a real directory the cache indexes by its full path:
+      // the lookup keeps the root. Without iOSonMac the same root is stripped like any other (Darling's prefix, above).
+      static const char* const kIosRoots[] = { "/System/iOSSupport", nullptr };
+      const char* kCatalyst = "/System/iOSSupport/usr/lib/libcatalyst.dylib";
+      dyld::gLinkContext.rootPaths = kIosRoots;
+      dyld3::gDisk.clear();
+      dyld::gLinkContext.iOSonMac = true;
+      CHECK(loadRooted(kCatalyst, kCatalyst) == 1 && dyld::seen.cachePath == kCatalyst);
+      dyld::gLinkContext.iOSonMac = false;
+      CHECK(loadRooted(kCatalyst, kCatalyst) == 0 && dyld::seen.cacheCalls == 0);
       dyld::gLinkContext.rootPaths = nullptr;
       // no root path: a prefixed-looking path has no cache entry
       dyld3::gDisk.clear(); dyld3::gDisk["/prefix/usr/lib/libz.1.dylib"] = 555;

@@ -3843,7 +3843,8 @@ static void recordDiskOverrideOfCacheImage(const ImageLoader* image, const dyld3
 static const char* pathWithoutRoot(const char* path)
 {
 #if SUPPORT_ROOT_PATH
-	if ( gLinkContext.rootPaths != NULL ) {
+	// iOSMac's root, /System/iOSSupport, is a real directory the cache indexes: a path under it is already a cache path
+	if ( (gLinkContext.rootPaths != NULL) && !gLinkContext.iOSonMac ) {
 		for (const char* const* rootPath = gLinkContext.rootPaths; *rootPath != NULL; ++rootPath) {
 			const size_t rootLen = strlen(*rootPath);
 			if ( (strncmp(path, *rootPath, rootLen) == 0) && (path[rootLen] == '/') )
