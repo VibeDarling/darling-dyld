@@ -77,7 +77,7 @@ OVERRIDE_MAIN = <<~CPP
 
     // --- exporter 1 (libexpa): _beta has an export kind that is not understood, everything else is provided ---
     __block unsigned calls = 0; __block std::vector<std::string> seenSymbols; __block std::vector<std::string> permsAtResolve, otherAtResolve;
-    auto resolver = ^bool(const char *symbol, uint64_t *address) {
+    auto resolver = ^bool(const char *symbol, bool, uint64_t *address) {
       ++calls; seenSymbols.push_back(symbol); permsAtResolve.push_back(permissions(f.gotMapAddr)); otherAtResolve.push_back(permissions(otherData));
       *address = stubAddress(symbol); return *address != 0;
     };
@@ -145,11 +145,13 @@ OVERRIDE_MAIN = <<~CPP
     return failures != 0;
   }
 
-  // Export kind 8 (objc class and class-alias exports) is a plain address, another nonzero kind is not understood: the fixture's _beta
-  // (kind 7, authenticated data-key slot) gets the kind in argv[3] written into the mapped export table before exporter 1 is patched.
+  // Export kind 8 (objc class and similar exports) is a plain address, another nonzero kind is not understood: the fixture's _beta
+  // (kind 7, authenticated data-key slot) gets the kind in the mode ("kind8", ...) written into the mapped export table before exporter 1
+  // is patched. The reader tells the resolver which exports are classes; a "refuse" mode makes the resolver refuse them as dyld2 does for
+  // a plain image, and the slot must then keep the cache's own pointer and count as missing.
   static unsigned gLogged; static std::string gLoggedLine;
   static void captureLog(const char *format, ...) { va_list ap; va_start(ap, format); char buf[256]; vsnprintf(buf, sizeof buf, format, ap); va_end(ap); ++gLogged; gLoggedLine = buf; }
-  static int mainKind(const std::string &dir, unsigned kind) {
+  static int mainKind(const std::string &dir, unsigned kind, bool refuseClass) {
     const Fixture f = loadManifest(dir);
     const DyldSharedCache *cache = mapFixture(dir);
     size_t beta = 0; while (f.exports[beta].name != "_beta") ++beta;
@@ -158,15 +160,23 @@ OVERRIDE_MAIN = <<~CPP
     CHECK((nameKind >> 28) == 7);
     poke(nameWord, 4, (nameKind & 0x0fffffffu) | ((uint64_t)kind << 28));
     const Snapshot before = snapshot(f);
-    __block std::vector<std::string> seenSymbols;
-    auto resolver = ^bool(const char *symbol, uint64_t *address) { seenSymbols.push_back(symbol); *address = stubAddress(symbol); return *address != 0; };
+    __block std::vector<std::string> seenSymbols, classSymbols;
+    auto resolver = ^bool(const char *symbol, bool classExport, uint64_t *address) {
+      seenSymbols.push_back(symbol); if (classExport) classSymbols.push_back(symbol);
+      if (classExport && refuseClass) return false;
+      *address = stubAddress(symbol); return *address != 0;
+    };
     DyldSharedCache::PatchOverrideStats stats;
     CHECK(cache->overridePatchGotSlots(1, resolver, captureLog, &stats) == nullptr);
-    const bool plainAddress = kind == 0 || kind == 8;
-    CHECK(stats.exports == 4 && stats.slots == 7 && stats.patched == (plainAddress ? 7u : 6u) && stats.unexplained == (plainAddress ? 0u : 1u));
-    CHECK(gLogged == (plainAddress ? 0u : 1u));
-    if ( !plainAddress ) CHECK(gLoggedLine.find("'_beta'") != std::string::npos && gLoggedLine.find("not understood") != std::string::npos);
-    CHECK(seenSymbols == (plainAddress ? std::vector<std::string>{"_alpha", "_beta", "_gamma", "_delta_data"} : std::vector<std::string>{"_alpha", "_gamma", "_delta_data"}));
+    const bool understood = kind == 0 || kind == 8;
+    const bool refused = kind == 8 && refuseClass;                // looked up, refused, counted as missing, the cache's own class stays
+    const bool plainAddress = understood && !refused;
+    CHECK(stats.exports == 4 && stats.slots == 7 && stats.patched == (plainAddress ? 7u : 6u) && stats.unexplained == (understood ? 0u : 1u));
+    CHECK(stats.missingExports == (refused ? 1u : 0u) && stats.missingSlots == (refused ? 1u : 0u));
+    CHECK(gLogged == (understood ? 0u : 1u));
+    if ( !understood ) CHECK(gLoggedLine.find("'_beta'") != std::string::npos && gLoggedLine.find("not understood") != std::string::npos);
+    CHECK(classSymbols == (kind == 8 ? std::vector<std::string>{"_beta"} : std::vector<std::string>{}));
+    CHECK(seenSymbols == (understood ? std::vector<std::string>{"_alpha", "_beta", "_gamma", "_delta_data"} : std::vector<std::string>{"_alpha", "_gamma", "_delta_data"}));
     const Snapshot after = snapshot(f);
     for (const Got &g : f.got) {
       if ( g.symbol != "_beta" ) continue;
@@ -184,10 +194,10 @@ OVERRIDE_MAIN = <<~CPP
     const DyldSharedCache *cache = mapFixture(dir);
     const Snapshot before = snapshot(f);
     DyldSharedCache::PatchOverrideStats stats;
-    auto good = ^bool(const char *symbol, uint64_t *address) { *address = stubAddress(symbol); return *address != 0; };
+    auto good = ^bool(const char *symbol, bool, uint64_t *address) { *address = stubAddress(symbol); return *address != 0; };
     // an address that does not fit the 48-bit pointer field of an authenticated pointer, however high its first stray bit is
     for (uint64_t stray : {1ull << 48, 1ull << 50, 1ull << 55, 1ull << 60}) {
-      CHECK_ERR(cache->overridePatchGotSlots(2, ^bool(const char *, uint64_t *address) { *address = stray; return true; }, nullptr, &stats), "does not fit");
+      CHECK_ERR(cache->overridePatchGotSlots(2, ^bool(const char *, bool, uint64_t *address) { *address = stray; return true; }, nullptr, &stats), "does not fit");
     }
     CHECK(snapshot(f).words == before.words && permissions(f.gotMapAddr) == "r--p");
     // a GOT slot that is misaligned (the table check accepts it: it only needs the 8 bytes inside a mapping)
@@ -237,7 +247,7 @@ OVERRIDE_MAIN = <<~CPP
     std::vector<uint64_t> before((uint64_t *)data, (uint64_t *)(data + size));
     DyldSharedCache::PatchOverrideStats stats;
     CHECK(!cache->hasPatchInfoV4());
-    CHECK_ERR(cache->overridePatchGotSlots(0, ^bool(const char *, uint64_t *) { CHECK(false); return false; }, nullptr, &stats), "outside the cache mappings");
+    CHECK_ERR(cache->overridePatchGotSlots(0, ^bool(const char *, bool, uint64_t *) { CHECK(false); return false; }, nullptr, &stats), "outside the cache mappings");
     CHECK(std::vector<uint64_t>((uint64_t *)data, (uint64_t *)(data + size)) == before && stats.patched == 0);
     printf(failures ? "RESULT failed (%d)\\n" : "RESULT ok\\n", failures);
     return failures != 0;
@@ -245,7 +255,7 @@ OVERRIDE_MAIN = <<~CPP
   int main(int argc, char **argv) {
     assert(argc >= 3);
     const std::string mode = argv[2];
-    if ( mode.rfind("kind", 0) == 0 ) return mainKind(argv[1], (unsigned)atoi(mode.c_str() + 4));
+    if ( mode.rfind("kind", 0) == 0 ) return mainKind(argv[1], (unsigned)atoi(mode.c_str() + 4), mode.find("refuse") != std::string::npos);
     return mode == "errors" ? mainErrors(argv[1]) : mode == "nopatch" ? mainNoPatchInfo(argv[1]) : mainOverride(argv[1]);
   }
 CPP
@@ -259,8 +269,8 @@ Dir.mktmpdir('patch-info-v4-override-') do |dir|
   # patch_high puts the GOT 4 GiB above the cache base, so the high word of every GOT offset is used
   out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/fxh", '--variant', 'patch_high', '--base', base)
   abort out unless st.success?
-  # kind 8 is patched like kind 0; the nonzero kinds around it (and the unused 15) are not understood
-  [%w[fx override], %w[fx errors], %w[fxh override], %w[fx kind8], %w[fx kind0], %w[fx kind1], %w[fx kind7], %w[fx kind9], %w[fx kind15]].each do |fixture, mode|
+  # kind 8 is patched like kind 0 unless the resolver refuses a class export; the nonzero kinds around it (and the unused 15) are not understood
+  [%w[fx override], %w[fx errors], %w[fxh override], %w[fx kind8], %w[fx kind8refuse], %w[fx kind0refuse], %w[fx kind0], %w[fx kind1], %w[fx kind7], %w[fx kind9], %w[fx kind15]].each do |fixture, mode|
     out, st = Open3.capture2e("#{dir}/test", "#{dir}/#{fixture}", mode)
     puts out
     abort "patch info v4 override test (#{fixture} #{mode}) failed" unless st.success? && out.include?('RESULT ok')

@@ -1918,7 +1918,7 @@ bool _dyld_shared_cache_optimized()
     return false;
 }
 
-// dyld4 returns nullptr when the cache has no Swift prespecialization data, which Darling's loader never has
+// Darling does not serve the cache's Swift prespecialization data; nullptr makes the Swift runtime use unspecialized metadata
 const void* _dyld_get_swift_prespecialized_data(void)
 {
     return NULL;

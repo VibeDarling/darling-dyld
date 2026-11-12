@@ -504,7 +504,9 @@ public:
     // when resolve() has no address for its symbol (missing), or the encoding or the export kind is not understood
     // (unexplained); the plain table is never applied. Only the DATA_CONST mappings that a slot is written into are made
     // writable, each around its writes. Not thread safe: the caller holds dyld's lock. Returns nullptr or why it stopped.
-    const char* overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, uint64_t* address),
+    // classExport is true for a kind 8 export (objc classes, Swift class metadata, block classes, xpc types), which resolve()
+    // refuses for a plain image: an arm64e runtime never realizes its classes. A refusal counts as missing.
+    const char* overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, bool classExport, uint64_t* address),
                                       DataConstLogFunc logFunc, PatchOverrideStats* stats) const;
 #endif
 

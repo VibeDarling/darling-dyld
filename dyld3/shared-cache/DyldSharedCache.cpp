@@ -1368,7 +1368,7 @@ static const uint32_t kMaxPatchableImages = 8192;
 static uint64_t sPatchedExporters[kMaxPatchableImages / 64];
 static const DyldSharedCache* sPatchedCache;
 
-const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, uint64_t* address),
+const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, bool classExport, uint64_t* address),
                                                     DataConstLogFunc logFunc, PatchOverrideStats* stats) const
 {
     memset(stats, 0, sizeof(*stats));
@@ -1400,7 +1400,9 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
         uint64_t address = 0;
         ++stats->exports;
         stats->slots += e.locationsCount;
-        // kind 8 is inferred (observed for objc class and class-alias exports; not defined in the open-source headers), other kinds are left alone
+        // kind 8 is inferred from observed exports (objc classes, Swift class metadata, concrete block classes, xpc type objects; not
+        // defined in the open-source headers), other kinds are left alone. The resolver decides whether a kind 8 export may be
+        // overridden: a plain libsystem_blocks or libxpc substitute leaves the __NSConcrete*Block and __xpc_type_* slots on the cache copy
         const uint32_t kind = t.exports[e.imageExportIndex].nameKind >> 28;
         if ( (kind != 0) && (kind != 8) ) {
             stats->unexplained += e.locationsCount;
@@ -1408,7 +1410,7 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
                 logFunc("dyld: GOT slots of '%s' have an export kind that is not understood, left as the cache's pointers\n", symbol);
             continue;
         }
-        if ( !resolve(symbol, &address) ) {
+        if ( !resolve(symbol, kind == 8, &address) ) {
             ++stats->missingExports;
             stats->missingSlots += e.locationsCount;
             continue;

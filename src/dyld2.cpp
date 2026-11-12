@@ -1804,13 +1804,20 @@ static void overrideSplitCacheGotSlots()
 		if ( dyld3::sharedCachePathIsAllowListed(cache->getIndexedImagePath(record.cacheImageIndex), dyld3::sharedCacheAllowList()) )
 			continue;
 		DyldSharedCache::PatchOverrideStats stats;
-		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, uint64_t* address) {
+		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, bool classExport, uint64_t* address) {
 			const ImageLoader* foundIn;
 			uintptr_t found;
 			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) ) {
+				const bool foundInIsArm64e = dyld3::darling::cpusubtypeIsArm64e(foundIn->machHeader()->cpusubtype);
+				// an arm64e runtime never realizes the classes of a plain image, so cache code would get an unsigned class pointer
+				if ( classExport && !foundInIsArm64e ) {
+					if ( verbose || gLogCachePolicy )
+						dyld::log("dyld: split cache GOT override: %s of %s is a class export of a non-arm64e image, the cache's pointer stays\n", symbol, foundIn->getPath());
+					return false;
+				}
 				// the importer is a cache image, which is arm64e; a callback-taking export of a plain image gets a thunk. found is
 				// the exporter's own definition, so unlike a resolved bind it can never be an interposer's address
-				*address = dyld3::darling::adaptedTarget(symbol, found, dyld3::darling::cpusubtypeIsArm64e(foundIn->machHeader()->cpusubtype));
+				*address = dyld3::darling::adaptedTarget(symbol, found, foundInIsArm64e);
 				if ( verbose )
 					dyld::log("dyld: patched %s %s -> %s\n", installPath, symbol, foundIn->getPath());
 				return true;
@@ -1818,7 +1825,7 @@ static void overrideSplitCacheGotSlots()
 			if ( verbose )
 				dyld::log("dyld: split cache GOT override: %s does not export %s, the cache's pointer stays\n", installPath, symbol);
 			return false;
-		}, verbose ? &dyld::log : nullptr, &stats);
+		}, (verbose || gLogCachePolicy) ? &dyld::log : nullptr, &stats);
 		if ( error != nullptr )
 			halt(mkstringf("split cache GOT override of '%s': %s\n", installPath, error));
 		if ( stats.alreadyApplied )

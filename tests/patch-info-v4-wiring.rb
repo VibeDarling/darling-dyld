@@ -75,8 +75,8 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       bool hasPatchInfoV4() const { return patchInfo; }
       const char *getIndexedImagePath(uint32_t i) const { return images[i].c_str(); }
       // symbols the exporter has in its GOT: two the loaded image defines and one it does not; index 4 has two unexplained slots instead
-      const char *overridePatchGotSlots(uint32_t index, bool (^resolve)(const char *symbol, uint64_t *address), DataConstLogFunc, PatchOverrideStats *s) const {
-        calls.push_back(index);
+      const char *overridePatchGotSlots(uint32_t index, bool (^resolve)(const char *symbol, bool classExport, uint64_t *address), DataConstLogFunc logFunc, PatchOverrideStats *s) const {
+        calls.push_back(index); logOn.push_back(logFunc != nullptr);
         memset(s, 0, sizeof *s);
         if (applied.count(index)) { s->alreadyApplied = true; return nullptr; }
         if (index == 2 && error) return error;
@@ -84,11 +84,11 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
         if (index == 4) { s->exports = 1; s->slots = 2; s->unexplained = 2; return nullptr; }
         for (const char *name : {"_open", "_close", "_nosuchsymbol"}) {
           uint64_t address = 0; ++s->exports; s->slots += 2;
-          if (resolve(name, &address)) { s->patched += 2; lastAddress[name] = address; } else { ++s->missingExports; s->missingSlots += 2; }
+          if (resolve(name, classNames.count(name) != 0, &address)) { s->patched += 2; lastAddress[name] = address; } else { ++s->missingExports; s->missingSlots += 2; }
         }
         return nullptr;
       }
-      mutable std::map<std::string, uint64_t> lastAddress;
+      mutable std::map<std::string, uint64_t> lastAddress; mutable std::vector<bool> logOn; std::set<std::string> classNames;   // the symbols the cache has as kind 8 exports
     };
     struct ImageLoader {
       struct LinkContext { bool verboseMapping = false; };
@@ -107,7 +107,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     };
     namespace dyld {
       #{record_struct}
-      ImageLoader::LinkContext gLinkContext;
+      ImageLoader::LinkContext gLinkContext; bool gLogCachePolicy = false;
       dyld3::SharedCacheLoadInfo sSharedCacheLoadInfo = {nullptr};
       std::vector<ImageLoader*> sAllImages;
       std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;
@@ -125,7 +125,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     }
     // a disk image standing in for cache image `index`, as loadPhase5 records it
     static void shadow(const char *install, uint32_t index) { ImageLoader *i = image(install); sAllImages.push_back(i); sDiskOverridesOfCacheImages.push_back({i, index}); }
-    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); cache.lastAddress.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
+    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); cache.lastAddress.clear(); cache.logOn.clear(); cache.classNames.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
     static unsigned summaries() { unsigned n = 0; for (const std::string &l : logged) n += l.find("split cache GOT override: patched=") != std::string::npos; return n; }
 
     int main() {
@@ -203,6 +203,42 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       sAllImages.push_back(facade); sDiskOverridesOfCacheImages.push_back({facade, 1});
       overrideSplitCacheGotSlots();
       CHECK(cache.lastAddress["_open"] == (0x1000 | dyld3::darling::kThunkBit) && cache.lastAddress["_close"] == 0x2000);
+
+      // --- a kind 8 (class) export is held back when the image that defines it is plain, whichever image is recorded; counted as missing ---
+      auto classCase = [&](ImageLoader *recorded) {
+        reset(cache); cache.classNames = {"_open", "_close"}; sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+        sAllImages.push_back(recorded); sDiskOverridesOfCacheImages.push_back({recorded, 1});
+        overrideSplitCacheGotSlots();
+      };
+      ImageLoader *armKernel = image("/usr/lib/system/libsystem_kernel.dylib"); armKernel->header.cpusubtype = 2;
+      classCase(armKernel);                                                // an arm64e image's own classes are overridden
+      CHECK(cache.lastAddress.size() == 2 && cache.lastAddress["_open"] == 0x1000 && cache.lastAddress["_close"] == 0x2000);
+      classCase(image("/usr/lib/system/libsystem_kernel.dylib"));          // a plain image's classes are not
+      CHECK(cache.lastAddress.empty() && logged.empty());                  // the cache keeps its own, silently without the cache policy option
+      gLogCachePolicy = true; cache.applied.clear(); logged.clear();
+      overrideSplitCacheGotSlots();
+      CHECK(logged.size() == 2 && logged[0].find("class export of a non-arm64e image") != std::string::npos);   // one line per held back class, no summary line
+      gLogCachePolicy = false;
+      ImageLoader *plainDefiner = image("/usr/lib/system/libsystem_c.dylib");
+      ImageLoader *armFacade = image("/usr/lib/system/libsystem_kernel.dylib"); armFacade->header.cpusubtype = 2; armFacade->reexportedFrom["_close"] = plainDefiner;
+      classCase(armFacade);                                                // an arm64e substitute re-exporting a plain image's class: held back
+      CHECK(cache.lastAddress.size() == 1 && cache.lastAddress["_open"] == 0x1000);
+      ImageLoader *armDefiner = image("/usr/lib/system/libsystem_c.dylib"); armDefiner->header.cpusubtype = 2;
+      ImageLoader *plainFacade = image("/usr/lib/system/libsystem_kernel.dylib"); plainFacade->reexportedFrom["_close"] = armDefiner;
+      classCase(plainFacade);                                              // a plain substitute re-exporting an arm64e image's class: allowed (the definer counts)
+      CHECK(cache.lastAddress.size() == 1 && cache.lastAddress["_close"] == 0x2000);
+      cache.classNames.clear(); cache.applied.clear();                     // a non-class export of a plain image is still overridden
+      overrideSplitCacheGotSlots();
+      CHECK(cache.lastAddress.size() == 2 && cache.lastAddress["_open"] == (0x1000 | dyld3::darling::kThunkBit));
+
+      // --- the log function is passed under the cache policy option too ---
+      reset(cache); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true)); shadow("/usr/lib/libSystem.B.dylib", 0);
+      overrideSplitCacheGotSlots();
+      CHECK((cache.logOn == std::vector<bool>{false}));
+      cache.applied.clear(); cache.logOn.clear(); gLogCachePolicy = true;
+      overrideSplitCacheGotSlots();
+      CHECK((cache.logOn == std::vector<bool>{true}));
+      gLogCachePolicy = false;
 
       // --- a reader error halts, naming the exporter and the reason ---
       reset(cache);
