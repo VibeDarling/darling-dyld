@@ -143,6 +143,9 @@ extern "C" int __fork();
 #include "Loading.h"
 #include "DyldSharedCache.h"
 #include "SharedCacheRuntime.h"
+#ifdef DARLING
+#include "DarlingArm64eAdapters.h"
+#endif
 #include "StringUtils.h"
 #include "Tracing.h"
 #include "ClosureBuilder.h"
@@ -248,6 +251,8 @@ struct EnvironmentVariables {
 	bool						DYLD_DISABLE_DOFS;
 	bool						hasOverride;
                             //  DYLD_SHARED_CACHE_DIR           ==> sSharedCacheOverrideDir
+                            //  DYLD_SHARED_CACHE_SPLIT_DIR     ==> sSharedCacheSplitDir (Darling only)
+                            //  DYLD_SHARED_CACHE_SPLIT_POLICY  ==> sSharedCacheSplitPolicy (Darling only)
 							//	DYLD_ROOT_PATH					==> gLinkContext.rootPaths
 							//	DYLD_IMAGE_SUFFIX				==> gLinkContext.imageSuffix
 							//	DYLD_PRINT_OPTS					==> gLinkContext.verboseOpts
@@ -260,6 +265,8 @@ struct EnvironmentVariables {
 							//	DYLD_PRINT_REBASINGS			==> gLinkContext.verboseRebase
 							//	DYLD_PRINT_DOFS					==> gLinkContext.verboseDOF
 							//	DYLD_PRINT_APIS					==> gLogAPIs
+							//	DYLD_PRINT_OBJC_NOTIFICATIONS	==> gLogObjCNotifications (Darling only)
+							//	DYLD_PRINT_CACHE_POLICY			==> gLogCachePolicy (Darling only)
 							//	DYLD_IGNORE_PREBINDING			==> gLinkContext.prebindUsage
 							//	DYLD_PREBIND_DEBUG				==> gLinkContext.verbosePrebinding
 							//	DYLD_NEW_LOCAL_SHARED_REGIONS	==> gLinkContext.sharedRegionMode
@@ -315,9 +322,16 @@ static UndefinedHandler				sUndefinedHandler = NULL;
 static ImageLoader*					sBundleBeingLoaded = NULL;	// hack until OFI is reworked
 static dyld3::SharedCacheLoadInfo	sSharedCacheLoadInfo;
 static const char*					sSharedCacheOverrideDir;
+#ifdef DARLING
+static const char*					sSharedCacheSplitDir;	// DYLD_SHARED_CACHE_SPLIT_DIR, null when not set
+static const char*					sSharedCacheSplitPolicy;	// DYLD_SHARED_CACHE_SPLIT_POLICY, null when not set
+#endif
        bool							gSharedCacheOverridden = false;
 ImageLoader::LinkContext			gLinkContext;
 bool								gLogAPIs = false;
+bool								gLogObjCNotifications = false;
+bool								gLogCachePolicy = false;
+bool								gObjCRuntimeIsSharedCache = false;
 #if SUPPORT_ACCELERATE_TABLES
 bool								gLogAppAPIs = false;
 #endif
@@ -1361,8 +1375,20 @@ static void notifyBatchPartial(dyld_image_states state, bool orLater, dyld_image
 	}
 }
 
+#ifdef DARLING
+static void overrideSplitCacheGotSlots();
+#endif
+
 static void notifyBatch(dyld_image_states state, bool preflightOnly)
 {
+#ifdef DARLING
+	// ImageLoader::link() sends this once the images of a dlopen are bound. The add-image callbacks and objc's mapped callback run in it
+	// and read and write the cache images' data (libdyld's tlv_initialize_descriptors sets the thread-local thunks that the override
+	// would otherwise set back), so the override has to be done by then. At launch it is a no-op here (the main executable is still
+	// linking) and _main does it after the binds, before any callback is registered.
+	if ( (state == dyld_image_state_bound) && !preflightOnly )
+		overrideSplitCacheGotSlots();
+#endif
 	notifyBatchPartial(state, false, NULL, preflightOnly, false);
 }
 
@@ -1579,6 +1605,13 @@ static void addImage(ImageLoader* image)
 	
 }
 
+static std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;
+
+const std::vector<DiskOverrideOfCacheImage>& diskOverridesOfCacheImages()
+{
+	return sDiskOverridesOfCacheImages;
+}
+
 //
 // Helper for std::remove_if
 //
@@ -1657,6 +1690,11 @@ void removeImage(ImageLoader* image)
 			break;
 		}
 	}
+
+	// a record of a cache image that this image stood in for must not outlive it
+	sDiskOverridesOfCacheImages.erase(std::remove_if(sDiskOverridesOfCacheImages.begin(), sDiskOverridesOfCacheImages.end(),
+													 [image](const DiskOverrideOfCacheImage& r) { return r.image == image; }),
+									  sDiskOverridesOfCacheImages.end());
 
 	// If this image is the potential canonical definition of any weak defs, then set them to a tombstone value
 	if ( gLinkContext.weakDefMapInitialized && image->hasCoalescedExports() && (image->getState() >= dyld_image_state_bound) ) {
@@ -1748,6 +1786,190 @@ static void runAllStaticTerminators(void* extra)
 		halt(msg);
 	}
 }
+
+#ifdef DARLING
+// What the GOT override has done so far in this process.
+static struct { uint64_t patched, missing, unexplained, plainPatched, plainMissing, plainUnexplained; } sSplitCachePatchTotals;
+// By cache image index: the images an earlier pass has seen in the process (they may have run, so their plain locations are never
+// patched later).
+static std::vector<bool> sCacheImagesSeen;
+
+// An export can sit in another library of the libSystem family on Darling than in the cache: Apple's libsystem_malloc
+// exports reallocf, Darling's is in libsystem_c. The stand-in's clients reach both through the umbrella that re-exports
+// them, so look in the other re-exports of every loaded disk image that re-exports the stand-in. Otherwise the cache keeps
+// its own reallocf while malloc, realloc and free are Darling's, and reallocf is handed pointers its allocator never made.
+// The same rule as the override in ImageLoaderMachOCompressed::doBind (<rdar://problem/59196856>). Only siblings: the
+// stand-in's dependencies would let a symbol that Darling's libz lacks resolve to any libSystem function of that name.
+static bool findInReExportSiblings(const ImageLoader* standIn, const char* symbol, const ImageLoader** foundIn, uintptr_t* address)
+{
+	for (const ImageLoader* umbrella : sAllImages) {
+		if ( umbrella->inSharedCache() )
+			continue;
+		__block bool reExportsStandIn = false;
+		__block std::vector<const ImageLoader*> siblings;
+		umbrella->forEachReExportDependent(^(const ImageLoader* dependent, bool&) {
+			if ( dependent == standIn )
+				reExportsStandIn = true;
+			else
+				siblings.push_back(dependent);
+		});
+		if ( !reExportsStandIn )
+			continue;
+		for (const ImageLoader* sibling : siblings) {
+			if ( !sibling->inSharedCache() && sibling->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, foundIn, address) )
+				return true;
+		}
+	}
+	return false;
+}
+
+// The images of a split cache import through its coalesced GOT, whose slots the mapper has signed to the cache's own
+// exporters. For every cache exporter that this process provides from disk (the records loadPhase5 keeps of a disk
+// image standing in for a cache image), point the slots of the symbols it exports at the loaded image's definitions.
+// Runs in link() after the binds, weak binds and interposing and before the bound notification (notifyBatch), which holds dyld's lock (dlopen takes it explicitly, the other APIs through their glue, and
+// the launch is single threaded), and once more after the launch binds. The lookups run symbol resolvers (a bind stores a
+// resolver's result, and a resolver export's stub reaches the resolver through __la_resolver, which preserves less than a
+// call does), and a resolver uses its image's bound slots: the Darling native shims (ELF bridge libraries) read __got for
+// _elfcalls. A dlopen has bound the whole closure when link() ends, but link() of the main program and of the inserted
+// libraries only loads and rebases (ImageLoader::link skips the bind while linkingMainExecutable, ImageLoader.cpp:545),
+// and _main binds them later (after applyInterposing). So the pass is a no-op during the launch's links, and _main runs
+// it when those binds are done, before the initializers: no cache image runs before its imports are fixed. Idempotent,
+// and a no-op without version 4 patch info or a cache image in the process. A symbol the loaded image does not export is looked up in its re-export siblings (findInReExportSiblings);
+// one that no Darling image defines keeps the cache's pointer and is counted. The clients' own data pointers to those symbols
+// (CoreFoundation's static allocator holds _malloc and _free) are rewritten too, or cache code would free through the cache's
+// uninitialized copy of the library. Only for the cache images in the process (every write copies a page of the cache's data):
+// the launch pass patches the ones loaded, and a pass at the end of a dlopen's link() patches the ones that dlopen loaded, before
+// they run. An image that an earlier pass has seen may have run, so when a stand-in appears later its plain locations stay as they
+// are, and the count of such images is logged under DYLD_PRINT_CACHE_POLICY.
+static void overrideSplitCacheGotSlots()
+{
+	const DyldSharedCache* cache = sSharedCacheLoadInfo.loadAddress;
+	if ( (cache == nullptr) || !cache->hasPatchInfoV4() || gLinkContext.linkingMainExecutable )
+		return;
+	bool cacheImageLoaded = false;
+	for (const ImageLoader* image : sAllImages)
+		cacheImageLoaded |= image->inSharedCache();
+	if ( !cacheImageLoaded )
+		return;
+	const bool verbose = gLinkContext.verboseMapping;
+	uint64_t exporters = 0, newUnexplained = 0, plainWork = 0;
+	// what to do with the plain locations of each cache image of the process: patch the new ones, leave the ones seen before
+	std::vector<uint8_t> clientActions;
+	bool anyNewClient = false;
+	for (const ImageLoader* image : sAllImages) {
+		uint32_t index;
+		if ( !image->inSharedCache() || !cache->findMachHeaderImageIndex(image->machHeader(), index) )
+			continue;
+		if ( clientActions.size() <= index )
+			clientActions.resize(index + 1, DyldSharedCache::kPlainClientIgnore);
+		const bool seen = (index < sCacheImagesSeen.size()) && sCacheImagesSeen[index];
+		clientActions[index] = seen ? DyldSharedCache::kPlainClientRunning : DyldSharedCache::kPlainClientPatch;
+		anyNewClient |= !seen;
+	}
+	const uint8_t* actions = clientActions.data();
+	const size_t actionCount = clientActions.size();
+	int (^clientAction)(uint32_t) = ^(uint32_t client) { return (client < actionCount) ? (int)actions[client] : (int)DyldSharedCache::kPlainClientIgnore; };
+	for (const DiskOverrideOfCacheImage& record : sDiskOverridesOfCacheImages) {
+		const ImageLoader* image = record.image;
+		const char* installPath = image->getInstallPath();
+		if ( dyld3::sharedCachePathIsAllowListed(cache->getIndexedImagePath(record.cacheImageIndex), dyld3::sharedCacheAllowList()) )
+			continue;
+		DyldSharedCache::PatchOverrideStats stats;
+		// an exporter that is done is entered again only for the cache images that are new
+		const bool done = cache->patchOverrideDone(record.cacheImageIndex);
+		// a real cache leaves thousands of symbols to the cache (an empty libswiftCore stand-in: 3843): one line per exporter, not per symbol
+		struct { uint64_t count; const char* first[3]; } initialUndefined = { 0, { nullptr, nullptr, nullptr } };	// names point into the cache's string table, which stays mapped
+		__block decltype(initialUndefined) undefined = initialUndefined;
+		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, bool classExport, uint64_t* address) {
+			const ImageLoader* foundIn;
+			uintptr_t found;
+			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) || findInReExportSiblings(image, symbol, &foundIn, &found) ) {
+				const bool foundInIsArm64e = dyld3::darling::cpusubtypeIsArm64e(foundIn->machHeader()->cpusubtype);
+				// an arm64e runtime never realizes the classes of a plain image, so cache code would get an unsigned class pointer
+				if ( classExport && !foundInIsArm64e ) {
+					if ( verbose || gLogCachePolicy )
+						dyld::log("dyld: split cache GOT override: %s of %s is a class export of a non-arm64e image, the cache's pointer stays\n", symbol, foundIn->getPath());
+					return false;
+				}
+				// the importer is a cache image, which is arm64e; a callback-taking export of a plain image gets a thunk. found is
+				// the exporter's own definition, so unlike a resolved bind it can never be an interposer's address
+				*address = dyld3::darling::adaptedTarget(symbol, found, foundInIsArm64e);
+				if ( verbose )
+					dyld::log("dyld: patched %s %s -> %s\n", installPath, symbol, foundIn->getPath());
+				return true;
+			}
+			if ( undefined.count < 3 )
+				undefined.first[undefined.count] = symbol;
+			++undefined.count;
+			if ( verbose )
+				dyld::log("dyld: split cache GOT override: neither %s nor a library re-exported with it defines %s, the cache's own definition stays\n", installPath, symbol);
+			return false;
+		}, (done && !anyNewClient) ? (int (^)(uint32_t))nullptr : clientAction, (verbose || gLogCachePolicy) ? &dyld::log : nullptr, &stats);
+		if ( error != nullptr )
+			halt(mkstringf("split cache GOT override of '%s': %s\n", installPath, error));
+		sSplitCachePatchTotals.plainPatched += stats.plainPatched;
+		sSplitCachePatchTotals.plainMissing += stats.plainMissing;
+		sSplitCachePatchTotals.plainUnexplained += stats.plainUnexplained;
+		newUnexplained += stats.plainUnexplained;
+		plainWork += stats.plainSlots;
+		// dyld::log only, as below
+		if ( (stats.plainClientsRunning != 0) && (verbose || gLogCachePolicy) )
+			dyld::log("dyld: split cache plain override: %s: %llu cache image(s) in the process have run already and keep the cache's own pointers to its exports\n",
+					  installPath, (unsigned long long)stats.plainClientsRunning);
+		if ( stats.alreadyApplied )
+			continue;
+		if ( (undefined.count != 0) && (verbose || gLogCachePolicy) ) {
+			// cache code that keeps such a definition runs it on the cache's own state, mixed with Darling's if the symbol is stateful
+			// dyld::log only: this runs before libc's locale state is usable, which snprintf needs (it crashed in localeconv_l)
+			const uint64_t n = undefined.count;
+			dyld::log("dyld: split cache GOT override: %s: %llu export(s) that no Darling image defines keep the cache's definition (first: %s%s%s%s%s%s)\n",
+					  installPath, (unsigned long long)n, undefined.first[0], (n > 1) ? ", " : "", (n > 1) ? undefined.first[1] : "",
+					  (n > 2) ? ", " : "", (n > 2) ? undefined.first[2] : "", (n > 3) ? ", ..." : "");
+		}
+		++exporters;
+		sSplitCachePatchTotals.patched += stats.patched;
+		sSplitCachePatchTotals.missing += stats.missingSlots;
+		sSplitCachePatchTotals.unexplained += stats.unexplained;
+		newUnexplained += stats.unexplained;
+	}
+	for (size_t index = 0; index != clientActions.size(); ++index) {
+		if ( clientActions[index] == DyldSharedCache::kPlainClientIgnore )
+			continue;
+		if ( sCacheImagesSeen.size() <= index )
+			sCacheImagesSeen.resize(index + 1, false);
+		sCacheImagesSeen[index] = true;
+	}
+	// one line per pass: with the verbose mapping option, and without it only for an anomaly (an encoding or an export kind
+	// that was refused). Missing symbols are normal (Darling lacks some of the exports), so they are only in the verbose line.
+	if ( (newUnexplained != 0) || (((exporters != 0) || (plainWork != 0)) && verbose) )
+		dyld::log("dyld: split cache GOT override: patched=%llu missing=%llu unexplained=%llu plain-patched=%llu plain-missing=%llu plain-unexplained=%llu (locations, all exporters so far)\n",
+				  (unsigned long long)sSplitCachePatchTotals.patched, (unsigned long long)sSplitCachePatchTotals.missing,
+				  (unsigned long long)sSplitCachePatchTotals.unexplained, (unsigned long long)sSplitCachePatchTotals.plainPatched,
+				  (unsigned long long)sSplitCachePatchTotals.plainMissing, (unsigned long long)sSplitCachePatchTotals.plainUnexplained);
+}
+#endif
+
+#if defined(DARLING) && defined(__arm64__)
+// Cache code reads its thread pointer with `mrs Xt, TPIDRRO_EL0`, which Linux leaves at zero. Rewrite those reads for
+// every cache image before any of them runs, from the sidecar table next to the cache (see DarlingTSDIslands.h). Runs at
+// the end of link(), under the same lock and for the same reason as overrideSplitCacheGotSlots(): no cache image has run
+// yet. Cheap once an image is done, and a no-op without a split cache or a cache image in the process.
+static void translateSplitCacheTSDReads()
+{
+	if ( (sSharedCacheLoadInfo.loadAddress == nullptr) || !sSharedCacheLoadInfo.loadAddress->isSplitCache() )
+		return;
+	for (const ImageLoader* image : sAllImages) {
+		if ( !image->inSharedCache() )
+			continue;
+		dyld3::darling_tsd::PatchStats stats;
+		if ( const char* error = dyld3::translateSplitCacheTSD(sSharedCacheLoadInfo, image->machHeader(), &stats) )
+			halt(mkstringf("TSD translation of '%s': %s\n", image->getPath(), error));
+		if ( gLinkContext.verboseMapping && (stats.sites != 0) )
+			dyld::log("dyld: TSD reads of %s: %u sites, %u veneers, %u cpu-index, %u nops, %u left to the trap\n", image->getPath(),
+					  stats.sites, stats.veneers, stats.cpuZeroed, stats.nops, stats.trapped);
+	}
+}
+#endif
 
 void initializeMainExecutable()
 {
@@ -2221,6 +2443,12 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	else if ( strcmp(key, "DYLD_PRINT_APIS") == 0 ) {
 		gLogAPIs = true;
 	}
+	else if ( strcmp(key, "DYLD_PRINT_OBJC_NOTIFICATIONS") == 0 ) {
+		gLogObjCNotifications = true;
+	}
+	else if ( strcmp(key, "DYLD_PRINT_CACHE_POLICY") == 0 ) {
+		gLogCachePolicy = true;
+	}
 #if SUPPORT_ACCELERATE_TABLES
 	else if ( strcmp(key, "DYLD_PRINT_APIS_APP") == 0 ) {
 		gLogAppAPIs = true;
@@ -2258,6 +2486,21 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	else if ( (strcmp(key, "DYLD_SHARED_CACHE_DIR") == 0) && gLinkContext.allowEnvVarsSharedCache  ) {
 		sSharedCacheOverrideDir = value;
 	}
+#ifdef DARLING
+	// A restricted process must not choose which cache it maps, so this needs the path permission as well.
+	else if ( (strcmp(key, "DYLD_SHARED_CACHE_SPLIT_DIR") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
+		sSharedCacheSplitDir = value;
+	}
+	// gated like DYLD_SHARED_CACHE_SPLIT_DIR: a restricted process must not choose how its imports are bound
+	else if ( (strcmp(key, "DYLD_DARLING_ARM64E_ADAPTERS") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
+		// "off" binds the raw targets to arm64e importers again, to show what the adapters change; "report" also names the imports with no row
+		dyld3::darling::setAdapterMode(strcmp(value, "off") == 0 ? dyld3::darling::AdapterMode::Off : (strcmp(value, "report") == 0 ? dyld3::darling::AdapterMode::Report : dyld3::darling::AdapterMode::On));
+	}
+	// The policy replaces the list of libraries the cache serves, so it is as restricted as the directory.
+	else if ( (strcmp(key, "DYLD_SHARED_CACHE_SPLIT_POLICY") == 0) && gLinkContext.allowEnvVarsSharedCache && gLinkContext.allowEnvVarsPath ) {
+		sSharedCacheSplitPolicy = value;
+	}
+#endif
 	else if ( strcmp(key, "DYLD_USE_CLOSURES") == 0 ) {
 		// Handled elsewhere
 	}
@@ -3550,6 +3793,68 @@ static bool isFileRelativePath(const char* path)
 static ImageLoader* loadPhase5check(const char* path, const char* orgPath, const LoadContext& context);
 
 
+// A split cache image has no closure Image, so the cache cannot say whether a file on disk may override it
+// (see dyld3::chooseSharedCacheLoadSource). Sets existsOnDisk and statErrNo from the stat of path.
+static bool useCacheImageWithoutClosure(const char* path, const dyld3::SharedCacheFindDylibResults& found,
+										struct stat& statBuf, bool& existsOnDisk, uint& statErrNo)
+{
+	// HACK to support old caches
+	existsOnDisk = ( dyld3::stat(path, &statBuf) == 0 );
+	statErrNo = errno;
+	const bool splitCache = sSharedCacheLoadInfo.loadAddress->isSplitCache();
+	const dyld3::SharedCacheLoadSource source = dyld3::chooseSharedCacheLoadSource(splitCache, true, existsOnDisk,
+																				  found.pathInCache, dyld3::sharedCacheAllowList());
+	if ( gLogCachePolicy ) {
+		const bool allowListed = dyld3::sharedCachePathIsAllowListed(found.pathInCache, dyld3::sharedCacheAllowList());
+		dyld::log("cache load source %s: policy=%s allow_list=%s\n", found.pathInCache ? found.pathInCache : path,
+				  source == dyld3::kSharedCacheLoadFromCache ? "cache" : "disk", allowListed ? "hit" : "miss");
+	}
+	if ( source == dyld3::kSharedCacheLoadFromDisk )
+		return false;
+	// the stat was of a disk file that the cache now shadows: its inode and mtime must not end up on the cache image
+	if ( splitCache )
+		bzero(&statBuf, sizeof(statBuf));
+	return true;
+}
+
+// the patch-table override must know which cache image a disk image stands in for
+static void recordDiskOverrideOfCacheImage(const ImageLoader* image, const dyld3::SharedCacheFindDylibResults& foundByPath)
+{
+	dyld3::SharedCacheFindDylibResults found = foundByPath;
+	// a library substituted through DYLD_LIBRARY_PATH is not at a cache path, but the cache's code imports it by install name
+	// (checkandAddImage can hand back the cache image already loaded under that install name: not an override of itself)
+	if ( (found.cacheImageIndex == dyld3::kNoCacheImageIndex) && (image->getInstallPath() != nullptr) && !image->inSharedCache() )
+		dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, image->getInstallPath(), &found);
+	if ( (found.image == nullptr) && (found.cacheImageIndex != dyld3::kNoCacheImageIndex)
+	  && sSharedCacheLoadInfo.loadAddress->isSplitCache() ) {
+		// loading can hand back an image that is already loaded under the same install name
+		for (const DiskOverrideOfCacheImage& existing : sDiskOverridesOfCacheImages) {
+			if ( existing.image == image )
+				return;
+		}
+		DiskOverrideOfCacheImage record = { image, found.cacheImageIndex };
+		sDiskOverridesOfCacheImages.push_back(record);
+	}
+}
+
+
+// loadPhase0 puts DYLD_ROOT_PATH in front of a path (Darling's prefix) before it reaches loadPhase5load, but a cache
+// indexes the path without it. Returns path as the cache knows it.
+static const char* pathWithoutRoot(const char* path)
+{
+#if SUPPORT_ROOT_PATH
+	if ( gLinkContext.rootPaths != NULL ) {
+		for (const char* const* rootPath = gLinkContext.rootPaths; *rootPath != NULL; ++rootPath) {
+			const size_t rootLen = strlen(*rootPath);
+			if ( (strncmp(path, *rootPath, rootLen) == 0) && (path[rootLen] == '/') )
+				return &path[rootLen];
+		}
+	}
+#endif
+	return path;
+}
+
+
 // try to open file
 static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const LoadContext& context, unsigned& cacheIndex, std::vector<const char*>* exceptions)
 {
@@ -3573,6 +3878,7 @@ static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const 
 	bool existsOnDisk;
 	__block dyld3::SharedCacheFindDylibResults shareCacheResults;
 	shareCacheResults.image = nullptr;
+	shareCacheResults.cacheImageIndex = dyld3::kNoCacheImageIndex;
 
 #if TARGET_OS_SIMULATOR
 
@@ -3584,7 +3890,7 @@ static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const 
 #else
 
 	auto findSharedCacheImage = ^() {
-		return dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, path, &shareCacheResults);
+		return dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, pathWithoutRoot(path), &shareCacheResults);
 	};
 
 #endif
@@ -3608,11 +3914,8 @@ static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const 
 		}
 		bool useCache = false;
 		if ( shareCacheResults.image == nullptr ) {
-			// HACK to support old caches
-			existsOnDisk = ( dyld3::stat(path, &statBuf) == 0 );
+			useCache = useCacheImageWithoutClosure(path, shareCacheResults, statBuf, existsOnDisk, statErrNo);
 			didStat = true;
-			statErrNo = errno;
-			useCache = !existsOnDisk;
 		}
 		else {
 			// <rdar://problem/7014995> zero out stat buffer so mtime, etc are zero for items from the shared cache
@@ -3686,6 +3989,9 @@ static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const 
 			if ( shareCacheResults.image != nullptr ) {
 				// if image was found in cache, but is overridden by a newer file on disk, record what the image overrides
 				imageLoader->setOverridesCachedDylib(shareCacheResults.image->imageNum());
+			}
+			else {
+				recordDiskOverrideOfCacheImage(imageLoader, shareCacheResults);
 			}
 			return imageLoader;
 		}
@@ -4022,7 +4328,8 @@ static ImageLoader* loadPhase1(const char* path, const char* orgPath, const Load
 
 	bool pathIsInDyldCacheWhichCannotBeOverridden = false;
 	if ( sSharedCacheLoadInfo.loadAddress != nullptr ) {
-		pathIsInDyldCacheWhichCannotBeOverridden = sSharedCacheLoadInfo.loadAddress->hasNonOverridablePath(path);
+		pathIsInDyldCacheWhichCannotBeOverridden = sSharedCacheLoadInfo.loadAddress->hasNonOverridablePath(path)
+												|| dyld3::pathIsPinnedToSharedCache(sSharedCacheLoadInfo, path);
 	}
 
 	// <rdar://problem/48490116> dyld customer cache cannot be overridden
@@ -4216,6 +4523,29 @@ ImageLoader* load(const char* path, const LoadContext& context, unsigned& cacheI
 
 
 
+// update global state
+static void installSharedCacheGlobalState(bool forcePrivate)
+{
+	if ( sSharedCacheLoadInfo.loadAddress != nullptr ) {
+		gLinkContext.dyldCache 								= sSharedCacheLoadInfo.loadAddress;
+		dyld::gProcessInfo->processDetachedFromSharedRegion = forcePrivate;
+		dyld::gProcessInfo->sharedCacheSlide                = sSharedCacheLoadInfo.slide;
+		dyld::gProcessInfo->sharedCacheBaseAddress          = (unsigned long)sSharedCacheLoadInfo.loadAddress;
+		sSharedCacheLoadInfo.loadAddress->getUUID(dyld::gProcessInfo->sharedCacheUUID);
+		dyld3::kdebug_trace_dyld_image(DBG_DYLD_UUID_SHARED_CACHE_A, sSharedCacheLoadInfo.path, (const uuid_t *)&dyld::gProcessInfo->sharedCacheUUID[0], {0,0}, {{ 0, 0 }}, (const mach_header *)sSharedCacheLoadInfo.loadAddress);
+	}
+}
+
+// If this process wants a different __DATA_CONST state from the shared region, then override that now
+static void matchSharedCacheDataConstState(bool sharedCacheDataConstIsEnabled)
+{
+	if ( (sSharedCacheLoadInfo.loadAddress != nullptr) && (gEnableSharedCacheDataConst != sharedCacheDataConstIsEnabled) ) {
+		uint32_t permissions = gEnableSharedCacheDataConst ? VM_PROT_READ : (VM_PROT_READ | VM_PROT_WRITE);
+		sSharedCacheLoadInfo.loadAddress->changeDataConstPermissions(mach_task_self(), permissions,
+																	 (gLinkContext.verboseMapping ? &dyld::log : nullptr));
+	}
+}
+
 static void mapSharedCache(uintptr_t mainExecutableSlide)
 {
 	dyld3::SharedCacheOptions opts;
@@ -4231,16 +4561,7 @@ static void mapSharedCache(uintptr_t mainExecutableSlide)
     // <rdar://problem/56299169> kern.bootargs is now blocked
 	opts.disableASLR		= (mainExecutableSlide == 0) && dyld3::internalInstall(); // infer ASLR is off if main executable is not slid
 	loadDyldCache(opts, &sSharedCacheLoadInfo);
-
-	// update global state
-	if ( sSharedCacheLoadInfo.loadAddress != nullptr ) {
-		gLinkContext.dyldCache 								= sSharedCacheLoadInfo.loadAddress;
-		dyld::gProcessInfo->processDetachedFromSharedRegion = opts.forcePrivate;
-		dyld::gProcessInfo->sharedCacheSlide                = sSharedCacheLoadInfo.slide;
-		dyld::gProcessInfo->sharedCacheBaseAddress          = (unsigned long)sSharedCacheLoadInfo.loadAddress;
-		sSharedCacheLoadInfo.loadAddress->getUUID(dyld::gProcessInfo->sharedCacheUUID);
-		dyld3::kdebug_trace_dyld_image(DBG_DYLD_UUID_SHARED_CACHE_A, sSharedCacheLoadInfo.path, (const uuid_t *)&dyld::gProcessInfo->sharedCacheUUID[0], {0,0}, {{ 0, 0 }}, (const mach_header *)sSharedCacheLoadInfo.loadAddress);
-	}
+	installSharedCacheGlobalState(opts.forcePrivate);
 
 //#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
 // RAM disk booting does not have shared cache yet
@@ -4253,6 +4574,61 @@ static void mapSharedCache(uintptr_t mainExecutableSlide)
 //	}
 //#endif
 }
+
+static const char* basename(const char* path)
+{
+    const char* last = path;
+    for (const char* s = path; *s != '\0'; s++) {
+        if (*s == '/') 
+			last = s+1;
+    }
+    return last;
+}
+
+#ifdef DARLING
+// The user asked for this cache with DYLD_SHARED_CACHE_SPLIT_DIR, so a failure to map it must not leave the process running without it.
+// The exceptions are a process whose architecture has no split mapper (x86_64, i386: the variable reaches every child) and a
+// directory that has no cache file for this process's architecture (macOS ships an arm64e cache only): that process runs
+// without a cache, and false is returned. Neither has any use for the policy, so only a process that maps a cache reads it.
+// No message names the host's directory, only the files in it.
+static bool mapSplitSharedCache(const macho_header* mainExecutableMH)
+{
+	if ( !dyld3::splitCacheArchHasMapper(mainExecutableMH->cputype, mainExecutableMH->cpusubtype) ) {
+		if ( gLinkContext.verboseMapping )
+			dyld::log("dyld: continuing without a shared cache: no split cache mapper for this architecture\n");
+		return false;
+	}
+	char path[sizeof(sSharedCacheLoadInfo.path)];
+	if ( const char* error = dyld3::splitCacheMainFilePath(sSharedCacheSplitDir, mainExecutableMH->cputype, mainExecutableMH->cpusubtype, path, sizeof(path)) )
+		halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_DIR: %s\n", error));
+	if ( dyld3::splitCacheMainFileIsMissing(sSharedCacheSplitDir, path) ) {
+		if ( gLinkContext.verboseMapping )
+			dyld::log("dyld: continuing without a shared cache: %s not found\n", basename(path));
+		return false;
+	}
+	if ( sSharedCacheSplitPolicy != nullptr ) {
+		size_t errorLine;
+		if ( const char* error = dyld3::loadSplitCachePolicy(sSharedCacheSplitPolicy, &errorLine) ) {
+			if ( errorLine == 0 )
+				halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_POLICY '%s': %s\n", basename(sSharedCacheSplitPolicy), error));
+			halt(mkstringf("DYLD_SHARED_CACHE_SPLIT_POLICY '%s': %s (line %lu)\n", basename(sSharedCacheSplitPolicy), error, (unsigned long)errorLine));
+		}
+	}
+	dyld3::SplitCacheMapStats stats;
+	if ( !dyld3::mapSplitCachePrivate(path, gLinkContext.verboseMapping, &sSharedCacheLoadInfo, &stats) )
+		halt(mkstringf("could not map the split dyld cache '%s': %s\n", basename(path), sSharedCacheLoadInfo.errorMessage ? sSharedCacheLoadInfo.errorMessage : "no reason given"));
+	installSharedCacheGlobalState(true);
+	if ( gLinkContext.verboseMapping ) {
+		const dyld3::SharedCacheAllowList& allowList = dyld3::sharedCacheAllowList();
+		for (size_t i = 0; i != allowList.count; ++i) {
+			dyld3::SharedCacheFindDylibResults found;
+			if ( !dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, allowList.paths[i], &found) || (strcmp(found.pathInCache, allowList.paths[i]) != 0) )
+				dyld::log("dyld: '%s' is not the install name of an image in the split dyld cache, ignored\n", allowList.paths[i]);
+		}
+	}
+	return true;
+}
+#endif
 
 
 
@@ -4883,6 +5259,17 @@ const char* getPathFromIndex(unsigned cacheIndex)
 	return sAllCacheImagesProxy->getIndexedPath(cacheIndex);
 }
 
+const mach_header* cacheImageMachHeader(void* handle)
+{
+	if ( sAllCacheImagesProxy == NULL )
+		return NULL;
+	unsigned index;
+	uint8_t flags;
+	if ( !sAllCacheImagesProxy->isCacheHandle(handle, &index, &flags) )
+		return NULL;
+	return sAllCacheImagesProxy->machHeaderForIndex(index);
+}
+
 void* dlsymFromCache(void* handle, const char* symName, unsigned index)
 {
 	if ( sAllCacheImagesProxy == NULL )
@@ -4928,16 +5315,6 @@ static ImageLoader* libraryLocator(const char* libraryName, bool search, const c
 	context.origin				= origin;
 	context.rpath				= rpaths;
 	return load(libraryName, context, cacheIndex);
-}
-
-static const char* basename(const char* path)
-{
-    const char* last = path;
-    for (const char* s = path; *s != '\0'; s++) {
-        if (*s == '/') 
-			last = s+1;
-    }
-    return last;
 }
 
 static void setContext(const macho_header* mainExecutableMH, int argc, const char* argv[], const char* envp[], const char* apple[])
@@ -5160,6 +5537,9 @@ void link(ImageLoader* image, bool forceLazysBound, bool neverUnload, const Imag
 			path = sAllCacheImagesProxy->getIndexedPath(cacheIndex);
 #endif
 		image->link(gLinkContext, forceLazysBound, false, neverUnload, loaderRPaths, path);
+#if defined(DARLING) && defined(__arm64__)
+		translateSplitCacheTSDReads();
+#endif
 	}
 	catch (const char* msg) {
 		garbageCollectImages();
@@ -6840,12 +7220,17 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 #else
 		mapSharedCache(mainExecutableSlide);
 #endif
-
-		// If this process wants a different __DATA_CONST state from the shared region, then override that now
-		if ( (sSharedCacheLoadInfo.loadAddress != nullptr) && (gEnableSharedCacheDataConst != sharedCacheDataConstIsEnabled) ) {
-			uint32_t permissions = gEnableSharedCacheDataConst ? VM_PROT_READ : (VM_PROT_READ | VM_PROT_WRITE);
-			sSharedCacheLoadInfo.loadAddress->changeDataConstPermissions(mach_task_self(), permissions,
-																		 (gLinkContext.verboseMapping ? &dyld::log : nullptr));
+		matchSharedCacheDataConstState(sharedCacheDataConstIsEnabled);
+	}
+#else
+	// Off unless DYLD_SHARED_CACHE_SPLIT_DIR names a split macOS cache. Prebuilt closures do not exist for a split cache.
+	if ( sSharedCacheSplitDir != nullptr ) {
+		// the cache is private to this process, and addImage only records its dylibs' UUIDs in that mode
+		gLinkContext.sharedRegionMode = ImageLoader::kUsePrivateSharedRegion;
+		if ( mapSplitSharedCache(mainExecutableMH) ) {
+			sClosureMode = ClosureMode::Off;
+			// mapSplitCachePrivate maps __DATA_CONST read-only whatever this process wants, so that is the state to match
+			matchSharedCacheDataConstState(true);
 		}
 	}
 #endif // !DARLING
@@ -7404,6 +7789,10 @@ reloadAllImages:
 		// <rdar://problem/12186933> do weak binding only after all inserted images linked
 		sMainExecutable->weakBind(gLinkContext);
 		gLinkContext.linkingMainExecutable = false;
+#ifdef DARLING
+		// the stand-ins of cache images are bound now, which the override needs (see overrideSplitCacheGotSlots)
+		overrideSplitCacheGotSlots();
+#endif
 
 		sMainExecutable->recursiveMakeDataReadOnly(gLinkContext);
 
