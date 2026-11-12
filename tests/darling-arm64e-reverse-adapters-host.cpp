@@ -44,10 +44,18 @@ static uint64_t gResult;
 // when non-zero, the callee reads this many words from its first argument while it runs (the copy lives for the call only)
 static unsigned gCaptureWords;
 static uint64_t gCaptured[8];
+// when set, the callee behaves like the arm64e libdyld's _dyld_func_lookup: it stores gOutValue through argument 1 and answers 1
+static bool gWriteOut;
+static uint64_t gOutValue;
 static uint64_t fakeCallee(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
 	const uint64_t a[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
 	memcpy(gSeen, a, sizeof(a));
+	if ( gWriteOut ) {
+		++gCalls;
+		*(uint64_t*)a1 = gOutValue;
+		return 1;
+	}
 	if ( gCaptureWords != 0 )
 		memcpy(gCaptured, (const void*)a0, gCaptureWords * sizeof(uint64_t));
 	++gCalls;
@@ -118,6 +126,15 @@ static void checkTable()
 	CHECK(validateReverseRows(unsupportedActs, 1) != nullptr, "an unsupported row with an action was accepted");
 	const AdapterStatus st = AdapterStatus::ShapeOnly;
 	ReverseRow okStruct[1] = { { "_a", 0, false, 1, st, "e", 1, 6, 0x3E } };
+	ReverseRow okOut[1] = { { "_a", 0, false, 2, st, "e", 0, 0, 0, 2 } };
+	CHECK(validateReverseRows(okOut, 1) == nullptr, "a valid out-argument row was refused");
+	ReverseRow badOuts[] = {
+		{ "_a", 0, false, 2, st, "e", 0, 0, 0, 3 },		// beyond the row's arguments
+		{ "_a", 2, false, 2, st, "e", 0, 0, 0, 2 },		// also in the sign mask
+		{ "_a", 0, false, 2, st, "e", 2, 6, 0x3E, 2 },	// also the struct argument
+	};
+	for (const ReverseRow& bad : badOuts)
+		CHECK(validateReverseRows(&bad, 1) != nullptr, "a malformed out-argument row was accepted (out %u)", bad.outCodeArg);
 	CHECK(validateReverseRows(okStruct, 1) == nullptr, "a valid struct row was refused");
 	ReverseRow badStructs[] = {
 		{ "_a", 0, false, 1, st, "e", 2, 6, 0x3E },		// the struct argument is beyond the row's arguments
@@ -404,6 +421,59 @@ static void checkStructArgument()
 	munmap(page, 4096);
 }
 
+// _dyld_func_lookup(name, &address): the arm64e libdyld hands back a signed address and plain callers (libSystem.B, and the
+// libsystem_kernel that it passes the function to) call it with a plain BLR, so it comes back raw.
+static void checkOutCodeArgument()
+{
+	Fn8 f = thunkFor("__dyld_func_lookup");
+	const uint64_t target = goodCode(20);
+	uint64_t out = 0x77;
+	gWriteOut = true;
+	gOutValue = oracleSign(target, 0);
+	CHECK(f(kS[0], (uint64_t)&out, kS[2], kS[3], kS[4], kS[5], kS[6], kS[7]) == 1, "the result of the lookup changed");
+	CHECK(out == target, "the signed address came back as %llx, not raw %llx", (unsigned long long)out, (unsigned long long)target);
+	CHECK(gSeen[0] == kS[0] && gSeen[1] == (uint64_t)&out, "an argument was changed");
+	for (uint64_t v : { (uint64_t)0, (uint64_t)1, ~(uint64_t)0 }) {
+		out = 0x77;
+		gOutValue = v;
+		f(kS[0], (uint64_t)&out, 0, 0, 0, 0, 0, 0);
+		CHECK(out == v, "%llx was changed", (unsigned long long)v);
+	}
+	gWriteOut = false;
+	// a lookup that failed wrote nothing: the memory is not touched
+	gResult = 0;
+	out = 0x77;
+	f(kS[0], (uint64_t)&out, 0, 0, 0, 0, 0, 0);
+	CHECK(out == 0x77, "the out argument of a failed lookup was touched");
+	// an address that does not authenticate (unsigned, another modifier, corrupted) stops the process, naming the symbol
+	for (uint64_t bad : { target, oracleSign(target, 1), oracleSign(target, 0) ^ (uint64_t)(1ULL << 50) }) {
+		fflush(stdout);
+		int fds[2];
+		CHECK(pipe(fds) == 0, "no pipe");
+		const pid_t pid = fork();
+		if ( pid == 0 ) {
+			gMessageFd = fds[1];
+			close(fds[0]);
+			signal(SIGTRAP, onTrap);
+			signal(SIGILL, onTrap);
+			gWriteOut = true;
+			gOutValue = bad;
+			uint64_t slot = 0;
+			gWarnings.clear();
+			f(kS[0], (uint64_t)&slot, 0, 0, 0, 0, 0, 0);
+			_exit(0);
+		}
+		close(fds[1]);
+		char text[512];
+		const ssize_t n = read(fds[0], text, sizeof(text) - 1);
+		close(fds[0]);
+		int status = 0;
+		waitpid(pid, &status, 0);
+		CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 42, "an address that does not authenticate (%llx) was handed to plain code", (unsigned long long)bad);
+		CHECK(std::string(text, n > 0 ? (size_t)n : 0).find("__dyld_func_lookup") != std::string::npos, "the message does not name the symbol");
+	}
+}
+
 static void checkPolicy()
 {
 	CHECK(reverseAdaptedTarget("__ZSt13set_terminatePFvvE", 0x1234, false, &isEntry) == 0x1234, "an exporter that is plain was adapted");
@@ -445,8 +515,8 @@ static void checkEveryRow()
 		if ( row.status == AdapterStatus::Unsupported )
 			continue;
 		++supported;
-		if ( row.structArg != 0 )
-			continue;	// checkStructArgument
+		if ( (row.structArg != 0) || (row.outCodeArg != 0) )
+			continue;	// checkStructArgument, checkOutCodeArgument
 		Fn8 f = thunkFor(row.symbol);
 		uint64_t args[8]; memcpy(args, kS, sizeof(args));
 		for (unsigned i = 0; i != 8; ++i)
@@ -460,7 +530,7 @@ static void checkEveryRow()
 		}
 		CHECK(result == (row.authReturn ? goodCode(30) : 0x5a5a), "%s: result %llx", row.symbol, (unsigned long long)result);
 	}
-	CHECK(supported == 24, "supported rows: %d", supported);
+	CHECK(supported == 25, "supported rows: %d", supported);
 }
 
 static void checkReport()
@@ -496,7 +566,7 @@ int main(int argc, char** argv)
 	if ( argc >= 2 && strcmp(argv[1], "rows") == 0 ) {
 		size_t n = 0; const ReverseRow* rows = reverseRows(&n);
 		for (size_t i = 0; i != n; ++i)
-			printf("%s %x %d %d %d %u %u %x\n", rows[i].symbol, rows[i].signMask, rows[i].authReturn, rows[i].argCount, (int)rows[i].status, rows[i].structArg, rows[i].structWords, rows[i].structSignMask);
+			printf("%s %x %d %d %d %u %u %x %u\n", rows[i].symbol, rows[i].signMask, rows[i].authReturn, rows[i].argCount, (int)rows[i].status, rows[i].structArg, rows[i].structWords, rows[i].structSignMask, rows[i].outCodeArg);
 		return 0;
 	}
 	if ( argc >= 3 && strcmp(argv[1], "reverse-thunk") == 0 ) {
@@ -520,6 +590,7 @@ int main(int argc, char** argv)
 	checkFunctionStarts();
 	checkArgPositions();
 	checkStructArgument();
+	checkOutCodeArgument();
 	checkEveryRow();
 	checkPolicy();
 	checkReport();

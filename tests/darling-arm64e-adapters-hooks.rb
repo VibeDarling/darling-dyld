@@ -138,10 +138,13 @@ REPLAY = <<~'CPP'
   // the fake arm64e callee of a reverse thunk
   static uint64_t gSeen[8], gCaptured[6];
   static bool gCapture;
+  static uint64_t gLookupAnswer;
+  static uint64_t plainFunction() { return 0x42; }
   static uint64_t fakeCallee(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
     const uint64_t a[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
     memcpy(gSeen, a, sizeof(a));
     if ( gCapture ) memcpy(gCaptured, (const void*)a0, sizeof(gCaptured));
+    if ( gLookupAnswer != 0 ) { *(uint64_t*)a1 = gLookupAnswer; return 1; }
     return 0;
   }
   typedef uint64_t (*Fn8)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
@@ -280,6 +283,24 @@ REPLAY = <<~'CPP'
     CHECK(gCaptured[4] == 0, "a NULL word changed");
     CHECK(gCaptured[5] == A + 0x1000, "a word in an arm64e image was signed");
     CHECK(memcmp(funcs, funcsBefore, sizeof(funcs)) == 0, "the caller's struct was written");
+
+    // _dyld_func_lookup: the arm64e libdyld hands back an address signed IA 0 (Darling's dyld signs it for the arm64e libdyld) and
+    // plain libSystem.B binds the function and passes it to plain libsystem_kernel in its _libkernel_functions table, which calls the
+    // result with a plain BLR. Through the real bind hook, what libsystem_kernel calls must hand back a raw address.
+    const char* lookupSymbol = "__dyld_func_lookup";
+    const uint64_t lookupBound = hook4(&plainImporter, BIND_TYPE_POINTER, lookupSymbol, 0, callee, &calleeImage);
+    CHECK(lookupBound != callee, "a plain image's bind of _dyld_func_lookup got no thunk");
+    CHECK(plainImporter.bind(lookupSymbol, 0, callee, &calleeImage) == lookupBound, "the dyld-info and the chained-fixups binds of _dyld_func_lookup made different thunks");
+    CHECK(hook4(&arm64eImporter, BIND_TYPE_POINTER, lookupSymbol, 0, callee, &calleeImage) == callee, "an arm64e importer of _dyld_func_lookup was thunked");
+    struct { int (*dyld_func_lookup)(const char*, void**); } libkernelFuncs = { (int (*)(const char*, void**))lookupBound };
+    const uint64_t plainEntry = (uint64_t)&plainFunction;
+    CHECK(oracleSign(plainEntry, 0) != plainEntry, "the lookup target is a PAC fixed point");
+    gLookupAnswer = oracleSign(plainEntry, 0);
+    void* looked = nullptr;
+    CHECK(libkernelFuncs.dyld_func_lookup("_x", &looked) == 1, "the lookup result changed");
+    gLookupAnswer = 0;
+    CHECK((uint64_t)looked == plainEntry, "libsystem_kernel got %p, not the raw address", looked);
+    CHECK(((uint64_t (*)())looked)() == 0x42, "the raw address was not callable with a plain branch");
 
     // hook 3
     void* callerArm64e = (void*)0x1500; void* callerPlain = (void*)0x2500;

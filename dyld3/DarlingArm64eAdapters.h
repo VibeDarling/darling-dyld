@@ -125,6 +125,11 @@ struct ReverseRow {
 	uint8_t			structArg = 0;		// argument number + 1, 0 for none
 	uint8_t			structWords = 0;	// size of the struct in 8-byte words, 1 to 8
 	uint8_t			structSignMask = 0;	// bit i: word i is a code pointer to sign (IA, discriminator 0)
+	// A `void**` out parameter that the callee fills with a code pointer signed (IA, discriminator 0) and that plain code calls
+	// with a plain BLR (the arm64e libdyld's __dyld_func_lookup). When the call returns non-zero as an int, which says that the
+	// callee wrote it, the pointer is authenticated and stored back raw; one that does not authenticate stops the process like a
+	// handler result does. 0, 1 and -1 stay as they are.
+	uint8_t			outCodeArg = 0;		// argument number + 1, 0 for none
 };
 
 // true when `address` may be signed for an arm64e callee: a function entry of a loaded plain image

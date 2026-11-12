@@ -50,8 +50,9 @@ Dir.mktmpdir('rev-adapters') do |dir|
   # pointer parameter, the handler getters authenticate a result, set_* sign argument 0 and authenticate the old handler.
   rows, = AdapterSupport.run(exe, 'rows')
   table = rows.lines.map { |l| s, m, ret, c, status = l.split; [s, [m.to_i(16), ret == '1', c.to_i, status.to_i]] }.to_h
+  outs = rows.lines.to_h { |l| f = l.split; [f[0], f[8].to_i] }
   structs = rows.lines.map { |l| f = l.split; [f[0], [f[5].to_i, f[6].to_i, f[7].to_i(16)]] }.to_h
-  check('the table has 26 rows, 2 of them unsupported', table.size == 26 && table.values.count { |v| v[3] == 3 } == 2, table.size.to_s)
+  check('the table has 27 rows, 2 of them unsupported', table.size == 27 && table.values.count { |v| v[3] == 3 } == 2, table.size.to_s)
   cache = (ENV['CACHE_EXPORTS'] ? File.readlines(ENV['CACHE_EXPORTS'], chomp: true) : [])
   expected_pf = cache.select { |n| n.include?('PF') && !n.include?('money_get') }
   check('every cache export with a function-pointer parameter has a supported row (skipped without the export list)',
@@ -65,6 +66,8 @@ Dir.mktmpdir('rev-adapters') do |dir|
       check("#{sym}: sets sign argument 0 and authenticate the old handler", mask == 1 && auth_return && argc == 1)
     elsif sym == '__libc_initializer'
       check('__libc_initializer signs no argument and returns no handler, but the words of its argument 0 struct: version, then 5 code pointers (struct _libc_functions)', mask == 0 && !auth_return && argc == 1 && structs[sym] == [1, 6, 0x3E])
+    elsif sym == '__dyld_func_lookup'
+      check('__dyld_func_lookup signs nothing and returns no handler, but authenticates its argument 1 out parameter (void** address)', mask == 0 && !auth_return && argc == 2 && outs[sym] == 2)
     elsif sym == '___cxa_throw'
       check('___cxa_throw signs the destructor (argument 2)', mask == 4 && !auth_return && argc == 3)
     else
@@ -102,6 +105,18 @@ Dir.mktmpdir('rev-adapters') do |dir|
     check("rows probe killed: #{name}", rexe.nil? || row.nil? || row[5..7] != ['1', '6', '3e'])
   end
 
+  {
+    'the __dyld_func_lookup row fixes up the wrong argument' => ['0, 0, 0, 2 },', '0, 0, 0, 1 },'],
+    'the __dyld_func_lookup row has no out argument' => ['0, 0, 0, 2 },', '0, 0, 0, 0 },'],
+    'the __dyld_func_lookup row is dropped' => [/^\t\{ "__dyld_func_lookup",.*\n/, ''],
+  }.each do |name, (from, to)|
+    check("rows mutant applies: #{name}", rows_file.scan(from).size == 1)
+    rexe, = AdapterSupport.build(root, dir, 'rowsmutant', driver, reverse_rows_text: rows_file.sub(from, to))
+    rout, = rexe ? AdapterSupport.run(rexe, 'rows') : ['', nil]
+    row = rout.lines.map(&:split).find { |f| f[0] == '__dyld_func_lookup' }
+    check("rows probe killed: #{name}", rexe.nil? || row.nil? || row[8] != '2')
+  end
+
   # mutation probes
   adapters = File.read(File.join(root, 'dyld3/DarlingArm64eAdapters.cpp'))
   sign_line = 'return AdapterSign::signPointer(value, nullptr, false, 0, 0);'
@@ -116,12 +131,12 @@ Dir.mktmpdir('rev-adapters') do |dir|
     'the handed-back ring is removed' => [entry_test, '((isEntry != nullptr) && isEntry(value))'],
     'the handed-back ring accepts any value' => ['return ringHolds(sHandedBack, pointer);', 'return pointer != 0;'],
     'a missing predicate signs' => ['((isEntry != nullptr) && isEntry(value))', '((isEntry == nullptr) || isEntry(value))'],
-    'the authenticated handler is not remembered' => ['recordHandedBack(authenticatedResult);', ';'],
+    'the authenticated handler is not remembered' => ['recordHandedBack(result);', ';'],
     # (removing the NULL skip is an equivalent mutant: signPointer returns 0 for 0)
-    'the returned handler is stripped instead of authenticated' => ['const uint64_t authenticatedResult = authenticateIA(result, 0);', 'const uint64_t authenticatedResult = stripCode(result);'],
-    'the returned handler is authenticated with a modifier' => ['const uint64_t authenticatedResult = authenticateIA(result, 0);', 'const uint64_t authenticatedResult = authenticateIA(result, 1);'],
-    'a failed authentication is ignored' => ["\t\tif ( !authenticated(authenticatedResult) ) {", "\t\tif ( false ) {"],
-    'a failed authentication is stripped and returned' => ["__builtin_trap();\n\t\t}\n\t\trecordHandedBack(authenticatedResult);\n\t\tresult = authenticatedResult;", "result = stripCode(result);\n\t\t}\n\t\trecordHandedBack(authenticatedResult);\n\t\tresult = stripCode(result);"],
+    'the returned handler is stripped instead of authenticated' => ['const uint64_t authenticatedValue = authenticateIA(value, 0);', 'const uint64_t authenticatedValue = stripCode(value);'],
+    'the returned handler is authenticated with a modifier' => ['const uint64_t authenticatedValue = authenticateIA(value, 0);', 'const uint64_t authenticatedValue = authenticateIA(value, 1);'],
+    'a failed authentication is ignored' => ["\tif ( !authenticated(authenticatedValue) ) {", "\tif ( false ) {"],
+    'a failed authentication is stripped and returned' => ["__builtin_trap();\n\t}\n\treturn authenticatedValue;", "return stripCode(value);\n\t}\n\treturn stripCode(value);"],
     'a failed authentication stops without naming the symbol' => ['it is not handed to plain code\\n", row->symbol);', 'it is not handed to plain code\\n", "?");'],
     'special values are authenticated' => ['if ( row->authReturn && !isSpecialHandler(result) )', 'if ( row->authReturn )'],
     'every result is authenticated' => ['if ( row->authReturn && !isSpecialHandler(result) )', 'if ( !isSpecialHandler(result) )'],
@@ -152,6 +167,12 @@ Dir.mktmpdir('rev-adapters') do |dir|
     'the validator accepts a struct mask outside the words' => ['((r.structSignMask >> r.structWords) != 0)', 'false'],
     'the validator accepts a struct argument that is also masked' => ['if ( (r.signMask >> (r.structArg - 1)) & 1 )', 'if ( false )'],
     'the validator accepts a struct argument past the row\'s arguments' => ['if ( r.structArg > r.argCount )', 'if ( false )'],
+    'the out parameter is not fixed up' => ['if ( (row->outCodeArg != 0) && ((int)result != 0) && (a[row->outCodeArg - 1] != 0) ) {', 'if ( false ) {'],
+    'the out parameter is fixed up for a failed lookup' => ['((int)result != 0) && (a[row->outCodeArg - 1] != 0) ) {', '(a[row->outCodeArg - 1] != 0) ) {'],
+    'the out parameter is stripped instead of authenticated' => ['*out = authenticateForPlain(row, *out);', '*out = stripCode(*out);'],
+    'the out parameter is read from the wrong argument' => ['uint64_t* out = (uint64_t*)a[row->outCodeArg - 1];', 'uint64_t* out = (uint64_t*)a[row->outCodeArg];'],
+    'special values in the out parameter are authenticated' => ['if ( !isSpecialHandler(*out) )', 'if ( true )'],
+    'the validator accepts an out argument past the row\'s arguments' => ['(r.outCodeArg > r.argCount) ||', 'false ||'],
     'the validator accepts a row that does nothing' => ["\t\tif ( !acts )\n\t\t\treturn \"a row does nothing\";\n\t\tif ( r.argCount > 8 )", "\t\tif ( r.argCount > 8 )"],
     'the validator accepts an unsupported row with an action' => ["\t\t\tif ( acts )\n\t\t\t\treturn \"a row without an adapter has an action\";\n\t\t\tcontinue;\n\t\t}\n\t\tif ( r.status == AdapterStatus::HandledElsewhere )", "\t\t\tcontinue;\n\t\t}\n\t\tif ( r.status == AdapterStatus::HandledElsewhere )"],
   }

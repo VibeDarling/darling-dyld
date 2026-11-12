@@ -724,7 +724,7 @@ const char* validateReverseRows(const ReverseRow* rows, size_t count)
 		}
 		if ( (r.evidence == nullptr) || (r.evidence[0] == '\0') )
 			return "a row has no evidence";
-		const bool acts = (r.signMask != 0) || r.authReturn || (r.structArg != 0);
+		const bool acts = (r.signMask != 0) || r.authReturn || (r.structArg != 0) || (r.outCodeArg != 0);
 		if ( (r.structArg == 0) && ((r.structWords != 0) || (r.structSignMask != 0)) )
 			return "a row without a struct argument describes a struct";
 		if ( r.status == AdapterStatus::Unsupported ) {
@@ -740,6 +740,8 @@ const char* validateReverseRows(const ReverseRow* rows, size_t count)
 			return "a row takes more than eight register arguments";
 		if ( (r.argCount < 8) && ((r.signMask >> r.argCount) != 0) )
 			return "a sign mask names an argument the row does not have";
+		if ( (r.outCodeArg > r.argCount) || (r.outCodeArg == r.structArg && r.outCodeArg != 0) || ((r.outCodeArg != 0) && ((r.signMask >> (r.outCodeArg - 1)) & 1)) )
+			return "an out argument is out of range, is the struct argument, or is also in the sign mask";
 		if ( r.structArg != 0 ) {
 			if ( r.structArg > r.argCount )
 				return "a struct argument is out of range";
@@ -767,6 +769,18 @@ static uint64_t signPlainCode(uint64_t value, FunctionEntryPredicate isEntry)
 	return value;
 }
 
+// A code pointer that comes back must authenticate under IA/0: one that does not stops the process. The non-hint authentication
+// is fine here: a reverse thunk only exists in a process that has an arm64e cache image, which runs on PAC hardware.
+static uint64_t authenticateForPlain(const ReverseRow* row, uint64_t value)
+{
+	const uint64_t authenticatedValue = authenticateIA(value, 0);
+	if ( !authenticated(authenticatedValue) ) {
+		dyld::warn("arm64e adapters: %s returned a code pointer that does not authenticate (IA, discriminator 0); it is not handed to plain code\n", row->symbol);
+		__builtin_trap();
+	}
+	return authenticatedValue;
+}
+
 static uint64_t callReverseRow(uint64_t* regs, const ReverseRow* row, uint64_t real, FunctionEntryPredicate isEntry)
 {
 	uint64_t a[8];
@@ -791,13 +805,13 @@ static uint64_t callReverseRow(uint64_t* regs, const ReverseRow* row, uint64_t r
 	}
 	uint64_t result = ((Call8)real)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
 	if ( row->authReturn && !isSpecialHandler(result) ) {
-		const uint64_t authenticatedResult = authenticateIA(result, 0);
-		if ( !authenticated(authenticatedResult) ) {
-			dyld::warn("arm64e adapters: %s returned a handler that does not authenticate (IA, discriminator 0); it is not handed to plain code\n", row->symbol);
-			__builtin_trap();
-		}
-		recordHandedBack(authenticatedResult);
-		result = authenticatedResult;
+		result = authenticateForPlain(row, result);
+		recordHandedBack(result);
+	}
+	if ( (row->outCodeArg != 0) && ((int)result != 0) && (a[row->outCodeArg - 1] != 0) ) {
+		uint64_t* out = (uint64_t*)a[row->outCodeArg - 1];
+		if ( !isSpecialHandler(*out) )
+			*out = authenticateForPlain(row, *out);
 	}
 	return result;
 }
