@@ -41,7 +41,9 @@ abort '_main runs the override after the initializers' unless (init_call = main_
 abort '_main calls the override outside #ifdef DARLING' unless main_fn[0...launch_hook].rindex('#ifdef DARLING') > inserted_bind
 abort 'overrideSplitCacheGotSlots does not skip the launch links' unless override_fn.include?('gLinkContext.linkingMainExecutable')
 puts 'ok   the override runs at the end of link() and in neither initializer pass'
+abort 'overrideSplitCacheGotSlots calls a libc printf-family function, which crashes before the locale state is usable: format through dyld::log (_simple_vsprintf)' if override_fn =~ /\bv?(?:f|s|sn|as|d)?printf\s*\(/
 puts 'ok   at launch the override is skipped by the links and runs once after the binds'
+puts 'ok   the override formats only through dyld::log, no snprintf'
 
 Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
   File.write("#{dir}/test.cpp", <<~CPP)

@@ -1873,11 +1873,11 @@ static void overrideSplitCacheGotSlots()
 			continue;
 		if ( (undefined.count != 0) && (verbose || gLogCachePolicy) ) {
 			// cache code that keeps such a definition runs it on the cache's own state, mixed with Darling's if the symbol is stateful
-			char names[512] = "";
-			for (uint64_t i = 0; i < ((undefined.count < 3) ? undefined.count : 3); ++i)
-				snprintf(&names[strlen(names)], sizeof(names) - strlen(names), "%s%s", (i == 0) ? "" : ", ", undefined.first[i]);
-			dyld::log("dyld: split cache GOT override: %s: %llu export(s) that no Darling image defines keep the cache's definition (first: %s%s)\n",
-					  installPath, (unsigned long long)undefined.count, names, (undefined.count > 3) ? ", ..." : "");
+			// dyld::log only: this runs before libc's locale state is usable, which snprintf needs (it crashed in localeconv_l)
+			const uint64_t n = undefined.count;
+			dyld::log("dyld: split cache GOT override: %s: %llu export(s) that no Darling image defines keep the cache's definition (first: %s%s%s%s%s%s)\n",
+					  installPath, (unsigned long long)n, undefined.first[0], (n > 1) ? ", " : "", (n > 1) ? undefined.first[1] : "",
+					  (n > 2) ? ", " : "", (n > 2) ? undefined.first[2] : "", (n > 3) ? ", ..." : "");
 		}
 		++exporters;
 		sSplitCachePatchTotals.patched += stats.patched;
