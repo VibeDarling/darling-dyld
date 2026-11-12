@@ -22,6 +22,8 @@ authentication and runs the extracted thunk selection and descriptor initializer
 descriptor's thunk with `blraaz` (key IA, discriminator 0), and its linker leaves only a plain bind of `_tlv_bootstrap` in
 the slot, so libdyld signs the thunk it stores for an arm64e image and stores `tlv_get_addr` as before for every other
 one. The test executes the arm64e call sequence against what was stored, and its probes mutate the extracted code.
+It also builds the thunk selection as an arm64e libdyld would compile it (`clang -target aarch64-linux-pauthtest`, which
+signs function pointers as arm64e does) and links it with `ld.lld`; both are required, and the test aborts without them.
 
 `tlv-guest.c` is a standalone Darling guest fixture for ordinary compiler-generated
 TLS. Build it with the Darling SDK and link libSystem. It verifies initialized

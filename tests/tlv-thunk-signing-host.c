@@ -13,41 +13,26 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// the values of <mach/machine.h> and <mach-o/loader.h> that the extracted code uses
-#define CPU_TYPE_X86_64 0x01000007
-#define CPU_TYPE_ARM64 0x0100000c
-#define CPU_TYPE_ARM64_32 0x0200000c
-#define CPU_SUBTYPE_MASK 0xff000000
-#define CPU_SUBTYPE_PTRAUTH_ABI 0x80000000
-#define CPU_SUBTYPE_ARM64_ALL 0
-#define CPU_SUBTYPE_ARM64_V8 1
-#define CPU_SUBTYPE_ARM64E 2
-#define CPU_SUBTYPE_X86_64_ALL 3
-#define LC_SEGMENT_COMMAND 0x19
-#define SECTION_TYPE 0xff
-#define S_THREAD_LOCAL_VARIABLES 0x13
-#define S_THREAD_LOCAL_REGULAR 0x11
-#define S_THREAD_LOCAL_ZEROFILL 0x12
-// test-only flag bit the image kind loop sets on a synthetic image that declares itself a cache-v2 image
-#define TLV_TEST_CACHE_V2 0x80000000
-// the layout of struct mach_header_64, segment_command_64 and section_64
-struct mach_header { uint32_t magic; int32_t cputype; int32_t cpusubtype; uint32_t filetype, ncmds, sizeofcmds, flags, reserved; };
-typedef struct mach_header macho_header;
-struct load_command { uint32_t cmd, cmdsize; };
-typedef struct { uint32_t cmd, cmdsize; char segname[16]; uint64_t vmaddr, vmsize, fileoff, filesize; int32_t maxprot, initprot; uint32_t nsects, flags; } macho_segment_command;
-typedef struct { char sectname[16], segname[16]; uint64_t addr, size; uint32_t offset, align, reloff, nreloc, flags, reserved1, reserved2, reserved3; } macho_section;
-typedef struct TLVDescriptor TLVDescriptor;
-struct TLVDescriptor { void* (*thunk)(struct TLVDescriptor*); unsigned long key, offset; };
+#include "tlv-thunk-signing-macho.h"
 
 #define CHECK(condition) do { if ( !(condition) ) { printf("FAIL line %d: %s\n", __LINE__, #condition); ++failures; } } while (0)
 static int failures;
 
+#ifdef TLV_PTRAUTH_UNIT
+// tests/tlv-thunk-signing-ptrauth-unit.c, built for a ptrauth_calls target: the extracted tlv_thunk_for_image and the
+// tlv_get_addr it takes the address of. Only the thunk selection is exercised, not tlv_initialize_descriptors.
+extern void* unit_thunk_for_image(int32_t cputype, int32_t cpusubtype);
+extern uint64_t unit_raw_tlv_get_addr(void);
+#define RAW_TLV_GET_ADDR unit_raw_tlv_get_addr()
+#else
 __attribute__((noinline)) void* tlv_get_addr(TLVDescriptor* d) { return (char*)d + 0x40; }   // what a plain call can tell apart
 static void tlv_free(void* storage) { (void)storage; }
 static bool tlv_image_uses_cache_v2(const struct mach_header* mh) { return (mh->flags & TLV_TEST_CACHE_V2) != 0; }
 static void tlv_set_key_for_image(const struct mach_header* mh, pthread_key_t key) { (void)mh; (void)key; }
 
 #include <extracted.inc>
+#define RAW_TLV_GET_ADDR ((uint64_t)tlv_get_addr)
+#endif
 
 __attribute__((target("arch=armv8.3-a"))) static uint64_t signIA(uint64_t p, uint64_t m) { __asm__("pacia %0, %1" : "+r"(p) : "r"(m)); return p; }
 __attribute__((target("arch=armv8.3-a"))) static uint64_t signIB(uint64_t p, uint64_t m) { __asm__("pacib %0, %1" : "+r"(p) : "r"(m)); return p; }
@@ -86,13 +71,17 @@ static int outcome(void* (*call)(const TLVDescriptor*), const TLVDescriptor* d)
 }
 
 static struct mach_header headerFor(int32_t cputype, int32_t cpusubtype) { struct mach_header h = {0xfeedfacf, cputype, cpusubtype, 0, 0, 0, 0, 0}; return h; }
+#ifdef TLV_PTRAUTH_UNIT
+static uint64_t thunkFor(int32_t cputype, int32_t cpusubtype) { return (uint64_t)unit_thunk_for_image(cputype, cpusubtype); }
+#else
 static uint64_t thunkFor(int32_t cputype, int32_t cpusubtype) { struct mach_header h = headerFor(cputype, cpusubtype); return (uint64_t)tlv_thunk_for_image(&h); }
+#endif
 
 // A signature that equals the right one by luck (1 in 2^PAC bits per wrong scheme) would make a negative control pass
 // vacuously, and keys are new for every exec: so pick a process whose keys keep every control meaningful.
 static bool controlsAreMeaningful(void)
 {
-	const uint64_t raw = (uint64_t)tlv_get_addr;
+	const uint64_t raw = RAW_TLV_GET_ADDR;
 	const uint64_t right = signIA(raw, 0);
 	return right != raw && signIB(raw, 0) != right && signDA(raw, 0) != right && signIA(raw, 1) != right;
 }
@@ -114,7 +103,7 @@ int main(int argc, char** argv)
 	if ( !controlsAreMeaningful() )
 		retryOrDie((char* const*)argv);
 	(void)argc;
-	const uint64_t raw = (uint64_t)tlv_get_addr;
+	const uint64_t raw = RAW_TLV_GET_ADDR;
 	const uint64_t right = signIA(raw, 0);
 	TLVDescriptor d = { 0, 0, 0 };
 
@@ -161,7 +150,15 @@ int main(int argc, char** argv)
 	CHECK(thunkFor(CPU_TYPE_X86_64, CPU_SUBTYPE_ARM64E) == raw);					// the same subtype number under another cputype
 	CHECK(thunkFor(CPU_TYPE_ARM64_32, CPU_SUBTYPE_ARM64E) == raw);
 	CHECK(thunkFor(0, 0) == raw);
+#ifdef __arm64__
+	// the call sequences themselves, over what the code returns: this is what faults when a thunk is signed twice
+	d.thunk = (void* (*)(TLVDescriptor*))thunkFor(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E);
+	CHECK(outcome(callLikeArm64e, &d) == 0);
+	d.thunk = (void* (*)(TLVDescriptor*))thunkFor(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL);
+	CHECK(outcome(callPlain, &d) == 0);
+#endif
 
+#ifndef TLV_PTRAUTH_UNIT
 	// A synthetic image with two thread-local descriptors reaches the stores of tlv_initialize_descriptors: each image kind
 	// gets the thunk its own call sequence accepts, in every descriptor. Cache-v2 images start from the packed TLV_Thunkv2
 	// words, so the checks also cover the normalization that must survive the key store.
@@ -205,6 +202,7 @@ int main(int argc, char** argv)
 				CHECK(outcome(callPlain, &image.vars[i]) == 0);
 		}
 	}
+#endif
 	printf(failures ? "RESULT failed (%d)\n" : "RESULT ok\n", failures);
 	return failures != 0;
 }

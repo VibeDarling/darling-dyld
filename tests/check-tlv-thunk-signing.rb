@@ -43,6 +43,40 @@ PROBES = [
   ['the packed size stored as the offset', 'descriptor->offset = packedOffset;', 'descriptor->offset = packedSize;'],
 ].freeze
 
+# The same for the ptrauth_calls build of tlv_thunk_for_image, where the compiler has already signed the address it takes.
+PTRAUTH_PROBES = [
+  ['arm64e image signed a second time by hand', "\t\treturn (void*)tlv_get_addr;\n\treturn ptrauth_strip",
+   "\t{ register uint64_t value __asm__(\"x17\") = (uint64_t)tlv_get_addr; register uint64_t discriminator __asm__(\"x16\") = 0;\n" \
+   "\t__asm__ volatile(\"hint #8\" : \"+r\"(value) : \"r\"(discriminator)); return (void*)value; }\n\treturn ptrauth_strip"],
+  ['arm64e image given the stripped address', "\t\treturn (void*)tlv_get_addr;\n\treturn ptrauth_strip",
+   "\t\treturn ptrauth_strip((void*)tlv_get_addr, ptrauth_key_function_pointer);\n\treturn ptrauth_strip"],
+  ['plain image given the signed address', "\treturn ptrauth_strip((void*)tlv_get_addr, ptrauth_key_function_pointer);\n#else",
+   "\treturn (void*)tlv_get_addr;\n#else"],
+  ['every image given the signed address', "if ( dyld_header_is_arm64e(mh) )\n\t\treturn (void*)tlv_get_addr;", "if ( true )\n\t\treturn (void*)tlv_get_addr;"],
+].freeze
+
+# ptrauth_calls build: the host's own checks run against the unit's tlv_thunk_for_image and tlv_get_addr. The object is
+# built for a target this host cannot link a whole program for, but its two functions need no libc. GNU ld refuses the
+# mix of that object with the plain host (missing aeabi_pauthabi), lld links it.
+PTRAUTH_TARGET = %w[-target aarch64-linux-pauthtest].freeze
+
+def build_and_run_ptrauth(root, dir, name, extracted)
+  work = File.join(dir, name)
+  FileUtils.mkdir_p(work)
+  File.write(File.join(work, 'extracted.inc'), extracted)
+  unit = File.join(work, 'unit.o')
+  out, st = Open3.capture2e('clang', *PTRAUTH_TARGET, '-std=gnu11', '-Wall', '-Wno-unused-function', '-march=armv8.3-a', '-O1', '-D__arm64__=1', '-I', work,
+                            '-c', "#{root}/tests/tlv-thunk-signing-ptrauth-unit.c", '-o', unit)
+  return [:build_failed, out] unless st.success?
+  exe = File.join(work, 'host')
+  out, st = Open3.capture2e('clang', '-std=gnu11', '-Wall', '-Wno-unused-function', '-march=armv8.3-a', '-O1', '-D__arm64__=1',
+                            '-fuse-ld=lld', '-DTLV_PTRAUTH_UNIT', "#{root}/tests/tlv-thunk-signing-host.c", unit, '-o', exe, '-lpthread')
+  return [:build_failed, out] unless st.success?
+  out, st = Open3.capture2e('timeout', '60', exe)
+  return [:skipped, out] if st.exitstatus == 77
+  [st.success? && out.include?('RESULT ok') ? :pass : :fail, out]
+end
+
 def build_and_run(root, dir, name, extracted, defines)
   work = File.join(dir, name)
   FileUtils.mkdir_p(work)
@@ -69,13 +103,18 @@ Dir.mktmpdir('tlv-thunk-signing-') do |dir|
     abort "#{name}: #{verdict}" unless verdict == :pass
     puts "ok   #{name}: #{out[/RESULT \w+/]}"
   end
+  ptrauth_extracted = %w[dyld_header_is_arm64e tlv_thunk_for_image].map { |f| extract(f == 'dyld_header_is_arm64e' ? priv_header : source, f) }.join("\n\n")
+  verdict, out = build_and_run_ptrauth(root, dir, 'ptrauth-calls', ptrauth_extracted)
+  puts out unless verdict == :pass
+  abort "ptrauth-calls: #{verdict}" unless verdict == :pass
+  puts "ok   ptrauth-calls: #{out[/RESULT \w+/]}"
   verdict, out = build_and_run(root, dir, 'arm64-without-__arm64__', extracted, ['-O1'])
   unless verdict == :build_failed && out.include?('must define __arm64__')
     abort "the missing __arm64__ guard did not fire (#{verdict})\n#{out}"
   end
   puts 'ok   guard: an aarch64 build without __arm64__ is a compile error'
   if ARGV.include?('--no-probes')
-    puts "skip PROBES (#{PROBES.size}) --no-probes"
+    puts "skip PROBES (#{PROBES.size}) and PTRAUTH_PROBES (#{PTRAUTH_PROBES.size}) --no-probes"
     next
   end
 
@@ -95,6 +134,19 @@ Dir.mktmpdir('tlv-thunk-signing-') do |dir|
       puts "FAIL probe survived: #{name} (#{results.join(', ')})"
     end
   end
+  ptrauth_killed = 0
+  PTRAUTH_PROBES.each_with_index do |(name, from, to), i|
+    abort "ptrauth probe text not found exactly once: #{name}" unless ptrauth_extracted.scan(from).size == 1
+    verdict, out = build_and_run_ptrauth(root, dir, "pp#{i}", ptrauth_extracted.sub(from, to))
+    if verdict == :fail
+      ptrauth_killed += 1
+      puts "ok   ptrauth probe killed: #{name}"
+    else
+      puts "FAIL ptrauth probe survived or did not build: #{name} (#{verdict})\n#{out if verdict == :build_failed}"
+    end
+  end
   abort "probes: #{killed}/#{PROBES.size} killed" unless killed == PROBES.size
-  puts "PASS TLV thunk signing: 3 builds, missing-__arm64__ guard, #{killed}/#{PROBES.size} probes killed"
+  abort "ptrauth probes: #{ptrauth_killed}/#{PTRAUTH_PROBES.size} killed" unless ptrauth_killed == PTRAUTH_PROBES.size
+  puts "PASS TLV thunk signing: 3 builds, ptrauth_calls build, missing-__arm64__ guard, #{killed}/#{PROBES.size} probes and " \
+       "#{ptrauth_killed}/#{PTRAUTH_PROBES.size} ptrauth probes killed"
 end

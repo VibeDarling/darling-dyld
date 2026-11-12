@@ -35,6 +35,9 @@
 #include <libkern/OSAtomic.h>
 
 #include <mach-o/dyld_priv.h>
+#if __has_feature(ptrauth_calls)
+#include <ptrauth.h>
+#endif
 extern bool tlv_image_uses_cache_v2(const struct mach_header*) __attribute__((visibility("hidden")));
 
 
@@ -300,7 +303,7 @@ static void tlv_normalize_descriptor(TLVDescriptor* descriptor, unsigned long st
 
 // An arm64e image reaches a descriptor's thunk with blraaz (key IA, discriminator 0, no address diversity), and its
 // linker leaves only a plain bind of _tlv_bootstrap in that slot, so the thunk stored here must be signed for it.
-// Any other image calls the slot with a plain branch. libdyld itself is plain arm64, hence the hint-space pacia1716.
+// Any other image calls the slot with a plain branch.
 static void* tlv_thunk_for_image(const struct mach_header* mh)
 {
 #if defined(__aarch64__) && !defined(__arm64__)
@@ -308,6 +311,14 @@ static void* tlv_thunk_for_image(const struct mach_header* mh)
 	// and the signing below would be skipped, leaving an unsigned thunk for arm64e images: fail loudly instead.
 #error "an arm64 build must define __arm64__; without it the arm64e TLV thunk would be stored unsigned"
 #endif
+#if __has_feature(ptrauth_calls)
+	// An arm64e libdyld already gets tlv_get_addr signed (IA, discriminator 0) by the compiler: signing it again
+	// would fault the blraaz, and a plain image needs the bare address.
+	if ( dyld_header_is_arm64e(mh) )
+		return (void*)tlv_get_addr;
+	return ptrauth_strip((void*)tlv_get_addr, ptrauth_key_function_pointer);
+#else
+	// libdyld itself is plain arm64 here, hence the hint-space pacia1716.
 #if __arm64__
 	if ( dyld_header_is_arm64e(mh) ) {
 		register uint64_t value __asm__("x17") = (uint64_t)tlv_get_addr;
@@ -317,6 +328,7 @@ static void* tlv_thunk_for_image(const struct mach_header* mh)
 	}
 #endif
 	return (void*)tlv_get_addr;
+#endif
 }
 
 // called when image is loaded
