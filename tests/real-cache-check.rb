@@ -77,25 +77,96 @@ PATCH_CHECK = <<~'CPP'
     const char *listEnv = getenv("DYLD_REAL_CACHE_OVERRIDE_IMAGES");
     std::string list = (listEnv && *listEnv) ? listEnv : "/usr/lib/system/libsystem_c.dylib,/usr/lib/system/libsystem_kernel.dylib,/usr/lib/system/libsystem_malloc.dylib,/usr/lib/system/libsystem_platform.dylib,/usr/lib/system/libsystem_pthread.dylib";
     for (size_t at = 0; at <= list.size();) { size_t comma = list.find(',', at); if (comma == std::string::npos) comma = list.size(); if (comma > at) exporterNames.push_back(list.substr(at, comma - at)); at = comma + 1; }
+    // --- raw walker of the plain table, before the override: header words 0 (patchTable: clients and exports slices per exporter), 2 (clients),
+    // 3 (clientExports), 4 (locations: client-relative offset, flags). The images' addresses come from the image table of the header. The slots of
+    // the exporters that are about to be overridden are recorded with their value; every other plain slot is only hashed, to prove it is not touched.
+    struct RawPlain { uint64_t address, was; uint32_t flags, exporter, exportIndex, client; };
+    std::set<uint32_t> overridden;
+    for (const std::string &name : exporterNames) { uint32_t index; if (cache->hasImagePath(name.c_str(), index)) overridden.insert(index); }
+    const uint64_t patchTableArray = arrayAt(0), clientsArray = arrayAt(2), clientExportsArray = arrayAt(3), locationsArray = arrayAt(4);
+    const uint8_t *imageInfos = (const uint8_t *)cache + le32(hdr + 0x1c0);
+    auto imageAddress = [&](uint32_t i) { return le64(imageInfos + 32ull * i) + slide; };
+    auto walkPlain = [&](void (^visit)(uint64_t address, uint32_t flags, uint32_t exporter, uint32_t exportIndex, uint32_t client)) {
+      for (uint32_t image = 0; image < arrayCount(0); ++image) {
+        const uint8_t *pt = (const uint8_t *)(patchTableArray + 16ull * image);
+        for (uint64_t c = le32(pt); c < (uint64_t)le32(pt) + le32(pt + 4); ++c) {
+          const uint8_t *client = (const uint8_t *)(clientsArray + 12 * c);
+          const uint64_t clientBase = imageAddress(le32(client));
+          for (uint64_t x = le32(client + 4); x < (uint64_t)le32(client + 4) + le32(client + 8); ++x) {
+            const uint8_t *ce = (const uint8_t *)(clientExportsArray + 12 * x);
+            for (uint64_t l = le32(ce + 4); l < (uint64_t)le32(ce + 4) + le32(ce + 8); ++l) {
+              const uint8_t *loc = (const uint8_t *)(locationsArray + 8 * l);
+              visit(clientBase + le32(loc), le32(loc + 4), image, le32(ce), le32(client));
+            }
+          }
+        }
+      }
+    };
+    __block std::vector<RawPlain> overriddenPlain; __block uint64_t plainTotal = 0, othersBefore = 14695981039346656037ull;
+    walkPlain(^(uint64_t address, uint32_t flags, uint32_t exporter, uint32_t exportIndex, uint32_t client) {
+      ++plainTotal;
+      const uint64_t value = *(const uint64_t *)address;
+      if (overridden.count(exporter)) overriddenPlain.push_back({address, value, flags, exporter, exportIndex, client});
+      else othersBefore = (othersBefore ^ (address * 0x9E3779B97F4A7C15ull) ^ value) * 1099511628211ull;
+    });
+    printf("patch info v4 raw walk of the whole plain table: locations=%llu of the overridden exporters=%zu\n", (unsigned long long)plainTotal, overriddenPlain.size());
+    assert(plainTotal == counts.plainLocations);
+    // What the cache holds before the override must decode as the table says: exporter header + implementation offset + the location's own
+    // addend, signed with the location's own key, discriminator and address diversity (an unauthenticated one carries its high7). This is
+    // the proof that the encoding of a plain location is the one of a GOT slot and that the override may reuse it.
+    uint64_t preChecked = 0, preWrong = 0, preShown = 0; std::map<std::string, uint64_t> mismatchSymbols; uint64_t preTlvDelta = 0;
+    for (const RawPlain &r : overriddenPlain) {
+      const uint32_t kind = le32((const uint8_t *)(exportsArray + 8ull * r.exportIndex) + 4) >> 28, f = r.flags; const bool authentic = f & 1;
+      if ((kind != 0 && kind != 8) || (authentic ? (((f >> 1) & 0x7f) != 0) : ((f >> 16) != 0))) continue;
+      const uint64_t addend = authentic ? (f >> 9) & 0x1f : (f >> 9) & 0x7f;
+      const uint64_t want = imageAddress(r.exporter) + le32((const uint8_t *)(exportsArray + 8ull * r.exportIndex)) + addend;
+      bool ok;
+      if (authentic) { const uint64_t disc = f >> 16, modifier = ((f >> 14) & 1) ? ((r.address & 0x0000ffffffffffffull) | (disc << 48)) : disc; ok = authenticate((f >> 15) & 1, r.was, modifier) == want; }
+      else ok = r.was == (want | ((uint64_t)((f >> 1) & 0x7f) << 57));
+      ++preChecked;
+      // Known exception: the TLV descriptors' thunk slots point 8 bytes past the table's `__tlv_bootstrap` (flags say addend 0). libdyld
+      // replaces that thunk when it initializes the descriptors, so the override writes what the table says like everywhere else.
+      if (!ok && !strcmp((const char *)(namesArray + (le32((const uint8_t *)(exportsArray + 8ull * r.exportIndex) + 4) & 0x0fffffffu)), "__tlv_bootstrap") && (r.was & 0x0000ffffffffffffull) == want + 8) { ++preTlvDelta; continue; }
+      if (!ok) { ++preWrong; ++mismatchSymbols[std::string((const char *)(namesArray + (le32((const uint8_t *)(exportsArray + 8ull * r.exportIndex) + 4) & 0x0fffffffu))) + " delta " + std::to_string((long long)((r.was & 0x0000ffffffffffffull) - want))]; if (preShown++ < 5) printf("PLAIN PRE-STATE MISMATCH at region offset %#llx flags %#x exporter %u kind %u symbol %s value %#llx want %#llx\n", (unsigned long long)(r.address - regionStart - slide), f, r.exporter, kind, (const char *)(namesArray + (le32((const uint8_t *)(exportsArray + 8ull * r.exportIndex) + 4) & 0x0fffffffu)), (unsigned long long)r.was, (unsigned long long)want); }
+    }
+    printf("plain locations of the overridden exporters, before the override: checked=%llu decode-mismatches=%llu (plus %llu __tlv_bootstrap thunk slots that are 8 past the table's address)\n", (unsigned long long)preChecked, (unsigned long long)preWrong, (unsigned long long)preTlvDelta);
+    for (const auto &m : mismatchSymbols) printf("  pre-state mismatch %s: %llu\n", m.first.c_str(), (unsigned long long)m.second);
+    assert(preChecked > 0 && preWrong == 0);
+    // Which clients are "in the process": two thirds of the cache's images, by index. The override must patch the plain locations of those and leave every
+    // other client's pages alone, which the verification below checks against the raw walk.
+    auto loadedClient = [](uint32_t client) { return client % 3 != 0; };
+    int (^clientAction)(uint32_t) = ^int(uint32_t client) { return loadedClient(client) ? DyldSharedCache::kPlainClientPatch : DyldSharedCache::kPlainClientIgnore; };
     std::set<uint32_t> patched; uint64_t totalSlots = 0, totalPatched = 0, totalUnexplained = 0, totalMissing = 0;
+    std::map<uint32_t, uint64_t> plainOfExporter, plainUnexplainedOfExporter; uint64_t totalPlainPatched = 0, totalPlainUnexplained = 0, totalPlainMissing = 0;
+    for (const RawPlain &r : overriddenPlain) {
+      if (!loadedClient(r.client)) continue;
+      const uint32_t kind = le32((const uint8_t *)(exportsArray + 8ull * r.exportIndex) + 4) >> 28, f = r.flags; const bool authentic = f & 1;
+      ++plainOfExporter[r.exporter];
+      plainUnexplainedOfExporter[r.exporter] += (kind != 0 && kind != 8) || (authentic ? (((f >> 1) & 0x7f) != 0) : ((f >> 16) != 0));
+    }
     for (const std::string &name : exporterNames) {
       uint32_t index;
       if (!cache->hasImagePath(name.c_str(), index)) { printf("override %s: not in the cache\n", name.c_str()); assert(false); }
       DyldSharedCache::PatchOverrideStats stats;
-      const char *error = cache->overridePatchGotSlots(index, ^bool(const char *symbol, bool, uint64_t *address) { *address = stub(symbol); return true; }, nullptr, nullptr, &stats);
+      const char *error = cache->overridePatchGotSlots(index, ^bool(const char *symbol, bool, uint64_t *address) { *address = stub(symbol); return true; }, clientAction, nullptr, &stats);
       if (error) { printf("override %s: error: %s\n", name.c_str(), error); assert(false); }
       std::set<uint32_t> symbols; for (size_t i : slotsOf[index]) symbols.insert(allSlots[i].exportIndex);
       __block uint64_t plainLocations = 0;
-      assert(cache->forEachPatchPlainLocation(index, ^(const DyldSharedCache::PatchLocationV4 &, uint32_t) { ++plainLocations; }) == nullptr);
+      assert(cache->forEachPatchPlainLocation(index, ^(const DyldSharedCache::PatchLocationV4 &, uint32_t client) { plainLocations += loadedClient(client); }) == nullptr);
       // the kind bits of the export name word are not interpreted: show how the GOT slots spread over them
       __block std::map<uint32_t, uint64_t> kinds;
       assert(cache->forEachPatchGotLocation(index, ^(const DyldSharedCache::PatchLocationV4 &l) { ++kinds[l.kind]; }) == nullptr);
       std::string kindText; for (const auto &k : kinds) kindText += " kind" + std::to_string(k.first) + "=" + std::to_string(k.second);
-      printf("override %s: image=%u got-exports=%zu export-entries=%llu got-slots=%llu patched=%llu unexplained=%llu missing-symbols=%llu missing-slots=%llu (plain-table locations, not applied: %llu; got slots by kind:%s)\n",
+      printf("override %s: image=%u got-exports=%zu export-entries=%llu got-slots=%llu patched=%llu unexplained=%llu missing-symbols=%llu missing-slots=%llu (plain-table locations of the loaded clients: %llu, patched=%llu unexplained=%llu missing=%llu; got slots by kind:%s)\n",
              name.c_str(), index, symbols.size(), (unsigned long long)stats.exports, (unsigned long long)stats.slots, (unsigned long long)stats.patched, (unsigned long long)stats.unexplained,
-             (unsigned long long)stats.missingExports, (unsigned long long)stats.missingSlots, (unsigned long long)plainLocations, kindText.c_str());
+             (unsigned long long)stats.missingExports, (unsigned long long)stats.missingSlots, (unsigned long long)plainLocations,
+             (unsigned long long)stats.plainPatched, (unsigned long long)stats.plainUnexplained, (unsigned long long)stats.plainMissing, kindText.c_str());
       assert(stats.exports >= symbols.size() && stats.slots == slotsOf[index].size() && stats.missingExports == 0 && stats.missingSlots == 0);
       assert(stats.patched + stats.unexplained == stats.slots);
+      // the plain locations are applied too: every one is accounted for, and the raw walk agrees on how many the override must refuse
+      assert(stats.plainSlots == plainLocations && stats.plainSlots == plainOfExporter[index] && stats.plainMissing == 0);
+      assert(stats.plainPatched + stats.plainUnexplained == stats.plainSlots && stats.plainUnexplained == plainUnexplainedOfExporter[index]);
+      totalPlainPatched += stats.plainPatched; totalPlainUnexplained += stats.plainUnexplained; totalPlainMissing += stats.plainMissing;
       DyldSharedCache::PatchOverrideStats again;
       assert(cache->overridePatchGotSlots(index, ^bool(const char *, bool, uint64_t *) { assert(false); return false; }, nullptr, nullptr, &again) == nullptr && again.alreadyApplied);
       patched.insert(index); totalSlots += stats.slots; totalPatched += stats.patched; totalUnexplained += stats.unexplained; totalMissing += stats.missingSlots;
@@ -105,7 +176,8 @@ PATCH_CHECK = <<~'CPP'
     uint64_t authOk = 0, plainOk = 0, unchanged = 0, wrong = 0, shown = 0;
     for (const RawSlot &s : allSlots) {
       const uint64_t now = *(const uint64_t *)s.address; const uint32_t f = s.flags; const bool authentic = f & 1;
-      const bool kindZero = (le32((const uint8_t *)(exportsArray + 8ull * s.exportIndex) + 4) >> 28) == 0;
+      const uint32_t slotKind = le32((const uint8_t *)(exportsArray + 8ull * s.exportIndex) + 4) >> 28;
+      const bool kindZero = slotKind == 0 || slotKind == 8;     // kind 8 (classes) is patched like kind 0 unless the resolver refuses it, and this one never does
       const bool explained = kindZero && (authentic ? (((f >> 1) & 0x7f) == 0) : ((f >> 16) == 0));
       bool ok;
       if (!patched.count(s.exporter) || !explained) { ok = (now == s.was); unchanged += ok; }
@@ -123,6 +195,44 @@ PATCH_CHECK = <<~'CPP'
            (unsigned long long)totalSlots, (unsigned long long)totalPatched, (unsigned long long)totalUnexplained, (unsigned long long)totalMissing,
            (unsigned long long)authOk, (unsigned long long)plainOk, (unsigned long long)unchanged, (unsigned long long)wrong);
     assert(wrong == 0 && authOk + plainOk == totalPatched && authOk + plainOk + unchanged == allSlots.size());
+
+    // --- independent verification of every plain location of the overridden exporters: it authenticates to the stub's address plus ITS OWN addend
+    // with ITS OWN key, discriminator and address diversity (the pre-state decode above proved those are the cache's own parameters); a refused one is
+    // unchanged; every plain slot of every other exporter is byte-identical to before ---
+    uint64_t plainAuthOk = 0, plainRawOk = 0, plainRefusedKept = 0, plainNotLoadedKept = 0, plainWrong = 0, plainShown = 0;
+    std::map<uint32_t, uint64_t> plainVerifiedOf;
+    for (const RawPlain &r : overriddenPlain) {
+      const uint64_t now = *(const uint64_t *)r.address; const uint32_t f = r.flags; const bool authentic = f & 1;
+      const uint32_t kind = le32((const uint8_t *)(exportsArray + 8ull * r.exportIndex) + 4) >> 28;
+      const bool explained = (kind == 0 || kind == 8) && (authentic ? (((f >> 1) & 0x7f) == 0) : ((f >> 16) == 0));
+      bool ok;
+      if (!loadedClient(r.client)) { ok = now == r.was; plainNotLoadedKept += ok; }
+      else if (!explained) { ok = now == r.was; plainRefusedKept += ok; }
+      else {
+        const char *symbol = (const char *)(namesArray + (le32((const uint8_t *)(exportsArray + 8ull * r.exportIndex) + 4) & 0x0fffffffu));
+        const uint64_t addend = authentic ? (f >> 9) & 0x1f : (f >> 9) & 0x7f, target = stub(symbol) + addend;
+        if (authentic) {
+          const uint64_t disc = f >> 16, modifier = ((f >> 14) & 1) ? ((r.address & 0x0000ffffffffffffull) | (disc << 48)) : disc;
+          ok = authenticate((f >> 15) & 1, now, modifier) == target; plainAuthOk += ok;
+        } else { ok = now == (target | ((uint64_t)((f >> 1) & 0x7f) << 57)); plainRawOk += ok; }
+        plainVerifiedOf[r.exporter] += ok;
+      }
+      if (!ok) { ++plainWrong; if (plainShown++ < 5) printf("PLAIN PATCH MISMATCH at region offset %#llx flags %#x\n", (unsigned long long)(r.address - regionStart - slide), f); }
+    }
+    __block uint64_t othersAfter = 14695981039346656037ull;
+    walkPlain(^(uint64_t address, uint32_t, uint32_t exporter, uint32_t, uint32_t) {
+      if (!overridden.count(exporter)) othersAfter = (othersAfter ^ (address * 0x9E3779B97F4A7C15ull) ^ *(const uint64_t *)address) * 1099511628211ull;
+    });
+    for (const std::string &name : exporterNames) {
+      uint32_t index; assert(cache->hasImagePath(name.c_str(), index));
+      printf("plain locations of %s: %llu, authenticate or compare ok after the override: %llu\n", name.c_str(), (unsigned long long)plainOfExporter[index], (unsigned long long)plainVerifiedOf[index]);
+      // libsystem_malloc is the exporter whose plain pointers (CoreFoundation's static allocator) crash the guest when left on the cache's copy
+      if (name.find("libsystem_malloc") != std::string::npos) assert(plainOfExporter[index] > 0 && plainVerifiedOf[index] == plainOfExporter[index] - plainUnexplainedOfExporter[index]);
+    }
+    printf("plain override verified: locations=%zu patched=%llu unexplained=%llu missing=%llu | independent: authenticate-ok=%llu plain-ok=%llu refused-kept=%llu not-loaded-clients-kept=%llu wrong=%llu | other exporters' plain slots unchanged=%s\n",
+           overriddenPlain.size(), (unsigned long long)totalPlainPatched, (unsigned long long)totalPlainUnexplained, (unsigned long long)totalPlainMissing,
+           (unsigned long long)plainAuthOk, (unsigned long long)plainRawOk, (unsigned long long)plainRefusedKept, (unsigned long long)plainNotLoadedKept, (unsigned long long)plainWrong, othersAfter == othersBefore ? "yes" : "NO");
+    assert(plainWrong == 0 && plainAuthOk + plainRawOk == totalPlainPatched && plainAuthOk + plainRawOk + plainRefusedKept + plainNotLoadedKept == overriddenPlain.size() && othersAfter == othersBefore);
   }
 CPP
 
