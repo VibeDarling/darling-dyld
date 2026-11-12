@@ -31,7 +31,17 @@ abort 'the override is skipped when link() throws and still run after the catch'
 [['initializeMainExecutable', init_main], ['runInitializers', run_init]].each do |name, body|
   abort "#{name} calls overrideSplitCacheGotSlots without dyld's lock (dlopen releases it before the initializers)" if body.include?('overrideSplitCacheGotSlots')
 end
+main_fn = dyld2[/^_main\(const macho_header.*?^\}/m] or abort '_main missing'
+bind = main_fn.index('sMainExecutable->recursiveBindWithAccounting(') or abort '_main does not bind the main executable'
+inserted_bind = main_fn.index('image->recursiveBind(gLinkContext', bind) or abort '_main does not bind the inserted images'
+launch_hook = main_fn.index('overrideSplitCacheGotSlots();') or abort '_main does not run the override'
+abort '_main runs the override before the launch binds are done' unless launch_hook > inserted_bind
+abort '_main runs the override while linkingMainExecutable is still set (it is a no-op then)' unless launch_hook > main_fn.index('gLinkContext.linkingMainExecutable = false;', inserted_bind)
+abort '_main runs the override after the initializers' unless (init_call = main_fn.index('initializeMainExecutable();', bind)) && launch_hook < init_call
+abort '_main calls the override outside #ifdef DARLING' unless main_fn[0...launch_hook].rindex('#ifdef DARLING') > inserted_bind
+abort 'overrideSplitCacheGotSlots does not skip the launch links' unless override_fn.include?('gLinkContext.linkingMainExecutable')
 puts 'ok   the override runs at the end of link() and in neither initializer pass'
+puts 'ok   at launch the override is skipped by the links and runs once after the binds'
 
 Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
   File.write("#{dir}/test.cpp", <<~CPP)
@@ -91,8 +101,9 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       mutable std::map<std::string, uint64_t> lastAddress; mutable std::vector<bool> logOn; std::set<std::string> classNames;   // the symbols the cache has as kind 8 exports
     };
     struct ImageLoader {
-      struct LinkContext { bool verboseMapping = false; };
+      struct LinkContext { bool verboseMapping = false; bool linkingMainExecutable = false; };
       std::string install, path; bool inCache = false; mach_header header = {1}; std::map<std::string, uintptr_t> exports; std::map<std::string, const ImageLoader*> reexportedFrom; std::vector<const ImageLoader*> reExports;
+      bool bound = true; std::map<std::string, std::pair<uintptr_t, uintptr_t>> resolvers; mutable unsigned resolverRuns = 0, resolverFaults = 0, stubLookups = 0;   // stub-and-resolver exports: {stub, resolver's result}
       const char *getInstallPath() const { return install.c_str(); }
       const char *getPath() const { return path.c_str(); }
       bool inSharedCache() const { return inCache; }
@@ -100,7 +111,17 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       void forEachReExportDependent(void (^callback)(const ImageLoader*, bool &stop)) const { bool stop = false; for (const ImageLoader *i : reExports) { callback(i, stop); if (stop) break; } }
       // the real lookup is ImageLoader::findExportedSymbolAddress (searchReExports, resolvers run for a GOT pointer)
       bool findExportedSymbolAddress(const LinkContext &, const char *name, const ImageLoader *requestor, int ordinal, bool runResolver, const ImageLoader **foundIn, uintptr_t *address) const {
-        if (requestor != nullptr || ordinal != -1 || !runResolver) return false;
+        if (requestor != nullptr || ordinal != -1) return false;
+        auto res = resolvers.find(name);
+        if (res != resolvers.end()) {
+          // like exportedSymbolAddress: with runResolver the resolver's answer, which needs the image's own bound slots (a native shim reads _elfcalls through its
+          // __got); without it the stub, whose call reaches the resolver through __la_resolver and the stub helper, which keep fewer registers than a lazy binder would
+          *foundIn = this;
+          if (!runResolver) { ++stubLookups; *address = res->second.first; return true; }
+          ++resolverRuns; if (!bound) { ++resolverFaults; return false; }
+          *address = res->second.second; return true;
+        }
+        if (!runResolver) return false;
         auto it = exports.find(name); if (it == exports.end()) return false;
         auto via = reexportedFrom.find(name);
         *foundIn = via == reexportedFrom.end() ? this : via->second; *address = it->second; return true;
@@ -290,6 +311,42 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       cache.classNames = {"_close"}; classFamily(1); CHECK(cache.lastAddress.count("_close") == 0);
       classFamily(2); CHECK(cache.lastAddress["_close"] == 0x5000);
       cache.classNames.clear();
+
+      // --- resolver exports: the override stores what the resolver returns (a stub would reach it through __la_resolver and lose registers), and never before the exporter is bound ---
+      // _close of the exporter is stub 0x2000 and resolver (result 0x9000), in the stand-in itself or in a sibling. At launch the links of the main program and
+      // of the inserted libraries run before the bind (ImageLoader::link skips it while linkingMainExecutable), so the exporters are not bound then.
+      auto resolverCase = [&](bool inSibling, int subtype) {
+        reset(cache); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+        ImageLoader *standIn = image("/usr/lib/system/libsystem_kernel.dylib"); standIn->bound = false; standIn->header.cpusubtype = subtype;
+        ImageLoader *c = image("/usr/lib/system/libsystem_c.dylib"); c->exports.clear(); c->bound = false; c->header.cpusubtype = subtype;
+        ImageLoader *holder = inSibling ? c : standIn; holder->resolvers["_close"] = {0x2000, 0x9000}; holder->exports["_close"] = 0x2000;
+        if (inSibling) standIn->exports.erase("_close");
+        ImageLoader *umbrella = image("/usr/lib/libSystem.B.dylib"); umbrella->reExports = {standIn, c};
+        sAllImages.push_back(umbrella); sAllImages.push_back(standIn); sAllImages.push_back(c); sDiskOverridesOfCacheImages.push_back({standIn, 1});
+        return std::make_pair(standIn, c);
+      };
+      for (bool inSibling : {false, true}) {
+        auto images = resolverCase(inSibling, 1);
+        gLinkContext.linkingMainExecutable = true;                       // the launch's link(): nothing is bound yet
+        overrideSplitCacheGotSlots();
+        CHECK(cache.calls.empty() && cache.lastAddress.empty() && logged.empty());           // nothing is looked up, run or stored
+        CHECK(images.first->resolverRuns + images.second->resolverRuns == 0 && images.first->stubLookups + images.second->stubLookups == 0);
+        gLinkContext.linkingMainExecutable = false; images.first->bound = images.second->bound = true;   // _main has bound them
+        overrideSplitCacheGotSlots();
+        CHECK(images.first->resolverRuns + images.second->resolverRuns == 1 && images.first->resolverFaults + images.second->resolverFaults == 0);
+        CHECK(images.first->stubLookups + images.second->stubLookups == 0);                  // the stub is never what is stored
+        CHECK(cache.lastAddress["_close"] == (0x9000 | dyld3::darling::kThunkBit));         // the resolved value, through the adapters of a plain exporter
+        CHECK(cache.lastAddress["_open"] == (0x1000 | dyld3::darling::kThunkBit));          // the other exports are as before
+        resolverCase(inSibling, 2); // arm64e exporters
+        for (ImageLoader *i : sAllImages) i->bound = true;
+        overrideSplitCacheGotSlots();
+        CHECK(cache.lastAddress["_close"] == 0x9000);
+      }
+      // a dlopen's link() ends with its closure bound: the override runs there and resolves at once
+      { auto images = resolverCase(false, 1); images.first->bound = images.second->bound = true; overrideSplitCacheGotSlots();
+        CHECK(cache.lastAddress["_close"] == (0x9000 | dyld3::darling::kThunkBit) && images.first->resolverFaults == 0); }
+      // the unbound control: the pass that is not skipped would have run the resolver on an image that is not bound
+      { auto images = resolverCase(false, 1); overrideSplitCacheGotSlots(); CHECK(images.first->resolverFaults == 1 && cache.lastAddress.count("_close") == 0); }
 
       // --- the log function is passed under the cache policy option too ---
       reset(cache); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true)); shadow("/usr/lib/libSystem.B.dylib", 0);

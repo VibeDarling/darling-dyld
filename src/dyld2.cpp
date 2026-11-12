@@ -1812,14 +1812,19 @@ static bool findInReExportSiblings(const ImageLoader* standIn, const char* symbo
 // exporters. For every cache exporter that this process provides from disk (the records loadPhase5 keeps of a disk
 // image standing in for a cache image), point the slots of the symbols it exports at the loaded image's definitions.
 // Runs at the end of link(), which holds dyld's lock (dlopen takes it explicitly, the other APIs through their glue, and
-// the launch is single threaded) and, for the main program, only returns when every dependent is loaded; so no cache
-// image runs before its imports are fixed. Idempotent, and a no-op without version 4 patch info or a cache image in
-// the process. A symbol the loaded image does not export is looked up in its re-export siblings (findInReExportSiblings);
+// the launch is single threaded), and once more after the launch binds. The lookups run symbol resolvers (a bind stores a
+// resolver's result, and a resolver export's stub reaches the resolver through __la_resolver, which preserves less than a
+// call does), and a resolver uses its image's bound slots: the Darling native shims (ELF bridge libraries) read __got for
+// _elfcalls. A dlopen has bound the whole closure when link() ends, but link() of the main program and of the inserted
+// libraries only loads and rebases (ImageLoader::link skips the bind while linkingMainExecutable, ImageLoader.cpp:545),
+// and _main binds them later (after applyInterposing). So the pass is a no-op during the launch's links, and _main runs
+// it when those binds are done, before the initializers: no cache image runs before its imports are fixed. Idempotent,
+// and a no-op without version 4 patch info or a cache image in the process. A symbol the loaded image does not export is looked up in its re-export siblings (findInReExportSiblings);
 // one that no Darling image defines keeps the cache's pointer and is counted.
 static void overrideSplitCacheGotSlots()
 {
 	const DyldSharedCache* cache = sSharedCacheLoadInfo.loadAddress;
-	if ( (cache == nullptr) || !cache->hasPatchInfoV4() )
+	if ( (cache == nullptr) || !cache->hasPatchInfoV4() || gLinkContext.linkingMainExecutable )
 		return;
 	bool cacheImageLoaded = false;
 	for (const ImageLoader* image : sAllImages)
@@ -7718,6 +7723,10 @@ reloadAllImages:
 		// <rdar://problem/12186933> do weak binding only after all inserted images linked
 		sMainExecutable->weakBind(gLinkContext);
 		gLinkContext.linkingMainExecutable = false;
+#ifdef DARLING
+		// the stand-ins of cache images are bound now, which the override needs (see overrideSplitCacheGotSlots)
+		overrideSplitCacheGotSlots();
+#endif
 
 		sMainExecutable->recursiveMakeDataReadOnly(gLinkContext);
 
