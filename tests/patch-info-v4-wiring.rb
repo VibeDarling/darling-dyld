@@ -92,13 +92,15 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
         if (index == 2 && error) return error;
         applied.insert(index);
         if (index == 4) { s->exports = 1; s->slots = 2; s->unexplained = 2; return nullptr; }
-        for (const char *name : {"_open", "_close", "_nosuchsymbol"}) {
+        std::vector<std::string> names = {"_open", "_close", "_nosuchsymbol"}; names.insert(names.end(), moreNames.begin(), moreNames.end());
+        for (const std::string &nameString : names) {
+          const char *name = nameString.c_str();
           uint64_t address = 0; ++s->exports; s->slots += 2;
           if (resolve(name, classNames.count(name) != 0, &address)) { s->patched += 2; lastAddress[name] = address; } else { ++s->missingExports; s->missingSlots += 2; }
         }
         return nullptr;
       }
-      mutable std::map<std::string, uint64_t> lastAddress; mutable std::vector<bool> logOn; std::set<std::string> classNames;   // the symbols the cache has as kind 8 exports
+      std::vector<std::string> moreNames; mutable std::map<std::string, uint64_t> lastAddress; mutable std::vector<bool> logOn; std::set<std::string> classNames;   // the symbols the cache has as kind 8 exports
     };
     struct ImageLoader {
       struct LinkContext { bool verboseMapping = false; bool linkingMainExecutable = false; };
@@ -147,7 +149,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     }
     // a disk image standing in for cache image `index`, as loadPhase5 records it
     static void shadow(const char *install, uint32_t index) { ImageLoader *i = image(install); sAllImages.push_back(i); sDiskOverridesOfCacheImages.push_back({i, index}); }
-    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); cache.lastAddress.clear(); cache.logOn.clear(); cache.classNames.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
+    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); cache.lastAddress.clear(); cache.logOn.clear(); cache.classNames.clear(); cache.moreNames.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
     static unsigned summaries() { unsigned n = 0; for (const std::string &l : logged) n += l.find("split cache GOT override: patched=") != std::string::npos; return n; }
 
     int main() {
@@ -304,8 +306,21 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       CHECK(cache.lastAddress.count("_nosuchsymbol") == 0 && logged.empty());                  // the three symbols of the stub: _nosuchsymbol is undefined everywhere
       gLogCachePolicy = true; cache.applied.clear(); logged.clear();
       overrideSplitCacheGotSlots();
-      { unsigned missing = 0; for (const std::string &l : logged) missing += l.find("_nosuchsymbol") != std::string::npos && l.find("the cache's own definition stays") != std::string::npos; CHECK(missing == 1 && logged.size() == 1); }
-      gLogCachePolicy = false;
+      CHECK(logged.size() == 1 && logged[0].find("/usr/lib/system/libsystem_malloc.dylib: 1 export(s) that no Darling image defines keep the cache's definition (first: _nosuchsymbol)") != std::string::npos);   // one line per exporter, under the policy option
+      gLogCachePolicy = false; cache.applied.clear(); logged.clear(); gLinkContext.verboseMapping = true;
+      overrideSplitCacheGotSlots();
+      { unsigned perSymbol = 0, perExporter = 0; for (const std::string &l : logged) { perSymbol += l.find("defines _nosuchsymbol") != std::string::npos; perExporter += l.find("1 export(s) that no Darling image defines") != std::string::npos; } CHECK(perSymbol == 1 && perExporter == 1); }   // the per-symbol line is for the verbose mapping option
+      gLinkContext.verboseMapping = false;
+      // thousands of misses (a real cache has 3843 for an empty libswiftCore stand-in) stay one bounded line under the policy option, and none without an option
+      familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000), image("/usr/lib/system/libsystem_info.dylib"));
+      for (int i = 0; i < 4000; ++i) cache.moreNames.push_back("_missing" + std::to_string(i));
+      cache.applied.clear(); logged.clear();
+      overrideSplitCacheGotSlots();
+      CHECK(logged.empty());
+      gLogCachePolicy = true; cache.applied.clear(); logged.clear();
+      overrideSplitCacheGotSlots();
+      CHECK(logged.size() == 1 && logged[0].find(": 4001 export(s) that no Darling image defines keep the cache's definition (first: _nosuchsymbol, _missing0, _missing1, ...)") != std::string::npos && logged[0].size() < 400);
+      gLogCachePolicy = false; cache.moreNames.clear();
       // the class-export gate looks at the image that defines the symbol, here the sibling
       auto classFamily = [&](int siblingSubtype) { familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000, siblingSubtype), image("/usr/lib/system/libsystem_info.dylib")); };
       cache.classNames = {"_close"}; classFamily(1); CHECK(cache.lastAddress.count("_close") == 0);

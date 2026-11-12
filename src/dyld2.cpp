@@ -1839,6 +1839,9 @@ static void overrideSplitCacheGotSlots()
 		if ( dyld3::sharedCachePathIsAllowListed(cache->getIndexedImagePath(record.cacheImageIndex), dyld3::sharedCacheAllowList()) )
 			continue;
 		DyldSharedCache::PatchOverrideStats stats;
+		// a real cache leaves thousands of symbols to the cache (an empty libswiftCore stand-in: 3843): one line per exporter, not per symbol
+		struct { uint64_t count; const char* first[3]; } initialUndefined = { 0, { nullptr, nullptr, nullptr } };	// names point into the cache's string table, which stays mapped
+		__block decltype(initialUndefined) undefined = initialUndefined;
 		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, bool classExport, uint64_t* address) {
 			const ImageLoader* foundIn;
 			uintptr_t found;
@@ -1857,14 +1860,25 @@ static void overrideSplitCacheGotSlots()
 					dyld::log("dyld: patched %s %s -> %s\n", installPath, symbol, foundIn->getPath());
 				return true;
 			}
-			if ( verbose || gLogCachePolicy )
-				dyld::log("dyld: split cache GOT override: neither %s nor a library re-exported with it defines %s, the cache's own definition stays (mixed with Darling's state if that is stateful)\n", installPath, symbol);
+			if ( undefined.count < 3 )
+				undefined.first[undefined.count] = symbol;
+			++undefined.count;
+			if ( verbose )
+				dyld::log("dyld: split cache GOT override: neither %s nor a library re-exported with it defines %s, the cache's own definition stays\n", installPath, symbol);
 			return false;
 		}, (verbose || gLogCachePolicy) ? &dyld::log : nullptr, &stats);
 		if ( error != nullptr )
 			halt(mkstringf("split cache GOT override of '%s': %s\n", installPath, error));
 		if ( stats.alreadyApplied )
 			continue;
+		if ( (undefined.count != 0) && (verbose || gLogCachePolicy) ) {
+			// cache code that keeps such a definition runs it on the cache's own state, mixed with Darling's if the symbol is stateful
+			char names[512] = "";
+			for (uint64_t i = 0; i < ((undefined.count < 3) ? undefined.count : 3); ++i)
+				snprintf(&names[strlen(names)], sizeof(names) - strlen(names), "%s%s", (i == 0) ? "" : ", ", undefined.first[i]);
+			dyld::log("dyld: split cache GOT override: %s: %llu export(s) that no Darling image defines keep the cache's definition (first: %s%s)\n",
+					  installPath, (unsigned long long)undefined.count, names, (undefined.count > 3) ? ", ..." : "");
+		}
 		++exporters;
 		sSplitCachePatchTotals.patched += stats.patched;
 		sSplitCachePatchTotals.missing += stats.missingSlots;
