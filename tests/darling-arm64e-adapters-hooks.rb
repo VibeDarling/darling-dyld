@@ -27,7 +27,8 @@ SOURCES = { dyld2: 'src/dyld2.cpp', loader: 'src/ImageLoaderMachOCompressed.cpp'
 # the text of each hook, or nil when it is not where it must be
 def snippets(src)
   {
-    got: src[:dyld2][/^\t+\*address = dyld3::darling::adaptedTarget\(symbol, found, [^\n]*;$/],
+    got: [src[:dyld2][/^\t+const bool foundInIsArm64e = dyld3::darling::cpusubtypeIsArm64e\(foundIn[^\n]*;$/],
+          src[:dyld2][/^\t+\*address = dyld3::darling::adaptedTarget\(symbol, found, foundInIsArm64e\);$/]].then { |l| l.all? ? l.join("\n") : nil },
     fixups: src[:loader][/#ifdef DARLING\n\t+\/\/ arm64e code binding[^\n]*\n(.*?)#endif/m, 1],
     sign_define: src[:api][/^\t#define DARLING_DLSYM_SIGN\(p\) \(\(void\*\)dyld3::MachOLoaded[^\n]*$/],
     sign_function: src[:api][/^\tstatic void\* darlingDlsymSignForCaller\(.*?^\t\}\n/m],
