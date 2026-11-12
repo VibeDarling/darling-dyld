@@ -1918,6 +1918,12 @@ bool _dyld_shared_cache_optimized()
     return false;
 }
 
+// dyld4 returns nullptr when the cache has no Swift prespecialization data, which Darling's loader never has
+const void* _dyld_get_swift_prespecialized_data(void)
+{
+    return NULL;
+}
+
 bool _dyld_shared_cache_is_locally_built()
 {
     if ( gUseDyld3 )

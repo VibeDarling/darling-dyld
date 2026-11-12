@@ -1,6 +1,6 @@
 # The four dyld4 data SPIs the shared cache's libobjc imports (__dyld_for_objc_header_opt_ro/rw,
-# __dyld_objc_class_count, __dyld_lookup_section_info): their rows in dyldAPIs.cpp's lookup table, their
-# declarations, and the section lookup itself, whose text is cut out of dyld3/ObjCSectionInfo.h and replayed
+# __dyld_objc_class_count, __dyld_lookup_section_info) and the Swift prespecialized data SPI (answers NULL): their
+# rows in dyldAPIs.cpp's lookup table, their declarations, and the section lookup itself, whose text is cut out of dyld3/ObjCSectionInfo.h and replayed
 # here against hand-built mach headers. Mutants of the lookup must each fail (--probes).
 # Usage: ruby tests/dyld-objc-data-apis.rb [checkout] [--probes]
 require 'tmpdir'
@@ -86,6 +86,52 @@ check('dyld3/APIs.cpp defines the lookup', D3APIS.match?(/^struct _dyld_section_
 check('dyldAPIs.cpp includes the shared section helper', APIS.match?(/^#include "ObjCSectionInfo\.h"/))
 SIGNATURES.each do |_name, sig|
   check("dyldAPIs.cpp defines #{sig}", APIS.match?(/^#{Regexp.escape(sig)}/m))
+end
+
+# --- the Swift prespecialized data SPI the cache's libswiftCore calls during Foundation init -----------------
+# dyld4 answers nullptr when the cache has no prespecialization data, and Darling's loader never has any.
+check('dyld_priv.h declares _dyld_get_swift_prespecialized_data once',
+      DYLDPRIV.scan(/^extern const void\* _dyld_get_swift_prespecialized_data\(void\);/).size == 1)
+SWIFT_SIG = 'const void* _dyld_get_swift_prespecialized_data(void)'
+check('libsystem defines _dyld_get_swift_prespecialized_data once', WRAPPERS.scan(/^#{Regexp.escape(SWIFT_SIG)}\n\{/).size == 1)
+swift_from = WRAPPERS.index("#{SWIFT_SIG}\n{") or abort 'libsystem _dyld_get_swift_prespecialized_data not found'
+SWIFT_FUNCTION = WRAPPERS[swift_from..(WRAPPERS.index("\n}\n", swift_from) + 2)]
+SWIFT_SOURCE = <<~'CPP' + SWIFT_FUNCTION + <<~'CPP2'
+  #include <stdio.h>
+  #include <stddef.h>
+  bool gUseDyld3 = false;
+CPP
+  int main()
+  {
+    int failures = 0;
+    for ( int dyld3 = 0; dyld3 < 2; ++dyld3 ) {
+      gUseDyld3 = dyld3 != 0;
+      if ( _dyld_get_swift_prespecialized_data() != nullptr ) {
+        printf("FAIL non-NULL answer with gUseDyld3=%d\n", dyld3);
+        ++failures;
+      }
+    }
+    if ( failures == 0 )
+      printf("ok NULL in the dyld2 and the dyld3 path\n");
+    return failures != 0;
+  }
+CPP2
+
+# The exported symbol, as the object file of an arm64 Mach-O translation unit has it: the header's prototype in C linkage
+# followed by the definition, so a hidden visibility on either, or a lost C linkage, shows. Swift guards its use of the
+# SPI with the define that upstream dyld_priv.h puts next to the prototype.
+check('dyld_priv.h defines DYLD_GET_SWIFT_PRESPECIALIZED_DATA_DEFINED next to the prototype',
+      DYLDPRIV.include?("extern const void* _dyld_get_swift_prespecialized_data(void);\n#define DYLD_GET_SWIFT_PRESPECIALIZED_DATA_DEFINED 1\n"))
+SWIFT_PROTOTYPE = DYLDPRIV[/^extern const void\* _dyld_get_swift_prespecialized_data\(void\);$/] or abort 'swift prototype not found'
+SWIFT_SYMBOL = '__dyld_get_swift_prespecialized_data'
+
+def swift_symbol_listing(dir, prototype, function)
+  File.write("#{dir}/swift_symbol.cpp", "#include <stddef.h>\nextern \"C\" {\n#{prototype}\n}\n#{function}")
+  out, status = Open3.capture2e('clang++', '-std=c++17', '-target', 'aarch64-apple-darwin20', '-c', "#{dir}/swift_symbol.cpp", '-o', "#{dir}/swift_symbol.o")
+  return [false, "build failed:\n#{out}"] unless status.success?
+  out, status = Open3.capture2e('llvm-nm', '-m', "#{dir}/swift_symbol.o")
+  return [false, "llvm-nm failed:\n#{out}"] unless status.success?
+  [out.lines.any? { |l| l =~ /\(__TEXT,__text\) external #{SWIFT_SYMBOL}$/ }, out]
 end
 
 # --- replay of the section lookup ---------------------------------------------------------------
@@ -392,6 +438,12 @@ Dir.mktmpdir('dyld-objc-data-apis-') do |dir|
   ok, out = build_wrappers(dir, WRAPPER_SOURCE)
   puts out
   check('table wrappers forward to the loader', ok, out)
+  ok, out = build_wrappers(dir, SWIFT_SOURCE)
+  puts out
+  check('the Swift prespecialized data SPI answers NULL', ok, out)
+  ok, out = swift_symbol_listing(dir, SWIFT_PROTOTYPE, SWIFT_FUNCTION)
+  puts out
+  check('the Swift prespecialized data SPI is an external, defined symbol with C linkage', ok, out)
   next unless RUN_PROBES
 
   probes = [
@@ -420,6 +472,36 @@ Dir.mktmpdir('dyld-objc-data-apis-') do |dir|
      'if ( seg->nsects > (seg->cmdsize - sizeof(segment_command_64))/sizeof(section_64) )',
      'if ( false )'],
   ]
+  [
+    ['the Swift prespecialized data SPI answers NULL', 'return NULL;', 'return (const void*)0x1;', SWIFT_SOURCE],
+    ['the dyld3 path of the Swift SPI answers NULL', 'return NULL;', 'return gUseDyld3 ? (const void*)0x1 : NULL;', SWIFT_SOURCE],
+  ].each do |name, from, to, source|
+    abort "probe text not found: #{name}" unless source.include?(from)
+    ok, out = build_wrappers(dir, source.sub(from, to))
+    if out.start_with?('build failed')
+      abort "probe does not compile: #{name}\n#{out}"
+    elsif ok
+      $failures += 1
+      puts "SURVIVED #{name}"
+    else
+      puts "killed   #{name}"
+    end
+  end
+  [
+    ['a hidden prototype hides the Swift SPI', SWIFT_PROTOTYPE, SWIFT_PROTOTYPE.sub('extern ', 'extern __attribute__((visibility("hidden"))) '), SWIFT_FUNCTION],
+    ['a hidden definition hides the Swift SPI', SWIFT_PROTOTYPE, SWIFT_PROTOTYPE, SWIFT_FUNCTION.sub('const void*', '__attribute__((visibility("hidden"))) const void*')],
+    ['the Swift SPI needs its C linkage', SWIFT_PROTOTYPE, '', SWIFT_FUNCTION],
+  ].each do |name, _from, prototype, function|
+    ok, out = swift_symbol_listing(dir, prototype, function)
+    if out.start_with?('build failed') || out.start_with?('llvm-nm failed')
+      abort "probe does not compile: #{name}\n#{out}"
+    elsif ok
+      $failures += 1
+      puts "SURVIVED #{name}"
+    else
+      puts "killed   #{name}"
+    end
+  end
   [
     ['headeropt_ro answers from libdyld\'s table', "\tDYLD_NO_LOCK_THIS_BLOCK;\n    typedef const void* (*funcType)(void);",
      "    return (gObjCOpt != nullptr) ? gObjCOpt->headeropt_ro() : nullptr;\n\tDYLD_NO_LOCK_THIS_BLOCK;\n    typedef const void* (*funcType)(void);"],
