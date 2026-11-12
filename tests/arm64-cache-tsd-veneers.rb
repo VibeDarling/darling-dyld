@@ -4,6 +4,7 @@ require 'open3'
 root=File.realpath(ARGV.fetch(0))
 source=File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
 helper=source[/class DarlingTSDReadVeneers \{.*?^\};/m] or abort 'veneer generator missing'
+protection=source[/static int mmapProtection\(.*?^\}/m] or abort 'protection helper missing'
 mapper=source[/static bool translateDarlingCacheTSD\(.*?^\}/m] or abort 'cache translator missing'
 Dir.mktmpdir('arm64-tsd-veneers-') do |dir|
  File.write("#{dir}/test.cpp", <<~CPP)
@@ -15,6 +16,10 @@ Dir.mktmpdir('arm64-tsd-veneers-') do |dir|
  #include <signal.h>
  #include <ucontext.h>
  #include <stdio.h>
+ #include <unistd.h>
+ #include <string.h>
+ #include "DarlingTSDIslands.h"
+ namespace darling_tsd = dyld3::darling_tsd;
  static void sys_icache_invalidate(void* p,size_t n) { __builtin___clear_cache((char*)p,(char*)p+n); }
  #{helper}
  static thread_local void* slot;
@@ -34,6 +39,7 @@ Dir.mktmpdir('arm64-tsd-veneers-') do |dir|
  struct TestMapping { uintptr_t sms_address; size_t sms_size; unsigned sms_init_prot; };
  struct CacheInfo { TestMapping mappings[2]; unsigned mappingsCount; };
  static unsigned long sys_thread_get_native_tsd_slot_offset() { return offset; }
+ #{protection}
  #{mapper}
  static void* worker(void* argument) {
    assert((uintptr_t)&slot-(uintptr_t)__builtin_thread_pointer()==offset);
@@ -70,16 +76,17 @@ Dir.mktmpdir('arm64-tsd-veneers-') do |dir|
    pthread_t threads[4];
    for(uintptr_t i=0;i<4;++i) assert(pthread_create(&threads[i],nullptr,worker,(void*)(i+1))==0);
    for(auto t:threads) assert(pthread_join(t,nullptr)==0);
+   const size_t page=(size_t)sysconf(_SC_PAGESIZE);
    uintptr_t cacheStart=0x190000000ULL;
-   auto* cache=(uint32_t*)mmap((void*)cacheStart,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON|MAP_FIXED_NOREPLACE,-1,0);
+   auto* cache=(uint32_t*)mmap((void*)cacheStart,2*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON|MAP_FIXED_NOREPLACE,-1,0);
    assert(cache==(void*)cacheStart);
    cache[0]=0xd53bd069; // data that resembles an instruction must remain intact
-   uint32_t* text=cache+1024;
+   uint32_t* text=cache+page/4;
    text[0]=0xd53bd069; text[1]=0xaa0903e0; text[2]=0xd65f03c0;
    text[8]=0xd53bd06a; text[9]=0xd34cfc00 | (10<<5) | 10;
    text[12]=0xd53bd07f;
-   assert(mprotect(text,4096,PROT_READ|PROT_EXEC)==0);
-   CacheInfo info{{{cacheStart,4096,VM_PROT_READ|VM_PROT_WRITE},{cacheStart+4096,4096,VM_PROT_READ|VM_PROT_EXECUTE}},2};
+   assert(mprotect(text,page,PROT_READ|PROT_EXEC)==0);
+   CacheInfo info{{{cacheStart,page,VM_PROT_READ|VM_PROT_WRITE},{cacheStart+page,page,VM_PROT_READ|VM_PROT_EXECUTE}},2};
    const char* error=nullptr;
    assert(translateDarlingCacheTSD(info,&error) && !error);
    assert(cache[0]==0xd53bd069 && text[8]==(0xaa1f03e0|10) && text[12]==0xd503201f);
@@ -90,7 +97,7 @@ Dir.mktmpdir('arm64-tsd-veneers-') do |dir|
    puts("PASS production veneers: 400000 native-slot reads, per-thread null fallback, invalid metadata, branch range and occupied mapping");
  }
  CPP
- out,status=Open3.capture2e('c++','-std=c++11','-O2','-pthread',"#{dir}/test.cpp",'-o',"#{dir}/test")
+ out,status=Open3.capture2e('c++','-std=c++11','-O2','-pthread','-I',"#{root}/dyld3","#{dir}/test.cpp","#{root}/dyld3/DarlingTSDIslands.cpp",'-o',"#{dir}/test")
  abort out unless status.success?
  out,status=Open3.capture2e("#{dir}/test"); puts out; abort 'veneer test failed' unless status.success?
 end
