@@ -151,6 +151,15 @@ const macho_header* ImageLoaderMegaDylib::getIndexedMachHeader(unsigned index) c
 	return (const macho_header*)(_images[index].address + _slide);
 }
 
+// Out-of-range answers null rather than throwing: the index comes from a dlopen handle, which a caller
+// can forge, and the callers of this want a header or nothing.
+const macho_header* ImageLoaderMegaDylib::machHeaderForIndex(unsigned index) const
+{
+	if ( index >= _imageCount )
+		return nullptr;
+	return (const macho_header*)(_images[index].address + _slide);
+}
+
 const char* ImageLoaderMegaDylib::getIndexedPath(unsigned index) const
 {
 	if ( index > _header->imagesCount )

@@ -1,0 +1,12 @@
+# C names (one underscore fewer than the Mach-O symbol) that Darling's libc++abi.dylib exports and
+# abi_cxx.cpp imports. Link-only stub input; see build_abi.py.
+__cxa_allocate_exception
+__cxa_throw
+__cxa_begin_catch
+__cxa_end_catch
+__gxx_personality_v0
+_ZdlPvm
+_ZSt9terminatev
+_ZTIi
+_ZTVN10__cxxabiv117__class_type_infoE
+_ZTVN10__cxxabiv120__si_class_type_infoE

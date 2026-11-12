@@ -1,0 +1,177 @@
+symbol	class	header_note	in_darling	source
+_DNSServiceBrowse	A	dns_sd.h arg5:callBack:fnptr	OK	T0
+_DNSServiceEnumerateDomains	A	dns_sd.h arg3:callBack:fnptr	OK	T0
+_DNSServiceQueryRecord	A	dns_sd.h arg6:callBack:fnptr	OK	T0
+_DNSServiceRegister	A	dns_sd.h arg10:callBack:fnptr	OK	T0
+_DNSServiceResolve	A	dns_sd.h arg6:callBack:fnptr	OK	T0
+__Block_copy	D	block object carrier (Block.h)	OK	T0
+__Block_object_assign	D	block object carrier (Block.h)	OK	T0
+__Block_object_dispose	D	block object carrier (Block.h)	OK	T0
+__Block_release	D	block object carrier (Block.h)	OK	T0
+__Unwind_DeleteException	S	unwind.h arg0:exception_object:struct _Unwind_Exception.exception_cleanup	OK	T0
+__Unwind_RaiseException	S	unwind.h arg0:exception_object:struct _Unwind_Exception.exception_cleanup	OK	T0
+__Unwind_Resume	S	unwind.h arg0:exception_object:struct _Unwind_Exception.exception_cleanup	OK	T0
+___cxa_atexit	A	cxxabi.h (declaration in header comment, line 141) arg0::fnptr	OK	T0
+___cxa_throw	A	cxxabi.h arg2:dest:fnptr	?	T0
+___platform_sigaction	S	signal.h arg1::struct __sigaction_u.__sa_handler;arg2::struct __sigaction_u.__sa_handler	OK	sweep
+__dyld_for_each_objc_class	A	mach-o/dyld_priv.h arg1:callback:block	OK	T0
+__dyld_for_each_objc_protocol	A	mach-o/dyld_priv.h arg1:callback:block	OK	T0
+__dyld_process_info_for_each_aot_image	A	mach-o/dyld_process_info.h arg1:callback:block	OK	T0
+__dyld_register_for_bulk_image_loads	A	mach-o/dyld_priv.h arg0:func:fnptr	OK	T0
+__dyld_register_func_for_remove_image	A	mach-o/dyld.h arg0:func:fnptr	OK	T0
+__os_activity_initiate	A	os/activity.h arg3:activity_block:block	OK	T0
+__os_alloc_once	A	os/alloc_once_impl.h arg2:init:fnptr	OK	sweep
+__os_once	A	os/once_private.h arg2:function:fnptr	OK	T0
+_aio_error	S	sys/aio.h arg0:aiocbp:struct sigevent.sigev_notify_function	OK	T0
+_aio_read	S	sys/aio.h arg0:aiocbp:struct sigevent.sigev_notify_function	OK	T0
+_aio_return	S	sys/aio.h arg0:aiocbp:struct sigevent.sigev_notify_function	OK	T0
+_aio_suspend	S	sys/aio.h arg0:aiocblist:struct sigevent.sigev_notify_function	OK	T0
+_aio_write	S	sys/aio.h arg0:aiocbp:struct sigevent.sigev_notify_function	OK	T0
+_atexit	A	stdlib.h arg0::fnptr	OK	T0
+_atexit_b	A	stdlib.h arg0::block	OK	T0
+_bsearch	A	stdlib.h arg4:__compar:fnptr	OK	T0
+_bsearch_b	A	stdlib.h arg4:__compar:block	OK	T0
+_ccansikdf_x963	S	corecrypto/ccansikdf.h arg0:di:struct ccdigest_info.compress	OK	T0
+_cccbc_init	S	corecrypto/ccmode.h arg0:mode:struct ccmode_cbc.init	MISSING	T0
+_cccbc_one_shot	S	corecrypto/ccmode.h arg0:mode:struct ccmode_cbc.init	MISSING	T0
+_cccbc_set_iv	S	corecrypto/ccmode.h arg0:mode:struct ccmode_cbc.init	MISSING	T0
+_cccbc_update	S	corecrypto/ccmode.h arg0:mode:struct ccmode_cbc.init	MISSING	T0
+_cccurve25519_make_key_pair	S	corecrypto/ccec25519.h arg0:rng:struct ccrng_state.generate	OK	T0
+_ccdh_compute_shared_secret	S	corecrypto/ccdh.h arg4:rng:struct ccrng_state.generate	OK	T0
+_ccdh_generate_key	S	corecrypto/ccdh.h arg1:rng:struct ccrng_state.generate	OK	T0
+_ccdigest	S	corecrypto/ccdigest.h arg0:di:struct ccdigest_info.compress	OK	T0
+_ccdigest_init	S	corecrypto/ccdigest.h arg0:di:struct ccdigest_info.compress	OK	T0
+_ccdigest_update	S	corecrypto/ccdigest.h arg0:di:struct ccdigest_info.compress	OK	T0
+_ccec_compact_generate_key	S	corecrypto/ccec.h arg1:rng:struct ccrng_state.generate	OK	T0
+_ccec_generate_key	S	corecrypto/ccec.h arg1:rng:struct ccrng_state.generate	OK	T0
+_ccec_generate_key_deterministic	S	corecrypto/ccec.h arg3:arg3:struct ccrng_state.generate	OK	T0
+_ccec_generate_key_fips	S	corecrypto/ccec.h arg1:rng:struct ccrng_state.generate	OK	T0
+_ccec_rfc6637_wrap_key	S	corecrypto/ccec.h arg9:rng:struct ccrng_state.generate	OK	T0
+_ccec_sign	S	corecrypto/ccec.h arg5:rng:struct ccrng_state.generate	OK	T0
+_ccecb_one_shot	S	corecrypto/ccmode.h arg0:mode:struct ccmode_ecb.init	MISSING	T0
+_ccecdh_compute_shared_secret	S	corecrypto/ccec.h arg4:masking_rng:struct ccrng_state.generate	OK	T0
+_ccecies_encrypt_gcm_setup	S	corecrypto/ccecies.h arg1:di:struct ccdigest_info.compress;arg2:rng:struct ccrng_state.generate;arg3:aes_gcm_enc:struct ccmode_gcm.init	OK	T0
+_ccgcm_finalize	S	corecrypto/ccmode.h arg0:mode:struct ccmode_gcm.init	MISSING	T0
+_ccgcm_gmac	S	corecrypto/ccmode.h arg0:mode:struct ccmode_gcm.init	MISSING	T0
+_ccgcm_inc_iv	S	corecrypto/ccmode.h arg0:mode:struct ccmode_gcm.init	OK	T0
+_ccgcm_init_with_iv	S	corecrypto/ccmode.h arg0:mode:struct ccmode_gcm.init	OK	T0
+_ccgcm_one_shot	S	corecrypto/ccmode.h arg0:mode:struct ccmode_gcm.init	OK	T0
+_ccgcm_reset	S	corecrypto/ccmode.h arg0:mode:struct ccmode_gcm.init	MISSING	T0
+_ccgcm_update	S	corecrypto/ccmode.h arg0:mode:struct ccmode_gcm.init	MISSING	T0
+_cchkdf	S	corecrypto/cchkdf.h arg0:di:struct ccdigest_info.compress	OK	T0
+_cchmac	S	corecrypto/cchmac.h arg0:di:struct ccdigest_info.compress	OK	T0
+_cchmac_final	S	corecrypto/cchmac.h arg0:di:struct ccdigest_info.compress	OK	T0
+_cchmac_init	S	corecrypto/cchmac.h arg0:di:struct ccdigest_info.compress	OK	T0
+_cchmac_update	S	corecrypto/cchmac.h arg0:di:struct ccdigest_info.compress	OK	T0
+_ccpbkdf2_hmac	S	corecrypto/ccpbkdf2.h arg0:di:struct ccdigest_info.compress	OK	T0
+_ccrsa_eme_pkcs1v15_encode	S	corecrypto/ccrsa_priv.h arg0:rng:struct ccrng_state.generate	OK	T0
+_ccrsa_emsa_pss_decode	S	corecrypto/ccrsa_priv.h arg0:di1:struct ccdigest_info.compress;arg1:di2:struct ccdigest_info.compress	OK	T0
+_ccrsa_emsa_pss_encode	S	corecrypto/ccrsa_priv.h arg0:di1:struct ccdigest_info.compress;arg1:di2:struct ccdigest_info.compress	OK	T0
+_ccrsa_generate_fips186_key	S	corecrypto/ccrsa.h arg4:rng1:struct ccrng_state.generate;arg5:rng2:struct ccrng_state.generate	OK	T0
+_ccrsa_oaep_decode	S	corecrypto/ccrsa_priv.h arg0:di:struct ccdigest_info.compress	MISSING	T0
+_ccrsa_oaep_encode	S	corecrypto/ccrsa_priv.h arg0:di:struct ccdigest_info.compress;arg1:rng:struct ccrng_state.generate	MISSING	T0
+_dispatch_after	A	dispatch/queue.h arg2:block:block	OK	T0
+_dispatch_after_f	A	dispatch/queue.h arg3:work:fnptr	OK	T0
+_dispatch_apply	A	dispatch/queue.h arg2:block:block	OK	T0
+_dispatch_apply_f	A	dispatch/queue.h arg3:work:fnptr	OK	T0
+_dispatch_async	A	dispatch/queue.h arg1:block:block	OK	T0
+_dispatch_async_and_wait	A	dispatch/queue.h arg1:block:block	OK	T0
+_dispatch_async_f	A	dispatch/queue.h arg2:work:fnptr	OK	T0
+_dispatch_barrier_async	A	dispatch/queue.h arg1:block:block	OK	T0
+_dispatch_barrier_sync	A	dispatch/queue.h arg1:block:block	OK	T0
+_dispatch_block_cancel	A	dispatch/block.h arg0:block:block	OK	T0
+_dispatch_block_create	A	dispatch/block.h arg1:block:block	OK	T0
+_dispatch_block_create_with_qos_class	A	dispatch/block.h arg3:block:block	OK	T0
+_dispatch_block_notify	A	dispatch/block.h arg0:block:block;arg2:notification_block:block	OK	T0
+_dispatch_block_testcancel	A	dispatch/block.h arg0:block:block	OK	T0
+_dispatch_block_wait	A	dispatch/block.h arg0:block:block	OK	T0
+_dispatch_data_apply	A	dispatch/data.h arg1:applier:block	OK	T0
+_dispatch_data_create	A	dispatch/data.h arg3:destructor:block	OK	T0
+_dispatch_group_async	A	dispatch/group.h arg2:block:block	OK	T0
+_dispatch_group_async_f	A	dispatch/group.h arg3:work:fnptr	OK	T0
+_dispatch_group_notify	A	dispatch/group.h arg2:block:block	OK	T0
+_dispatch_io_barrier	A	dispatch/io.h arg1:barrier:block	OK	T0
+_dispatch_io_create	A	dispatch/io.h arg3:cleanup_handler:block	OK	T0
+_dispatch_io_create_with_io	A	dispatch/io.h arg3:cleanup_handler:block	OK	T0
+_dispatch_io_create_with_path	A	dispatch/io.h arg5:cleanup_handler:block	OK	T0
+_dispatch_io_read	A	dispatch/io.h arg4:io_handler:block	OK	T0
+_dispatch_io_write	A	dispatch/io.h arg4:io_handler:block	OK	T0
+_dispatch_mach_create	A	dispatch/mach_private.h arg2:handler:block	OK	T0
+_dispatch_mach_create_f	A	dispatch/mach_private.h arg3:handler:fnptr	OK	T0
+_dispatch_mach_mig_demux	S	dispatch/mach_private.h arg1:subsystems:struct mig_subsystem.server	OK	T0
+_dispatch_mig_server	A	dispatch/source_private.h arg2:callback:fnptr	OK	T0
+_dispatch_once	A	dispatch/once.h arg1:block:block	OK	T0
+_dispatch_once_f	A	dispatch/once.h arg2:function:fnptr	OK	T0
+_dispatch_queue_set_specific	A	dispatch/queue.h arg3:destructor:fnptr	OK	T0
+_dispatch_read	A	dispatch/io.h arg3:handler:block	OK	T0
+_dispatch_set_finalizer_f	A	dispatch/object.h arg1:finalizer:fnptr	OK	T0
+_dispatch_source_set_cancel_handler	A	dispatch/source.h arg1:handler:block	OK	T0
+_dispatch_source_set_cancel_handler_f	A	dispatch/source.h arg1:handler:fnptr	OK	T0
+_dispatch_source_set_event_handler	A	dispatch/source.h arg1:handler:block	OK	T0
+_dispatch_source_set_event_handler_f	A	dispatch/source.h arg1:handler:fnptr	OK	T0
+_dispatch_source_set_registration_handler	A	dispatch/source.h arg1:handler:block	OK	T0
+_dispatch_sync	A	dispatch/queue.h arg1:block:block	OK	T0
+_dispatch_sync_f	A	dispatch/queue.h arg2:work:fnptr	OK	T0
+_dispatch_write	A	dispatch/io.h arg3:handler:block	OK	T0
+_dyld_get_image_versions	A	mach-o/dyld_priv.h arg1:callback:block	OK	T0
+_fts_children	S	fts.h arg0::struct union (anonymous at <sdk>/usr/include/fts.h:81:2).fts_compar	OK	T0
+_fts_close	S	fts.h arg0::struct union (anonymous at <sdk>/usr/include/fts.h:81:2).fts_compar	OK	T0
+_fts_open	A	fts.h arg2::fnptr	OK	T0
+_fts_read	S	fts.h arg0::struct union (anonymous at <sdk>/usr/include/fts.h:81:2).fts_compar	OK	T0
+_fts_set	S	fts.h arg0::struct union (anonymous at <sdk>/usr/include/fts.h:81:2).fts_compar	OK	T0
+_funopen	A	stdio.h arg1::fnptr;arg2::fnptr;arg3::fnptr;arg4::fnptr	OK	T0
+_getaddrinfo_async_start	A	netdb_async.h arg4:callback:fnptr	OK	T0
+_getnameinfo_async_start	A	netdb_async.h arg4:callback:fnptr	OK	T0
+_glob	A	glob.h arg2::fnptr	OK	T0
+_globfree	S	glob.h arg0::struct union (anonymous at <sdk>/usr/include/glob.h:56:2).gl_errfunc	OK	T0
+_kxld_create_context	A	kxld.h arg1:allocate_callback:fnptr;arg2:log_callback:fnptr	MISSING	T0
+_mach_msg_server_once	A	mach/mach.h arg0:demux:fnptr	OK	sweep
+_malloc_destroy_zone	S	malloc/malloc.h arg0:zone:struct _malloc_zone_t.size	OK	T0
+_malloc_get_zone_name	S	malloc/malloc.h arg0:zone:struct _malloc_zone_t.size	OK	T0
+_malloc_set_zone_name	S	malloc/malloc.h arg0:zone:struct _malloc_zone_t.size	OK	T0
+_malloc_zone_free	S	malloc/malloc.h arg0:zone:struct _malloc_zone_t.size	OK	T0
+_mergesort	A	stdlib.h arg3:__compar:fnptr	OK	T0
+_mergesort_b	A	stdlib.h arg3:__compar:block	OK	T0
+_notify_register_dispatch	A	notify.h arg3:handler:block	OK	T0
+_os_workgroup_set_working_arena	A	os/workgroup_object.h arg3:destructor:fnptr	OK	T0
+_psort_r	A	stdlib.h arg4:__compar:fnptr	OK	T0
+_pthread_atfork	A	pthread.h arg0::fnptr;arg1::fnptr;arg2::fnptr	OK	T0
+_pthread_create	A	pthread.h arg2::fnptr	OK	T0
+_pthread_key_create	A	pthread.h arg1::fnptr	OK	T0
+_pthread_key_init_np	A	pthread/tsd_private.h arg1::fnptr	OK	T0
+_pthread_once	A	pthread.h arg1::fnptr	OK	T0
+_qsort	A	stdlib.h arg3:__compar:fnptr	OK	T0
+_qsort_b	A	stdlib.h arg3:__compar:block	OK	T0
+_qsort_r	A	stdlib.h arg4:__compar:fnptr	OK	T0
+_rb_tree_init	S	sys/rbtree.h arg1::struct rb_tree_ops_t.rbto_compare_nodes	OK	T0
+_scandir	A	dirent.h arg2::fnptr;arg3::fnptr	OK	T0
+_sigaction	S	signal.h arg1::struct __sigaction_u.__sa_handler;arg2::struct __sigaction_u.__sa_handler	OK	T0
+_signal	A	sys/signal.h arg1::fnptr	OK	T0
+_xpc_activity_register	A	xpc/activity.h arg2:handler:block	OK	T0
+_xpc_array_apply	A	xpc/xpc.h arg1:applier:block	OK	T0
+_xpc_connection_send_message_with_reply	A	xpc/connection.h arg3:handler:block	OK	T0
+_xpc_connection_set_event_handler	A	xpc/connection.h arg1:handler:block	OK	T0
+_xpc_connection_set_finalizer_f	A	xpc/connection.h arg1:finalizer:fnptr	OK	T0
+_xpc_dictionary_apply	A	xpc/xpc.h arg1:applier:block	OK	T0
+_xpc_dictionary_handoff_reply	A	xpc/private.h arg2:block:block	OK	T0
+_xpc_main	A	xpc/xpc.h arg0:handler:fnptr	OK	T0
+___cxa_throw	A	cxxabi.h arg2:dest:fnptr	OK	libcxxabi
+___cxa_thread_atexit	A	cxxabi.h arg0::fnptr	OK	libcxxabi
+_heapsort	A	stdlib.h arg3:compar:fnptr	OK	sdk
+_psort	A	stdlib.h arg3:compar:fnptr	OK	sdk
+_heapsort_b	A	stdlib.h arg3:compar:block	OK	sdk
+_psort_b	A	stdlib.h arg3:compar:block	OK	sdk
+_tsearch	A	search.h arg2::fnptr	OK	sdk
+_tfind	A	search.h arg2::fnptr	OK	sdk
+_tdelete	A	search.h arg2::fnptr	OK	sdk
+_twalk	A	search.h arg1::fnptr	OK	sdk
+_lfind	A	search.h arg4::fnptr	OK	sdk
+_lsearch	A	search.h arg4::fnptr	OK	sdk
+_ftw	A	ftw.h arg1::fnptr	OK	sdk
+_nftw	A	ftw.h arg1::fnptr	OK	sdk
+_dispatch_barrier_async_f	A	dispatch/queue.h arg2:work:fnptr	OK	sdk
+_dispatch_barrier_sync_f	A	dispatch/queue.h arg2:work:fnptr	OK	sdk
+_dispatch_async_and_wait_f	A	dispatch/queue.h arg2:work:fnptr	OK	sdk
+_dispatch_group_notify_f	A	dispatch/group.h arg3:work:fnptr	OK	sdk
+_sigset	R	signal.h returns a handler (SIG_HOLD)	OK	sdk
+_objc_retainBlock	R	objc/objc-abi.h returns a block	OK	sdk

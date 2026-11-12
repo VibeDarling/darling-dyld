@@ -7,6 +7,7 @@ ruby tests/check-tlv-cache-gate.rb
 ruby tests/check-tlv-normalize.rb
 ruby tests/check-tlv-storage.rb
 ruby tests/check-tlv-allocation.rb
+ruby tests/check-tlv-thunk-signing.rb
 ```
 
 These extract the actual helpers/allocator from the source. They check cache
@@ -15,6 +16,12 @@ section extents and zero-based templates; and builder-shaped positive, negative
 and zero initial-content deltas with real pthread isolation. They do not execute
 the Mach-O loader. The initializer's existing load-command traversal is not made
 into a general malformed-image validator by the bounded span helper.
+
+`check-tlv-thunk-signing.rb` is the exception to "does not execute": it needs an ARM64 Linux host with pointer
+authentication and runs the extracted thunk selection and descriptor initializer natively. An arm64e image calls a
+descriptor's thunk with `blraaz` (key IA, discriminator 0), and its linker leaves only a plain bind of `_tlv_bootstrap` in
+the slot, so libdyld signs the thunk it stores for an arm64e image and stores `tlv_get_addr` as before for every other
+one. The test executes the arm64e call sequence against what was stored, and its probes mutate the extracted code.
 
 `tlv-guest.c` is a standalone Darling guest fixture for ordinary compiler-generated
 TLS. Build it with the Darling SDK and link libSystem. It verifies initialized

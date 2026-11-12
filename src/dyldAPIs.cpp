@@ -54,14 +54,20 @@
 #include "dyld2.h"
 #include "dyldLibSystemInterface.h"
 #include "DyldSharedCache.h"
+#include "objc-shared-cache.h"
+#include "ObjCSectionInfo.h"
 #include "MachOFile.h"
+#ifdef DARLING
+#include "DarlingArm64eAdapters.h"
+#include "DarlingObjCCallbacks.h"
+#endif
 
 #undef _POSIX_C_SOURCE
 #include <dlfcn.h>
 
 #if __has_feature(ptrauth_calls)
 	#define DARLING_DLSYM_SIGN(p) __builtin_ptrauth_sign_unauthenticated(p, ptrauth_key_asia, 0)
-	#define DARLING_DLSYM_SIGN_FOR_CALLER(p, callerAddress) DARLING_DLSYM_SIGN(p)
+	#define DARLING_DLSYM_SIGN_FOR_CALLER(p, callerAddress, machoName) DARLING_DLSYM_SIGN(p)
 #elif defined(DARLING) && defined(__arm64__) && defined(__LP64__)
 	// DARLING arm64e compat: arm64e code calls dlsym results with BLRAA (IA key, zero discriminator), so sign
 	// them with the same software PAC helper dyld uses for chained fixups.
@@ -70,14 +76,18 @@
 	// Darling's own libraries are plain arm64 even in an arm64e process, and call a dlsym result with a
 	// plain BLR, which faults on a signed pointer. So only sign for callers in arm64e images; code outside
 	// any Mach-O image (e.g. Darling's ELF side) gets the plain pointer too.
-	static void* darlingDlsymSignForCaller(void* result, void* callerAddress)
+	static void* darlingDlsymSignForCaller(void* result, void* callerAddress, const char* machoName)
 	{
 		const ImageLoader* callerImage = dyld::findImageContainingAddress(callerAddress);
-		if ( (callerImage == NULL) || ((callerImage->machHeader()->cpusubtype & ~CPU_SUBTYPE_MASK) != CPU_SUBTYPE_ARM64E) )
+		if ( (callerImage == NULL) || !dyld3::darling::cpusubtypeIsArm64e(callerImage->machHeader()->cpusubtype) )
 			return result;
+		// a callback-taking export of a plain image is handed out as the thunk that authenticates the caller's signatures
+		const ImageLoader* resultImage = dyld::findImageContainingAddress(result);
+		if ( resultImage != NULL )
+			result = (void*)dyld3::darling::adaptedTarget(machoName, (uint64_t)result, dyld3::darling::cpusubtypeIsArm64e(resultImage->machHeader()->cpusubtype));
 		return DARLING_DLSYM_SIGN(result);
 	}
-	#define DARLING_DLSYM_SIGN_FOR_CALLER(p, callerAddress) darlingDlsymSignForCaller(p, callerAddress)
+	#define DARLING_DLSYM_SIGN_FOR_CALLER(p, callerAddress, machoName) darlingDlsymSignForCaller(p, callerAddress, machoName)
 #endif
 
 #if __has_feature(ptrauth_calls)
@@ -208,6 +218,7 @@ static const struct dyld_func dyld_funcs[] = {
     {"__dyld_dlopen_preflight",							(void*)dlopen_preflight_compat },
 	{"__dyld_image_count",								(void*)_dyld_image_count },
     {"__dyld_get_image_header",							(void*)_dyld_get_image_header },
+    {"__dyld_get_dlopen_image_header",					(void*)_dyld_get_dlopen_image_header },
     {"__dyld_get_image_vmaddr_slide",					(void*)_dyld_get_image_vmaddr_slide },
     {"__dyld_get_image_name",							(void*)_dyld_get_image_name },
     {"__dyld_get_image_slide",							(void*)_dyld_get_image_slide },
@@ -234,6 +245,13 @@ static const struct dyld_func dyld_funcs[] = {
     {"__dyld_get_image_header_containing_address",		(void*)dyld_image_header_containing_address },
     {"__dyld_is_memory_immutable",						(void*)_dyld_is_memory_immutable },
     {"__dyld_objc_notify_register",						(void*)_dyld_objc_notify_register },
+    {"__dyld_objc_register_callbacks",					(void*)_dyld_objc_register_callbacks },
+    {"__dyld_for_objc_header_opt_ro",					(void*)_dyld_for_objc_header_opt_ro },
+    {"__dyld_for_objc_header_opt_rw",					(void*)_dyld_for_objc_header_opt_rw },
+    {"__dyld_objc_class_count",							(void*)_dyld_objc_class_count },
+    {"__dyld_lookup_section_info",						(void*)_dyld_lookup_section_info },
+    {"__dyld_for_each_objc_class",						(void*)_dyld_for_each_objc_class },
+    {"__dyld_for_each_objc_protocol",					(void*)_dyld_for_each_objc_protocol },
     {"__dyld_get_shared_cache_uuid",					(void*)_dyld_get_shared_cache_uuid },
     {"__dyld_get_shared_cache_range",					(void*)_dyld_get_shared_cache_range },
     {"__dyld_images_for_addresses",						(void*)_dyld_images_for_addresses },
@@ -405,6 +423,26 @@ const struct mach_header* _dyld_get_image_header(uint32_t image_index)
 	if ( dyld::gLogAPIs )
 		dyld::log("%s(%u)\n", __func__, image_index);
 	return allImagesIndexedMachHeader(image_index);
+}
+
+// RTLD_SELF is answered in libdyld, which still sees its caller's return address; this side never sees it.
+const struct mach_header* _dyld_get_dlopen_image_header(void* handle)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s(%p)\n", __func__, handle);
+
+	if ( handle == RTLD_MAIN_ONLY )
+		return dyld::mainExecutable()->machHeader();
+	if ( (handle == RTLD_DEFAULT) || (handle == RTLD_NEXT) || (handle == RTLD_SELF) )
+		return NULL;
+#if SUPPORT_ACCELERATE_TABLES
+	if ( dyld::isCacheHandle(handle) )
+		return dyld::cacheImageMachHeader(handle);
+#endif
+	ImageLoader* image = (ImageLoader*)(((uintptr_t)handle) & (-4));	// clear mode bits
+	if ( dyld::validImage(image) )
+		return image->machHeader();
+	return NULL;
 }
 
 intptr_t _dyld_get_image_vmaddr_slide(uint32_t image_index)
@@ -1901,7 +1939,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress);
+					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress, underscoredName);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -1935,7 +1973,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress);
+					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress, underscoredName);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -1981,7 +2019,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress);
+					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress, underscoredName);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -2026,7 +2064,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress);
+					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress, underscoredName);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -2077,7 +2115,7 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
 				}
 				const macho_section *sect = symbolImage ? symbolImage->findSection(result) : NULL;
 				if ( sect && ((sect->flags & S_ATTR_PURE_INSTRUCTIONS) || (sect->flags & S_ATTR_SOME_INSTRUCTIONS)) )
-					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress);
+					result = DARLING_DLSYM_SIGN_FOR_CALLER(result, callerAddress, underscoredName);
 			}
 #endif
 			if ( dyld::gLogAPIs )
@@ -2250,6 +2288,58 @@ void _dyld_objc_notify_register(_dyld_objc_notify_mapped    mapped,
 	dyld::registerObjCNotifiers(mapped, init, unmapped);
 }
 
+// The block a v3/v4 mapped callback is handed, called when libobjc makes a cache image's data mutable
+// before remapping a class or protocol reference. The cache runtime maps each mapping with the cache
+// header's protections, and the data mapping's include write (dyld3/SharedCacheRuntime.cpp:601, :634), so
+// there is nothing to change; the line, under DYLD_PRINT_OBJC_NOTIFICATIONS, is the guest evidence that libobjc asked.
+static void markImageMutableImpl(void*, uint32_t objcImageIndex)
+{
+	if ( dyld::gLogObjCNotifications )
+		dyld::log("dyld: objc mark_image_mutable index=%u\n", objcImageIndex);
+}
+
+static void logObjCSkip(const char* format, const char* path)
+{
+	dyld::log(format, path);
+}
+
+static void logObjCRegistered(unsigned version)
+{
+	dyld::log("dyld: objc register_callbacks version=%u\n", version);
+}
+
+static void logObjCDelivered(const char* kind, const char* path, unsigned refsOptimized)
+{
+	dyld::log("dyld: objc %s %s refs_optimized=%u\n", kind, path, refsOptimized);
+}
+
+// Whether the registering runtime is the cache's, from the image holding its mapped callback. Latched once
+// before the mapped replay, which reaches the table SPIs; a plain bool needs no lock for that. The lookup
+// reads dyld's lock-free mapped-range table, so it can run inside the notification lock.
+static void latchObjCRuntime(const void* mappedCallback)
+{
+	const ImageLoader* image = (mappedCallback != nullptr) ? dyld::findImageContainingAddress(mappedCallback) : nullptr;
+	dyld::gObjCRuntimeIsSharedCache = (image != nullptr) && image->inSharedCache();
+}
+
+void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s(%p)\n", __func__, callbacks);
+
+	dyld3::darling::ObjCCallbackState& state = dyld3::darling::objcCallbackState();
+	state.markImageMutableInvoke = markImageMutableImpl;
+	if ( dyld::gLogObjCNotifications ) {
+		state.logSkip = logObjCSkip;
+		state.logRegistered = logObjCRegistered;
+		state.logDelivered = logObjCDelivered;
+	}
+	if ( !state.registerCallbacks(callbacks) )
+		dyld::halt(state.error);
+	latchObjCRuntime((state.version >= 3) ? (const void*)state.mapped3 : (const void*)state.mapped2);
+	dyld::registerObjCNotifiers(dyld3::darling::objcMappedThunk, dyld3::darling::objcInitThunk, dyld3::darling::objcUnmappedThunk);
+}
+
 
 bool _dyld_get_shared_cache_uuid(uuid_t uuid)
 {
@@ -2260,12 +2350,141 @@ const void* _dyld_get_shared_cache_range(size_t* length)
 {
     const DyldSharedCache* cache = (DyldSharedCache*)dyld::imMemorySharedCacheHeader();
     if ( cache != nullptr ) {
-        const dyld_cache_mapping_info* const mappings = (dyld_cache_mapping_info*)((char*)cache + cache->header.mappingOffset);
-		const dyld_cache_mapping_info* lastMapping = &mappings[cache->header.mappingCount - 1];
-        *length = (size_t)((lastMapping->address + lastMapping->size) - cache->unslidLoadAddress());
+        *length = (size_t)cache->mappedSize();
         return cache;
     }
 	return nullptr;
+}
+
+// The dyld executable has no dyld3/APIs.cpp, so it needs its own copies of these four; libdyld's live in
+// dyld3/APIs.cpp. Both answer from the cache the same way.
+// The cache holds objc tables for its own libobjc only; a disk libobjc, or none registered yet, gets no cache.
+static const DyldSharedCache* objcRuntimeCache()
+{
+	if ( !dyld::gObjCRuntimeIsSharedCache )
+		return nullptr;
+	return (const DyldSharedCache*)dyld::imMemorySharedCacheHeader();
+}
+
+static const objc_opt::objc_opt_t* inMemoryObjCOpt()
+{
+	const DyldSharedCache* cache = objcRuntimeCache();
+	return (cache != nullptr) ? cache->objcOpt() : nullptr;
+}
+
+const void* _dyld_for_objc_header_opt_ro(void)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s()\n", __func__);
+	const objc_opt::objc_opt_t* opt = inMemoryObjCOpt();
+	return (opt != nullptr) ? opt->headeropt_ro() : nullptr;
+}
+
+void* _dyld_for_objc_header_opt_rw(void)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s()\n", __func__);
+	const objc_opt::objc_opt_t* opt = inMemoryObjCOpt();
+	return (opt != nullptr) ? opt->headeropt_rw() : nullptr;
+}
+
+uint32_t _dyld_objc_class_count(void)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s()\n", __func__);
+	const objc_opt::objc_opt_t* opt = inMemoryObjCOpt();
+	if ( opt == nullptr )
+		return 0;
+	const objc::ClassHashTable* classes = opt->classOpt();
+	return (classes != nullptr) ? classes->classCount() : 0;
+}
+
+struct _dyld_section_info_result _dyld_lookup_section_info(const struct mach_header* mh,
+														   _dyld_section_location_info_t locationHandle,
+														   enum _dyld_section_location_kind kind)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s()\n", __func__);
+	(void)locationHandle;
+	return lookupObjCSectionInfo(mh, kind);
+}
+
+// libobjc asks for every implementation of a class or protocol name. The cache's version-16 tables hold
+// each implementation's offset from the cache base and the index of the image that defines it; the
+// headeropt rw table holds whether libobjc has mapped that image yet.
+static void forEachObjCName(const char* name,
+							void (^callback)(void* objectPtr, bool isLoaded, bool* stop),
+							bool protocols)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s(%s)\n", protocols ? "_dyld_for_each_objc_protocol" : "_dyld_for_each_objc_class", name);
+	const DyldSharedCache* cache = objcRuntimeCache();
+	const objc_opt::objc_opt_t* opt = (cache != nullptr) ? cache->objcOpt() : nullptr;
+	if ( opt == nullptr )
+		return;
+	const objc_opt::objc_headeropt_rw_t* images = opt->headeropt_rw();
+	const uint8_t* cacheBase = (const uint8_t*)cache;
+	// Cache content is chosen by the environment, so the rw table and each object offset must land in a
+	// mapped region, not merely inside the span those regions cover: the split runtime leaves the rest of
+	// that span PROT_NONE, and mappedSize() covers all of it. forEachRegion reports unslid mapping addresses,
+	// so an offset from the cache base is applied to the first mapping's address. The range [offset,
+	// offset + length) must lie inside one region.
+	auto inMappedRegion = [cache](uint64_t cacheOffset, uint64_t length) {
+		struct Lookup { uint64_t firstAddress; uint64_t offset; uint64_t length; bool sawFirst; bool inside; };
+		Lookup lookup = { 0, cacheOffset, length, false, false };
+		Lookup* p = &lookup;
+		cache->forEachRegion(^(const void* content, uint64_t vmAddr, uint64_t size, uint32_t initProt, uint32_t maxProt, uint64_t flags) {
+			if ( !p->sawFirst ) {
+				p->firstAddress = vmAddr;
+				p->sawFirst = true;
+			}
+			const uint64_t address = p->firstAddress + p->offset;
+			if ( (address >= vmAddr) && (address - vmAddr < size) && (p->length <= size - (address - vmAddr)) )
+				p->inside = true;
+		});
+		return lookup.inside;
+	};
+	// A null or absent table lies below the cache: its offset wraps to a value below the first mapping, which
+	// no region holds. A count that would place entries past the end of its region is rejected the same way,
+	// which is what keeps isLoaded() from reading unmapped memory. The header check comes first because it is
+	// what makes the read of count safe.
+	const uint64_t tableOffset = (uint64_t)(uintptr_t)images - (uint64_t)(uintptr_t)cacheBase;
+	const uint64_t headerSize  = offsetof(objc_opt::objc_headeropt_rw_t, headers);
+	if ( !inMappedRegion(tableOffset, headerSize) )
+		return;
+	if ( !inMappedRegion(tableOffset, headerSize + (uint64_t)images->count * images->entsize) )
+		return;
+	auto visit = [callback, cacheBase, images, &inMappedRegion](uint64_t objectCacheOffset, uint16_t dylibObjCIndex, bool& stopObjects) {
+		// The offset is cache content as well; an entry outside the mapped regions names no object.
+		if ( !inMappedRegion(objectCacheOffset, 1) )
+			return;
+		bool stop = false;
+		bool isLoaded = images->isLoaded(dylibObjCIndex);
+		dyld3::darling::callObjCEnumerationBlock(callback, (void*)(cacheBase + objectCacheOffset), isLoaded, &stop);
+		stopObjects = stop;
+	};
+	if ( protocols ) {
+		const objc::ProtocolHashTable* table = opt->protocolOpt();
+		if ( table != nullptr )
+			table->forEachProtocol(name, visit);
+	}
+	else {
+		const objc::ClassHashTable* table = opt->classOpt();
+		if ( table != nullptr )
+			table->forEachClass(name, visit);
+	}
+}
+
+void _dyld_for_each_objc_class(const char* className,
+							   void (^callback)(void* classPtr, bool isLoaded, bool* stop))
+{
+	forEachObjCName(className, callback, false);
+}
+
+void _dyld_for_each_objc_protocol(const char* protocolName,
+								  void (^callback)(void* protocolPtr, bool isLoaded, bool* stop))
+{
+	forEachObjCName(protocolName, callback, true);
 }
 
 void _dyld_images_for_addresses(unsigned count, const void* addresses[], struct dyld_image_uuid_offset infos[])
