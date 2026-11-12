@@ -312,6 +312,17 @@ OVERRIDE_MAIN = <<~CPP
     DyldSharedCache::PatchOverrideStats s3;
     CHECK(cache->overridePatchGotSlots(1, resolver, nullptr, nullptr, &s3) == nullptr && s3.alreadyApplied && s3.plainSlots == 0 && lookups == lookupsBefore);
     CHECK(snapshot(f).words == after2.words);
+    // The exporter's tables were checked, plain part included, on the first call: a dlopen that brings a client does not check them again (the
+    // damage here is in a client that is not patched, which only a check of the whole plain table would find).
+    {
+      const Plain &victim = f.plain[firstPlainOf(f, 1)];                                        // exporter 1, client 3
+      const uint64_t record = plainLocationRecord(f, victim);
+      uint32_t saved; memcpy(&saved, (void *)record, 4);
+      poke(record, 4, 0x7fff0000u);
+      DyldSharedCache::PatchOverrideStats again;
+      CHECK(cache->overridePatchGotSlots(1, resolver, late, nullptr, &again) == nullptr && again.alreadyApplied && again.plainSlots == 2);
+      poke(record, 4, saved);
+    }
     // 3. a stand-in that appears after client 3 ran: its GOT is done, client 3 keeps the cache's pointers and is counted, client 2 (new) is patched
     DyldSharedCache::PatchOverrideStats s4;
     CHECK(cache->overridePatchGotSlots(2, resolver, late, nullptr, &s4) == nullptr);

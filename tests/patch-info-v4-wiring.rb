@@ -94,6 +94,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       const char *error = nullptr;                 // what overridePatchGotSlots returns for index 2
       bool hasPatchInfoV4() const { return patchInfo; }
       const char *getIndexedImagePath(uint32_t i) const { return images[i].c_str(); }
+      bool patchOverrideDone(uint32_t index) const { return applied.count(index) != 0; }
       bool findMachHeaderImageIndex(const mach_header *mh, uint32_t &index) const { index = mh->cacheIndex; return true; }
       // Every image of the cache is a client of every exporter, with one plain location per symbol. Symbols the exporter has in its GOT: two the loaded
       // image defines and one it does not; index 4 has two unexplained slots, and index 5 only a refused plain location, per client to patch.
@@ -104,7 +105,8 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
         if (wasApplied) { s->alreadyApplied = true; if (!clientAction) return nullptr; }
         else { if (index == 2 && error) return error; applied.insert(index); }
         uint64_t patchClients = 0;
-        if (clientAction) for (uint32_t c = 0; c < images.size(); ++c) { const int a = clientAction(c); patchClients += a == kPlainClientPatch; if (a == kPlainClientRunning && !wasApplied) ++s->plainClientsRunning; }
+        if (clientAction) for (uint32_t c = 0; c < images.size(); ++c) { const int a = clientAction(c); if (a == kPlainClientPatch) { ++patchClients; thunk[c] = 0xB007; }   // a plain location of a TLV descriptor: the stand-in's _tlv_bootstrap
+           if (a == kPlainClientRunning && !wasApplied) ++s->plainClientsRunning; }
         patchedClients.push_back(patchClients);
         if (index == 5) { if (!wasApplied) { s->exports = 1; s->slots = 1; s->patched = 1; } s->plainSlots = 2 * patchClients; s->plainPatched = patchClients; s->plainUnexplained = patchClients; return nullptr; }
         if (index == 4) { if (!wasApplied) { s->exports = 1; s->slots = 2; s->unexplained = 2; } s->plainSlots = patchClients; s->plainUnexplained = patchClients; return nullptr; }
@@ -120,11 +122,11 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
         }
         return nullptr;
       }
-      std::vector<std::string> moreNames; mutable std::map<std::string, uint64_t> lastAddress; mutable std::vector<bool> logOn, actionNull; mutable std::vector<uint64_t> patchedClients; std::set<std::string> classNames;   // the symbols the cache has as kind 8 exports
+      std::vector<std::string> moreNames; mutable std::map<std::string, uint64_t> lastAddress; mutable std::map<uint32_t, uint64_t> thunk; mutable std::vector<bool> logOn, actionNull; mutable std::vector<uint64_t> patchedClients; std::set<std::string> classNames;   // the symbols the cache has as kind 8 exports
     };
     struct ImageLoader {
       struct LinkContext { bool verboseMapping = false; bool linkingMainExecutable = false; };
-      std::string install, path; bool inCache = false; mach_header header = {1}; std::map<std::string, uintptr_t> exports; std::map<std::string, const ImageLoader*> reexportedFrom; std::vector<const ImageLoader*> reExports;
+      std::string install, path; bool inCache = false, notified = false; mach_header header = {1}; std::map<std::string, uintptr_t> exports; std::map<std::string, const ImageLoader*> reexportedFrom; std::vector<const ImageLoader*> reExports;
       bool bound = true; std::map<std::string, std::pair<uintptr_t, uintptr_t>> resolvers; mutable unsigned resolverRuns = 0, resolverFaults = 0, stubLookups = 0;   // stub-and-resolver exports: {stub, resolver's result}
       const char *getInstallPath() const { return install.c_str(); }
       const char *getPath() const { return path.c_str(); }
@@ -160,6 +162,21 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       const char *mkstringf(const char *format, ...) { static char buffer[512]; va_list a; va_start(a, format); vsnprintf(buffer, sizeof buffer, format, a); va_end(a); return buffer; }
       void halt(const char *message) { throw std::runtime_error(message); }
       #{override_fn}
+      // The bound notification: the add-image callbacks run for every cache image that has not been notified yet. libdyld's (a disk-served stand-in)
+      // is tlv_initialize_descriptors, which stores signed tlv_get_addr in the thunk of each new image's TLV descriptors.
+      enum dyld_image_states { dyld_image_state_bound = 60 };
+      static std::vector<bool> callbackSawPlainPatched; static DyldSharedCache *notifyCache = nullptr; static bool addImageCallbackRegistered = false;
+      static void notifyBatchPartial(dyld_image_states state, bool, void*, bool, bool) {
+        if (state != dyld_image_state_bound || !addImageCallbackRegistered) return;
+        for (ImageLoader *i : sAllImages) {
+          if (!i->inSharedCache() || i->notified) continue;
+          i->notified = true;
+          callbackSawPlainPatched.push_back(notifyCache->thunk[i->header.cacheIndex] == 0xB007);
+          notifyCache->thunk[i->header.cacheIndex] = 0xC0DE;
+        }
+      }
+      #define DARLING 1
+      #{notify_fn}
     }
     using namespace dyld;
 
@@ -170,7 +187,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     }
     // a disk image standing in for cache image `index`, as loadPhase5 records it
     static void shadow(const char *install, uint32_t index) { ImageLoader *i = image(install); sAllImages.push_back(i); sDiskOverridesOfCacheImages.push_back({i, index}); }
-    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); cache.lastAddress.clear(); cache.logOn.clear(); cache.actionNull.clear(); cache.patchedClients.clear(); sCacheImagesSeen.clear(); sCacheExportersDone.clear(); cache.classNames.clear(); cache.moreNames.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
+    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); sCacheImagesSeen.clear(); cache.lastAddress.clear(); cache.logOn.clear(); cache.actionNull.clear(); cache.patchedClients.clear(); cache.thunk.clear(); sCacheImagesSeen.clear(); cache.classNames.clear(); cache.moreNames.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
     static unsigned summaries() { unsigned n = 0; for (const std::string &l : logged) n += l.find("split cache GOT override: patched=") != std::string::npos; return n; }
 
     int main() {
@@ -232,10 +249,31 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       shadow("/usr/lib/system/libsystem_kernel.dylib", 1);
       sDiskOverridesOfCacheImages.pop_back(); sDiskOverridesOfCacheImages.erase(sDiskOverridesOfCacheImages.begin());   // keep only a new exporter: libSystem.B
       cache.applied.erase(0);
-      sCacheExportersDone[0] = false;
       overrideSplitCacheGotSlots();
       { unsigned running = 0; for (const std::string &l : logged) running += l.find("2 cache image(s) in the process have run already") != std::string::npos; CHECK(running == 1); }
       gLogCachePolicy = false;
+
+      // --- a dlopen: the override is done before the add-image callbacks run, so their writes to the cache images' data stand ---
+      // libdyld (stand-in) registered tlv_initialize_descriptors at launch, after the launch pass; a dlopen then loads a cache image with TLV descriptors
+      // (libsystem_c, index 2). The thunk of its descriptors must end as the callback's value, and the callback must have seen the override's value.
+      reset(cache); notifyCache = &cache; callbackSawPlainPatched.clear(); addImageCallbackRegistered = false;
+      sAllImages.push_back(image("/usr/lib/libz.1.dylib", true)); shadow("/usr/lib/system/libsystem_kernel.dylib", 1);
+      overrideSplitCacheGotSlots();                                       // the launch pass: libz is patched
+      CHECK(cache.thunk[3] == 0xB007);
+      addImageCallbackRegistered = true; notifyBatchPartial(dyld_image_state_bound, false, nullptr, false, false);   // libdyld's initializer registers the callback: it runs for libz
+      CHECK(cache.thunk[3] == 0xC0DE && callbackSawPlainPatched == std::vector<bool>{true});
+      cache.calls.clear(); callbackSawPlainPatched.clear();
+      gLinkContext.linkingMainExecutable = true;
+      notifyBatch(dyld_image_state_bound, false);                         // the launch: the main executable is still linking, nothing to do here
+      gLinkContext.linkingMainExecutable = false;
+      notifyBatch(dyld_image_state_bound, true);                          // a preflight does not bind anything
+      CHECK(cache.calls.empty());
+      sAllImages.push_back(image("/usr/lib/system/libsystem_c.dylib", true));
+      notifyBatch(dyld_image_state_bound, false);                         // what ImageLoader::link() sends when the dlopen's closure is bound
+      CHECK(cache.thunk[2] == 0xC0DE && callbackSawPlainPatched == std::vector<bool>{true});   // the callback saw the override's value and its own stands
+      CHECK(cache.thunk[3] == 0xC0DE);                                    // libz, which ran already, is not patched again
+      CHECK(logged.empty());
+      notifyCache = nullptr; addImageCallbackRegistered = false;
 
       // --- the verbose mapping option: one line per patched symbol and the summary; none without it ---
       reset(cache);
@@ -244,12 +282,12 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       sAllImages.push_back(kernel); sDiskOverridesOfCacheImages.push_back({kernel, 1});
       overrideSplitCacheGotSlots();
       CHECK(logged.empty() && cache.calls.size() == 1);
-      cache.applied.clear(); gLinkContext.verboseMapping = true;
+      cache.applied.clear(); sCacheImagesSeen.clear(); gLinkContext.verboseMapping = true;
       overrideSplitCacheGotSlots();
       unsigned patchedLines = 0; bool sawOpen = false;
       for (const std::string &l : logged) { patchedLines += l.rfind("dyld: patched ", 0) == 0; sawOpen |= l == "dyld: patched /usr/lib/system/libsystem_kernel.dylib _open -> /prefix/usr/lib/system/libsystem_kernel.dylib\\n"; }
       CHECK(patchedLines == 3 && sawOpen && summaries() == 1 && logged.size() == 4);
-      logged.clear(); cache.applied.clear(); kernel->exports.erase("_nosuchsymbol");
+      logged.clear(); cache.applied.clear(); sCacheImagesSeen.clear(); kernel->exports.erase("_nosuchsymbol");
       overrideSplitCacheGotSlots();
       bool sawMissing = false; patchedLines = 0;
       for (const std::string &l : logged) { sawMissing |= l.find("_nosuchsymbol") != std::string::npos && l.find("defines _nosuchsymbol") != std::string::npos; patchedLines += l.rfind("dyld: patched ", 0) == 0; }
@@ -284,7 +322,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       CHECK(cache.lastAddress.size() == 2 && cache.lastAddress["_open"] == 0x1000 && cache.lastAddress["_close"] == 0x2000);
       classCase(image("/usr/lib/system/libsystem_kernel.dylib"));          // a plain image's classes are not
       CHECK(cache.lastAddress.empty() && logged.empty());                  // the cache keeps its own, silently without the cache policy option
-      gLogCachePolicy = true; cache.applied.clear(); logged.clear();
+      gLogCachePolicy = true; cache.applied.clear(); sCacheImagesSeen.clear(); logged.clear();
       overrideSplitCacheGotSlots();
       CHECK(logged.size() == 3 && logged[0].find("class export of a non-arm64e image") != std::string::npos && logged[1].find("class export of a non-arm64e image") != std::string::npos);   // one line per held back class and one for the symbol nobody defines, no summary line
       gLogCachePolicy = false;
@@ -296,7 +334,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       ImageLoader *plainFacade = image("/usr/lib/system/libsystem_kernel.dylib"); plainFacade->reexportedFrom["_close"] = armDefiner;
       classCase(plainFacade);                                              // a plain substitute re-exporting an arm64e image's class: allowed (the definer counts)
       CHECK(cache.lastAddress.size() == 1 && cache.lastAddress["_close"] == 0x2000);
-      cache.classNames.clear(); cache.applied.clear();                     // a non-class export of a plain image is still overridden
+      cache.classNames.clear(); cache.applied.clear(); sCacheImagesSeen.clear();                     // a non-class export of a plain image is still overridden
       overrideSplitCacheGotSlots();
       CHECK(cache.lastAddress.size() == 2 && cache.lastAddress["_open"] == (0x1000 | dyld3::darling::kThunkBit));
 
@@ -326,18 +364,18 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       gLinkContext.verboseMapping = false;
       // the stand-in's own definition wins over a sibling's
       { ImageLoader *c = sibling("/usr/lib/system/libsystem_c.dylib", 0x5000); familyCase(nullptr, false, c, image("/usr/lib/system/libsystem_info.dylib"));
-        sAllImages.back()->exports["_close"] = 0x2222; cache.applied.clear(); cache.lastAddress.clear(); overrideSplitCacheGotSlots();
+        sAllImages.back()->exports["_close"] = 0x2222; cache.applied.clear(); sCacheImagesSeen.clear(); cache.lastAddress.clear(); overrideSplitCacheGotSlots();
         CHECK(cache.lastAddress["_close"] == (0x2222 | dyld3::darling::kThunkBit)); }
       // two siblings define the symbol: the first in the umbrella's re-export order wins, as in dyld's own override
       { familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000), image("/usr/lib/system/libsystem_info.dylib"));
         ImageLoader *umbrella = nullptr, *first = nullptr; for (ImageLoader *i : sAllImages) { if (i->install == "/usr/lib/libSystem.B.dylib") umbrella = i; if (i->install == "/usr/lib/system/libsystem_info.dylib") first = i; }
-        first->exports["_close"] = 0x6000; cache.applied.clear(); cache.lastAddress.clear(); overrideSplitCacheGotSlots();
+        first->exports["_close"] = 0x6000; cache.applied.clear(); sCacheImagesSeen.clear(); cache.lastAddress.clear(); overrideSplitCacheGotSlots();
         CHECK(cache.lastAddress["_close"] == (0x6000 | dyld3::darling::kThunkBit));              // libsystem_info is listed before libsystem_c
-        std::swap(umbrella->reExports[0], umbrella->reExports[2]); cache.applied.clear(); cache.lastAddress.clear(); overrideSplitCacheGotSlots();
+        std::swap(umbrella->reExports[0], umbrella->reExports[2]); cache.applied.clear(); sCacheImagesSeen.clear(); cache.lastAddress.clear(); overrideSplitCacheGotSlots();
         CHECK(cache.lastAddress["_close"] == (0x5000 | dyld3::darling::kThunkBit)); }
       // only an umbrella that re-exports the stand-in counts: with the umbrella no longer re-exporting it, nothing is borrowed
       familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000), image("/usr/lib/system/libsystem_info.dylib"));
-      cache.applied.clear(); cache.lastAddress.clear();
+      cache.applied.clear(); sCacheImagesSeen.clear(); cache.lastAddress.clear();
       for (ImageLoader *i : sAllImages) if (i->install == "/usr/lib/libSystem.B.dylib") i->reExports.erase(i->reExports.begin() + 1);
       overrideSplitCacheGotSlots();
       CHECK(cache.lastAddress.size() == 1 && cache.lastAddress.count("_close") == 0);         // the cache keeps its pointer
@@ -349,20 +387,20 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       // a symbol that no Darling image defines keeps the cache's pointer and says so with the cache policy option alone
       familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000), image("/usr/lib/system/libsystem_info.dylib"));
       CHECK(cache.lastAddress.count("_nosuchsymbol") == 0 && logged.empty());                  // the three symbols of the stub: _nosuchsymbol is undefined everywhere
-      gLogCachePolicy = true; cache.applied.clear(); logged.clear();
+      gLogCachePolicy = true; cache.applied.clear(); sCacheImagesSeen.clear(); logged.clear();
       overrideSplitCacheGotSlots();
       CHECK(logged.size() == 1 && logged[0].find("/usr/lib/system/libsystem_malloc.dylib: 1 export(s) that no Darling image defines keep the cache's definition (first: _nosuchsymbol)") != std::string::npos);   // one line per exporter, under the policy option
-      gLogCachePolicy = false; cache.applied.clear(); logged.clear(); gLinkContext.verboseMapping = true;
+      gLogCachePolicy = false; cache.applied.clear(); sCacheImagesSeen.clear(); logged.clear(); gLinkContext.verboseMapping = true;
       overrideSplitCacheGotSlots();
       { unsigned perSymbol = 0, perExporter = 0; for (const std::string &l : logged) { perSymbol += l.find("defines _nosuchsymbol") != std::string::npos; perExporter += l.find("1 export(s) that no Darling image defines") != std::string::npos; } CHECK(perSymbol == 1 && perExporter == 1); }   // the per-symbol line is for the verbose mapping option
       gLinkContext.verboseMapping = false;
       // thousands of misses (a real cache has 3843 for an empty libswiftCore stand-in) stay one bounded line under the policy option, and none without an option
       familyCase(nullptr, false, sibling("/usr/lib/system/libsystem_c.dylib", 0x5000), image("/usr/lib/system/libsystem_info.dylib"));
       for (int i = 0; i < 4000; ++i) cache.moreNames.push_back("_missing" + std::to_string(i));
-      cache.applied.clear(); logged.clear();
+      cache.applied.clear(); sCacheImagesSeen.clear(); logged.clear();
       overrideSplitCacheGotSlots();
       CHECK(logged.empty());
-      gLogCachePolicy = true; cache.applied.clear(); logged.clear();
+      gLogCachePolicy = true; cache.applied.clear(); sCacheImagesSeen.clear(); logged.clear();
       overrideSplitCacheGotSlots();
       CHECK(logged.size() == 1 && logged[0].find(": 4001 export(s) that no Darling image defines keep the cache's definition (first: _nosuchsymbol, _missing0, _missing1, ...)") != std::string::npos && logged[0].size() < 400);
       gLogCachePolicy = false; cache.moreNames.clear();
@@ -412,7 +450,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       reset(cache); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true)); shadow("/usr/lib/libSystem.B.dylib", 0);
       overrideSplitCacheGotSlots();
       CHECK((cache.logOn == std::vector<bool>{false}));
-      cache.applied.clear(); cache.logOn.clear(); gLogCachePolicy = true;
+      cache.applied.clear(); sCacheImagesSeen.clear(); cache.logOn.clear(); gLogCachePolicy = true;
       overrideSplitCacheGotSlots();
       CHECK((cache.logOn == std::vector<bool>{true}));
       gLogCachePolicy = false;

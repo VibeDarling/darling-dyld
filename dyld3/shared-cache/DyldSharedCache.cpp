@@ -1447,7 +1447,23 @@ static const char* applyPatchLocation(const PatchMappings& maps, PatchWriter& wr
 // This file is also built into libdyld, which has no C++ library: a bitmap of the exporters done, for the one cache of the process.
 static const uint32_t kMaxPatchableImages = 8192;
 static uint64_t sPatchedExporters[kMaxPatchableImages / 64];
+static uint64_t sCheckedExporters[kMaxPatchableImages / 64];    // exporters whose tables, plain part included, have been checked once
 static const DyldSharedCache* sPatchedCache;
+
+static void patchedCacheIs(const DyldSharedCache* cache)
+{
+    if ( sPatchedCache != cache ) {
+        memset(sPatchedExporters, 0, sizeof(sPatchedExporters));
+        memset(sCheckedExporters, 0, sizeof(sCheckedExporters));
+        sPatchedCache = cache;
+    }
+}
+
+bool DyldSharedCache::patchOverrideDone(uint32_t imageIndex) const
+{
+    patchedCacheIs(this);
+    return (imageIndex < kMaxPatchableImages) && ((sPatchedExporters[imageIndex / 64] & (1ULL << (imageIndex % 64))) != 0);
+}
 
 const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, bool classExport, uint64_t* address),
                                                     int (^clientAction)(uint32_t clientImageIndex), DataConstLogFunc logFunc, PatchOverrideStats* stats) const
@@ -1455,10 +1471,7 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
     memset(stats, 0, sizeof(*stats));
     if ( imageIndex >= kMaxPatchableImages )
         return kPatchErrImage;
-    if ( sPatchedCache != this ) {
-        memset(sPatchedExporters, 0, sizeof(sPatchedExporters));
-        sPatchedCache = this;
-    }
+    patchedCacheIs(this);
     // An exporter that is done has its GOT patched for good; it is entered again only to patch the plain locations of clients that appeared since
     const bool gotDone = (sPatchedExporters[imageIndex / 64] & (1ULL << (imageIndex % 64))) != 0;
     if ( gotDone ) {
@@ -1472,9 +1485,14 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
         return kPatchErrNotMapped;
     if ( const char* error = openPatchTablesV4(this, maps, &t) )
         return error;
-    PatchCursors cursors(UINT64_MAX);
-    if ( const char* error = checkPatchExporterV4(t, maps, imageIndex, true, &cursors) )
-        return error;
+    // the whole plain table of an exporter is checked once, not at every dlopen that brings a client
+    const bool checked = (sCheckedExporters[imageIndex / 64] & (1ULL << (imageIndex % 64))) != 0;
+    if ( !checked ) {
+        PatchCursors cursors(UINT64_MAX);
+        if ( const char* error = checkPatchExporterV4(t, maps, imageIndex, true, &cursors) )
+            return error;
+        sCheckedExporters[imageIndex / 64] |= 1ULL << (imageIndex % 64);
+    }
 
     const dyld_cache_image_patches_v4& p = t.patches[imageIndex];
     ExportMemo memo;

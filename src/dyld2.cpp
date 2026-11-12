@@ -1791,8 +1791,8 @@ static void runAllStaticTerminators(void* extra)
 // What the GOT override has done so far in this process.
 static struct { uint64_t patched, missing, unexplained, plainPatched, plainMissing, plainUnexplained; } sSplitCachePatchTotals;
 // By cache image index: the images an earlier pass has seen in the process (they may have run, so their plain locations are never
-// patched later), and the exporters whose GOT is done.
-static std::vector<bool> sCacheImagesSeen, sCacheExportersDone;
+// patched later).
+static std::vector<bool> sCacheImagesSeen;
 
 // An export can sit in another library of the libSystem family on Darling than in the cache: Apple's libsystem_malloc
 // exports reallocf, Darling's is in libsystem_c. The stand-in's clients reach both through the umbrella that re-exports
@@ -1876,7 +1876,7 @@ static void overrideSplitCacheGotSlots()
 			continue;
 		DyldSharedCache::PatchOverrideStats stats;
 		// an exporter that is done is entered again only for the cache images that are new
-		const bool done = (record.cacheImageIndex < sCacheExportersDone.size()) && sCacheExportersDone[record.cacheImageIndex];
+		const bool done = cache->patchOverrideDone(record.cacheImageIndex);
 		// a real cache leaves thousands of symbols to the cache (an empty libswiftCore stand-in: 3843): one line per exporter, not per symbol
 		struct { uint64_t count; const char* first[3]; } initialUndefined = { 0, { nullptr, nullptr, nullptr } };	// names point into the cache's string table, which stays mapped
 		__block decltype(initialUndefined) undefined = initialUndefined;
@@ -1907,9 +1907,6 @@ static void overrideSplitCacheGotSlots()
 		}, (done && !anyNewClient) ? (int (^)(uint32_t))nullptr : clientAction, (verbose || gLogCachePolicy) ? &dyld::log : nullptr, &stats);
 		if ( error != nullptr )
 			halt(mkstringf("split cache GOT override of '%s': %s\n", installPath, error));
-		if ( sCacheExportersDone.size() <= record.cacheImageIndex )
-			sCacheExportersDone.resize(record.cacheImageIndex + 1, false);
-		sCacheExportersDone[record.cacheImageIndex] = true;
 		sSplitCachePatchTotals.plainPatched += stats.plainPatched;
 		sSplitCachePatchTotals.plainMissing += stats.plainMissing;
 		sSplitCachePatchTotals.plainUnexplained += stats.plainUnexplained;
