@@ -480,9 +480,11 @@ public:
         bool                            explained;      // false: the flags have a bit the decoder cannot explain
     };
 
-    // slots counts every GOT location of the exporter, so patched + unexplained + missingSlots == slots.
+    // slots counts every GOT location of the exporter, so patched + unexplained + missingSlots == slots. The plain locations
+    // (the clients' own data pointers to the exporter's symbols) are counted apart: plainPatched + plainUnexplained + plainMissing == plainSlots.
     struct PatchOverrideStats {
         uint64_t    exports, slots, patched, unexplained, missingExports, missingSlots;
+        uint64_t    plainSlots, plainPatched, plainUnexplained, plainMissing;
         bool        alreadyApplied;
     };
 
@@ -499,11 +501,11 @@ public:
     const char* forEachPatchGotLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location)) const;
     const char* forEachPatchPlainLocation(uint32_t imageIndex, void (^handler)(const PatchLocationV4& location, uint32_t clientIndex)) const;
     #endif
-    // Overwrites the exporter's coalesced GOT slots with the address resolve() gives for the slot's symbol, signed as
-    // the slot's encoding says. Does nothing a second time for the same exporter. Leaves a slot alone (and counts it)
-    // when resolve() has no address for its symbol (missing), or the encoding or the export kind is not understood
-    // (unexplained); the plain table is never applied. Only the DATA_CONST mappings that a slot is written into are made
-    // writable, each around its writes. Not thread safe: the caller holds dyld's lock. Returns nullptr or why it stopped.
+    // Overwrites the exporter's coalesced GOT slots and the plain locations of all its clients with the address resolve() gives
+    // for the location's symbol plus the location's addend, signed as the location's own encoding says. Does nothing a second
+    // time for the same exporter. Leaves a location alone (and counts it) when resolve() has no address for its symbol
+    // (missing), or the encoding or the export kind is not understood (unexplained); resolve() is called once per export.
+    // Only the DATA_CONST mappings that a location is written into are made writable, each around its writes. Not thread safe: the caller holds dyld's lock. Returns nullptr or why it stopped.
     // classExport is true for a kind 8 export (objc classes, Swift class metadata, block classes, xpc types), which resolve()
     // refuses for a plain image: an arm64e runtime never realizes its classes. A refusal counts as missing.
     const char* overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, bool classExport, uint64_t* address),

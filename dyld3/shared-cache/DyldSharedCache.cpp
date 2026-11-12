@@ -1319,9 +1319,10 @@ const char* DyldSharedCache::forEachPatchPlainLocation(uint32_t imageIndex,
 
 // ---- override of the coalesced GOT slots of an exporter that the process provides itself ----
 static const char* const kPatchErrSign     = "patch override: the address of an exported symbol does not fit a pointer of the slot's kind";
-static const char* const kPatchErrSlot     = "patch override: a GOT slot is misaligned or lies in a mapping that cannot be made writable";
+static const char* const kPatchErrSlot     = "patch override: a patch location is misaligned or lies in a mapping that cannot be made writable";
 static const char* const kPatchErrProtect  = "patch override: could not make a DATA_CONST mapping writable";
 static const char* const kPatchErrRestore  = "patch override: could not make a DATA_CONST mapping read-only again";
+static const char* const kPatchErrMemo     = "patch override: could not allocate the exporter's lookup table";
 
 namespace {
 // Makes the read-only DATA_CONST mappings that a slot is written into writable, each on its first write, and puts them
@@ -1363,6 +1364,86 @@ struct PatchWriter {
 };
 }
 
+// What the override has learned about one export of the exporter: its GOT and its plain locations share one lookup, one log line
+// and one verdict. Kept per export of the exporter's slice, in memory that vm_allocate zero-fills (libdyld has no C++ library).
+namespace {
+enum : uint8_t { kExportUnseen = 0, kExportResolved, kExportMissing, kExportKindNotUnderstood };
+struct ExportResolution { uint64_t address; uint8_t state; };
+struct ExportMemo {
+    ExportResolution*   entries = nullptr;
+    vm_size_t           size = 0;
+    ~ExportMemo() { if ( entries != nullptr ) vm_deallocate(mach_task_self(), (vm_address_t)entries, size); }
+    bool allocate(uint64_t count) {
+        if ( count == 0 )
+            return true;
+        if ( count > (UINT64_MAX / sizeof(ExportResolution)) )
+            return false;
+        size = (vm_size_t)(count * sizeof(ExportResolution));
+        vm_address_t address = 0;
+        if ( vm_allocate(mach_task_self(), &address, size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS )
+            return false;
+        entries = (ExportResolution*)address;
+        return true;
+    }
+};
+}
+
+// kind 8 is inferred from observed exports (objc classes, Swift class metadata, concrete block classes, xpc type objects; not
+// defined in the open-source headers), other kinds are left alone. The resolver decides whether a kind 8 export may be
+// overridden: a plain libsystem_blocks or libxpc substitute leaves the __NSConcrete*Block and __xpc_type_* slots on the cache copy
+static ExportResolution& resolveExportOnce(const PatchTablesV4& t, ExportResolution* entries, const dyld_cache_image_patches_v4& p, uint32_t exportIndex,
+                                           bool (^resolve)(const char* symbol, bool classExport, uint64_t* address), DyldSharedCache::DataConstLogFunc logFunc)
+{
+    ExportResolution& r = entries[exportIndex - p.exportsStartIndex];
+    if ( r.state != kExportUnseen )
+        return r;
+    const char* symbol = t.names + (t.exports[exportIndex].nameKind & 0x0fffffffu);
+    const uint32_t kind = t.exports[exportIndex].nameKind >> 28;
+    if ( (kind != 0) && (kind != 8) ) {
+        r.state = kExportKindNotUnderstood;
+        if ( logFunc != nullptr )
+            logFunc("dyld: locations of '%s' have an export kind that is not understood, left as the cache's pointers\n", symbol);
+    }
+    else if ( resolve(symbol, kind == 8, &r.address) )
+        r.state = kExportResolved;
+    else
+        r.state = kExportMissing;
+    return r;
+}
+
+// One location of an exporter's symbol, GOT slot or plain client pointer alike: the symbol's address plus the location's own
+// addend, signed with the location's own key, discriminator and address diversity (an unauthenticated one with its own high7).
+static const char* applyPatchLocation(const PatchMappings& maps, PatchWriter& writer, DyldSharedCache::DataConstLogFunc logFunc, const char* what,
+                                      const DyldSharedCache::PatchLocationV4& loc, uint64_t slotUnslid, uint64_t address, uint64_t* patched, uint64_t* unexplained)
+{
+    if ( !loc.explained ) {
+        ++*unexplained;
+        if ( logFunc != nullptr )
+            logFunc("dyld: %s of '%s' has an encoding that cannot be explained (flags 0x%x), left as the cache's pointer\n", what, loc.symbol, loc.flags);
+        return nullptr;
+    }
+    // the signer only has the 48-bit pointer field of an authenticated pointer, and an unauthenticated one keeps its top byte for high7
+    if ( (address >> (loc.encoding.authenticated ? 48 : 56)) != 0 )
+        return kPatchErrSign;
+    const uint64_t target = address + loc.encoding.addend;
+    const PatchMapping* mapping = patchMappingContaining(maps, slotUnslid, sizeof(uint64_t), true);
+    if ( (slotUnslid % sizeof(uint64_t) != 0) || (mapping == nullptr)
+      || (((mapping->flags & DYLD_CACHE_MAPPING_CONST_DATA) == 0) && ((mapping->initProt & VM_PROT_WRITE) == 0)) )
+        return kPatchErrSlot;
+    if ( !writer.prepare(mapping) )
+        return kPatchErrProtect;
+    if ( loc.encoding.authenticated ) {
+        // signPointer() numbers the keys IA, IB, DA, DB
+        *loc.slot = dyld3::MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(target, loc.slot, loc.encoding.usesAddressDiversity,
+                        loc.encoding.discriminator, loc.encoding.keyIsData ? 2 : 0);
+    }
+    else {
+        *loc.slot = target | ((uint64_t)loc.encoding.high7 << 57);
+    }
+    ++*patched;
+    return nullptr;
+}
+
 // This file is also built into libdyld, which has no C++ library: a bitmap of the exporters done, for the one cache of the process.
 static const uint32_t kMaxPatchableImages = 8192;
 static uint64_t sPatchedExporters[kMaxPatchableImages / 64];
@@ -1389,28 +1470,25 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
     if ( const char* error = openPatchTablesV4(this, maps, &t) )
         return error;
     PatchCursors cursors(UINT64_MAX);
-    if ( const char* error = checkPatchExporterV4(t, maps, imageIndex, false, &cursors) )
+    if ( const char* error = checkPatchExporterV4(t, maps, imageIndex, true, &cursors) )
         return error;
 
+    const dyld_cache_image_patches_v4& p = t.patches[imageIndex];
+    ExportMemo memo;
+    if ( !memo.allocate(p.exportsCount) )
+        return kPatchErrMemo;
     PatchWriter writer(maps, t.slide, logFunc);
     const dyld_cache_image_got_clients_v4& g = t.gotClients[imageIndex];
     for (uint64_t i = g.exportsStartIndex; i != (uint64_t)g.exportsStartIndex + g.exportsCount; ++i) {
         const dyld_cache_got_client_export_v4& e = t.gotExports[i];
-        const char* symbol = t.names + (t.exports[e.imageExportIndex].nameKind & 0x0fffffffu);
-        uint64_t address = 0;
         ++stats->exports;
         stats->slots += e.locationsCount;
-        // kind 8 is inferred from observed exports (objc classes, Swift class metadata, concrete block classes, xpc type objects; not
-        // defined in the open-source headers), other kinds are left alone. The resolver decides whether a kind 8 export may be
-        // overridden: a plain libsystem_blocks or libxpc substitute leaves the __NSConcrete*Block and __xpc_type_* slots on the cache copy
-        const uint32_t kind = t.exports[e.imageExportIndex].nameKind >> 28;
-        if ( (kind != 0) && (kind != 8) ) {
+        const ExportResolution& r = resolveExportOnce(t, memo.entries, p, e.imageExportIndex, resolve, logFunc);
+        if ( r.state == kExportKindNotUnderstood ) {
             stats->unexplained += e.locationsCount;
-            if ( logFunc != nullptr )
-                logFunc("dyld: GOT slots of '%s' have an export kind that is not understood, left as the cache's pointers\n", symbol);
             continue;
         }
-        if ( !resolve(symbol, kind == 8, &address) ) {
+        if ( r.state == kExportMissing ) {
             ++stats->missingExports;
             stats->missingSlots += e.locationsCount;
             continue;
@@ -1419,31 +1497,34 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
             const dyld_cache_patchable_got_location_v4& l = t.gotLocations[k];
             const uint64_t slotUnslid = t.unslidBase + (((uint64_t)l.cacheOffsetHi << 32) | l.cacheOffsetLo);
             const PatchLocationV4 loc = patchLocation(t, e.imageExportIndex, slotUnslid, l.flags);
-            if ( !loc.explained ) {
-                ++stats->unexplained;
-                if ( logFunc != nullptr )
-                    logFunc("dyld: GOT slot of '%s' has an encoding that cannot be explained (flags 0x%x), left as the cache's pointer\n", symbol, l.flags);
+            if ( const char* error = applyPatchLocation(maps, writer, logFunc, "GOT slot", loc, slotUnslid, r.address, &stats->patched, &stats->unexplained) )
+                return error;
+        }
+    }
+    // The clients' own data pointers to the exporter's symbols (a static allocator's malloc and free callbacks, say) are not in the
+    // coalesced GOT. Every client is patched here, loaded or not: the cache maps all of its images at launch, so a client that
+    // is dlopen'ed later finds its slots done.
+    for (uint64_t i = p.clientsStartIndex; i != (uint64_t)p.clientsStartIndex + p.clientsCount; ++i) {
+        const dyld_cache_patch_client_v4& client = t.clients[i];
+        const uint64_t clientAddress = t.images[client.clientDylibIndex].address;
+        for (uint64_t j = client.exportsStartIndex; j != (uint64_t)client.exportsStartIndex + client.exportsCount; ++j) {
+            const dyld_cache_patch_client_export_v4& e = t.clientExports[j];
+            stats->plainSlots += e.locationsCount;
+            const ExportResolution& r = resolveExportOnce(t, memo.entries, p, e.imageExportIndex, resolve, logFunc);
+            if ( r.state == kExportKindNotUnderstood ) {
+                stats->plainUnexplained += e.locationsCount;
                 continue;
             }
-            // the signer only has the 48-bit pointer field of an authenticated pointer, and an unauthenticated one keeps its top byte for high7
-            if ( (address >> (loc.encoding.authenticated ? 48 : 56)) != 0 )
-                return kPatchErrSign;
-            const uint64_t target = address + loc.encoding.addend;
-            const PatchMapping* mapping = patchMappingContaining(maps, slotUnslid, sizeof(uint64_t), true);
-            if ( (slotUnslid % sizeof(uint64_t) != 0) || (mapping == nullptr)
-              || (((mapping->flags & DYLD_CACHE_MAPPING_CONST_DATA) == 0) && ((mapping->initProt & VM_PROT_WRITE) == 0)) )
-                return kPatchErrSlot;
-            if ( !writer.prepare(mapping) )
-                return kPatchErrProtect;
-            if ( loc.encoding.authenticated ) {
-                // signPointer() numbers the keys IA, IB, DA, DB
-                *loc.slot = dyld3::MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(target, loc.slot, loc.encoding.usesAddressDiversity,
-                                loc.encoding.discriminator, loc.encoding.keyIsData ? 2 : 0);
+            if ( r.state == kExportMissing ) {
+                stats->plainMissing += e.locationsCount;
+                continue;
             }
-            else {
-                *loc.slot = target | ((uint64_t)loc.encoding.high7 << 57);
+            for (uint64_t k = e.locationsStartIndex; k != (uint64_t)e.locationsStartIndex + e.locationsCount; ++k) {
+                const uint64_t slotUnslid = clientAddress + t.locations[k].dylibOffsetOfUse;
+                const PatchLocationV4 loc = patchLocation(t, e.imageExportIndex, slotUnslid, t.locations[k].flags);
+                if ( const char* error = applyPatchLocation(maps, writer, logFunc, "plain location", loc, slotUnslid, r.address, &stats->plainPatched, &stats->plainUnexplained) )
+                    return error;
             }
-            ++stats->patched;
         }
     }
     if ( !writer.restore() )

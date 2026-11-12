@@ -15,7 +15,7 @@ dyld2 = File.read("#{root}/src/dyld2.cpp")
 dyld2_h = File.read("#{root}/src/dyld2.h")
 runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
 runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
-override_fn = dyld2[/^static struct \{ uint64_t patched, missing, unexplained; \} sSplitCachePatchTotals;.*?^static void overrideSplitCacheGotSlots\(\).*?^\}/m] or abort 'overrideSplitCacheGotSlots missing'
+override_fn = dyld2[/^static struct \{[^}]*\} sSplitCachePatchTotals;.*?^static void overrideSplitCacheGotSlots\(\).*?^\}/m] or abort 'overrideSplitCacheGotSlots missing'
 record_struct = dyld2_h[/^\tstruct DiskOverrideOfCacheImage \{.*?^\t\};/m] or abort 'DiskOverrideOfCacheImage missing'
 allow_list = runtime[/^static const char\* const kSharedCacheServedOverDisk\[\].*?^bool sharedCachePathIsAllowListed\(.*?^\}/m] or abort 'allow-list code missing'
 allow_decl = runtime_h[/^struct SharedCacheAllowList \{.*?^\};/m] or abort 'SharedCacheAllowList missing'
@@ -78,10 +78,10 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     struct mach_header { int cpusubtype; };
     // The cache: which images it has, whether it has version 4 patch info, and what overridePatchGotSlots does.
     struct DyldSharedCache {
-      struct PatchOverrideStats { uint64_t exports, slots, patched, unexplained, missingExports, missingSlots; bool alreadyApplied; };
+      struct PatchOverrideStats { uint64_t exports, slots, patched, unexplained, missingExports, missingSlots, plainSlots, plainPatched, plainUnexplained, plainMissing; bool alreadyApplied; };
       typedef void (*DataConstLogFunc)(const char*, ...);
       bool patchInfo = true;
-      std::vector<std::string> images = {"/usr/lib/libSystem.B.dylib", "/usr/lib/system/libsystem_kernel.dylib", "/usr/lib/system/libsystem_c.dylib", "/usr/lib/libz.1.dylib", "/usr/lib/system/libsystem_malloc.dylib"};
+      std::vector<std::string> images = {"/usr/lib/libSystem.B.dylib", "/usr/lib/system/libsystem_kernel.dylib", "/usr/lib/system/libsystem_c.dylib", "/usr/lib/libz.1.dylib", "/usr/lib/system/libsystem_malloc.dylib", "/usr/lib/system/libsystem_platform.dylib"};
       mutable std::vector<uint32_t> calls; mutable std::set<uint32_t> applied;
       const char *error = nullptr;                 // what overridePatchGotSlots returns for index 2
       bool hasPatchInfoV4() const { return patchInfo; }
@@ -93,12 +93,14 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
         if (applied.count(index)) { s->alreadyApplied = true; return nullptr; }
         if (index == 2 && error) return error;
         applied.insert(index);
-        if (index == 4) { s->exports = 1; s->slots = 2; s->unexplained = 2; return nullptr; }
+        if (index == 5) { s->exports = 1; s->slots = 1; s->patched = 1; s->plainSlots = 2; s->plainPatched = 1; s->plainUnexplained = 1; return nullptr; }   // only a plain location is refused
+        if (index == 4) { s->exports = 1; s->slots = 2; s->unexplained = 2; s->plainSlots = 1; s->plainUnexplained = 1; return nullptr; }
         std::vector<std::string> names = {"_open", "_close", "_nosuchsymbol"}; names.insert(names.end(), moreNames.begin(), moreNames.end());
         for (const std::string &nameString : names) {
           const char *name = nameString.c_str();
           uint64_t address = 0; ++s->exports; s->slots += 2;
-          if (resolve(name, classNames.count(name) != 0, &address)) { s->patched += 2; lastAddress[name] = address; } else { ++s->missingExports; s->missingSlots += 2; }
+          ++s->plainSlots;     // one plain location per symbol, with the verdict of the GOT slots (the real reader looks each export up once)
+          if (resolve(name, classNames.count(name) != 0, &address)) { s->patched += 2; ++s->plainPatched; lastAddress[name] = address; } else { ++s->missingExports; s->missingSlots += 2; ++s->plainMissing; }
         }
         return nullptr;
       }
@@ -189,10 +191,15 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       // --- an anomaly (slots refused for their encoding or kind) is always reported, once, with the cumulative totals ---
       shadow("/usr/lib/system/libsystem_malloc.dylib", 4);
       overrideSplitCacheGotSlots();
-      CHECK(summaries() == 1 && logged.size() == 1 && logged[0].find("patched=8 missing=4 unexplained=2") != std::string::npos);
+      CHECK(summaries() == 1 && logged.size() == 1 && logged[0].find("patched=8 missing=4 unexplained=2 plain-patched=4 plain-missing=2 plain-unexplained=1") != std::string::npos);
       logged.clear();
       overrideSplitCacheGotSlots();
       CHECK(logged.empty());                                              // nothing new, nothing to say
+      // a plain location refused for its encoding is an anomaly too, even when no GOT slot is
+      shadow("/usr/lib/system/libsystem_platform.dylib", 5);
+      overrideSplitCacheGotSlots();
+      CHECK(summaries() == 1 && logged.size() == 1 && logged[0].find("patched=9 missing=4 unexplained=2 plain-patched=5 plain-missing=2 plain-unexplained=2") != std::string::npos);
+      logged.clear();
 
       // --- the verbose mapping option: one line per patched symbol and the summary; none without it ---
       reset(cache);

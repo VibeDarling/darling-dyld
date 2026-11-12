@@ -45,7 +45,7 @@ OVERRIDE_MAIN = <<~CPP
   }
   static uint64_t stubAddress(const std::string &symbol) {
     static const std::map<std::string, uint64_t> stubs = {{"_alpha", 0x111100001000ull}, {"_gamma", 0x111100002000ull}, {"_delta_data", 0x111100003000ull},
-      {"_bravo", 0x111100004000ull}, {"_unexplained", 0x111100006000ull}, {"_beta", 0x111100005000ull}};   // _charlie has none: missing; _beta is of an export kind that is not understood (7), or kind 8 in mainKind
+      {"_bravo", 0x111100004000ull}, {"_unexplained", 0x111100006000ull}, {"_beta", 0x111100005000ull}, {"_plain_only", 0x111100007000ull}};   // _charlie has none: missing; _beta is of an export kind that is not understood (7), or kind 8 in mainKind
     auto it = stubs.find(symbol); return it == stubs.end() ? 0 : it->second;
   }
   struct Snapshot { std::vector<uint64_t> words; };
@@ -56,6 +56,13 @@ OVERRIDE_MAIN = <<~CPP
   }
   static uint64_t word(const Snapshot &s, const Fixture &f, uint64_t slot) { return s.words[(slot - f.gotMapAddr) / 8]; }
   static uint64_t *slotPtr(uint64_t slot) { return (uint64_t *)slot; }
+  // The encoding of a plain location, decoded here from the flags word (not by the reader): what the written pointer must carry.
+  struct Decoded { bool auth, addrDiv, keyData, explained; unsigned disc, addend, high7; };
+  static Decoded decodeFlags(uint32_t f) {
+    Decoded d; d.auth = f & 1; d.high7 = (f >> 1) & 0x7f; d.addend = d.auth ? (f >> 9) & 0x1f : (f >> 9) & 0x7f;
+    d.addrDiv = d.auth && ((f >> 14) & 1); d.keyData = d.auth && ((f >> 15) & 1); d.disc = d.auth ? f >> 16 : 0;
+    d.explained = d.auth ? d.high7 == 0 : (f >> 16) == 0; return d;
+  }
 
   struct Rejections { unsigned trials = 0, rejected = 0; void add(bool ok) { ++trials; if (!ok) ++rejected; } };
 
@@ -85,11 +92,14 @@ OVERRIDE_MAIN = <<~CPP
     CHECK(cache->overridePatchGotSlots(1, resolver, nullptr, &stats) == nullptr);
     CHECK(stats.exports == 4 && stats.slots == 7 && stats.patched == 6 && stats.unexplained == 1 && stats.missingExports == 0 && stats.missingSlots == 0);
     CHECK(stats.patched + stats.unexplained + stats.missingSlots == stats.slots && !stats.alreadyApplied);
-    CHECK(seenSymbols == (std::vector<std::string>{"_alpha", "_gamma", "_delta_data"}));     // _beta is not even looked up
+    // the plain locations of the clients: _alpha x5, _gamma, _plain_only patched; _beta (kind 7) is not understood
+    CHECK(stats.plainSlots == 8 && stats.plainPatched == 7 && stats.plainUnexplained == 1 && stats.plainMissing == 0);
+    // one lookup per export for the GOT and the plain table together: _alpha and _gamma are not looked up again, only _plain_only is new; _beta is not even looked up
+    CHECK(seenSymbols == (std::vector<std::string>{"_alpha", "_gamma", "_delta_data", "_plain_only"}));
     // writable only once the first write is about to happen: the first lookup still sees read-only, a later one sees writable
     CHECK(permsAtResolve[0] == "r--p" && permsAtResolve[2] == "rw-p");
     CHECK(permissions(f.gotMapAddr) == "r--p");                 // restored on return
-    CHECK(otherAtResolve == (std::vector<std::string>{"r--p", "r--p", "r--p"}) && permissions(otherData) == "r--p");
+    CHECK(otherAtResolve == (std::vector<std::string>{"r--p", "r--p", "r--p", "r--p"}) && permissions(otherData) == "r--p");
 
     // --- exporter 2 (libexpb): _charlie is not provided, _unexplained has an encoding nobody can explain ---
     DyldSharedCache::PatchOverrideStats stats2;
@@ -97,15 +107,35 @@ OVERRIDE_MAIN = <<~CPP
     CHECK(cache->overridePatchGotSlots(2, resolver, nullptr, &stats2) == nullptr);
     CHECK(stats2.exports == 3 && stats2.slots == 3 && stats2.patched == 1 && stats2.unexplained == 1 && stats2.missingExports == 1 && stats2.missingSlots == 1);
     CHECK(stats2.patched + stats2.unexplained + stats2.missingSlots == stats2.slots);
+    // _bravo x2 patched, _charlie x2 missing, _unexplained: one encoding that cannot be explained, one patched
+    CHECK(stats2.plainSlots == 6 && stats2.plainPatched == 3 && stats2.plainUnexplained == 1 && stats2.plainMissing == 2);
+    CHECK(stats2.plainPatched + stats2.plainUnexplained + stats2.plainMissing == stats2.plainSlots);
     CHECK(permissions(f.gotMapAddr) == "r--p");
 
     // --- an independent walk of the whole GOT mapping ---
     const Snapshot after = snapshot(f);
     std::map<uint64_t, const Got *> listed; for (const Got &g : f.got) listed[g.slot] = &g;
-    Rejections wrongModifier;
-    unsigned patchedSeen = 0, untouchedSeen = 0;
+    std::map<uint64_t, const Plain *> plainListed; for (const Plain &p : f.plain) plainListed[p.slot] = &p;
+    Rejections wrongModifier, wrongModifierPlain, wrongKeyPlain;
+    unsigned patchedSeen = 0, untouchedSeen = 0, plainPatchedSeen = 0;
     for (uint64_t slot = f.gotMapAddr; slot < f.gotMapAddr + f.gotMapSize; slot += 8) {
       const uint64_t was = word(before, f, slot), now = word(after, f, slot);
+      auto plainIt = plainListed.find(slot);
+      if (plainIt != plainListed.end()) {
+        // a client's own pointer: its symbol's stub plus ITS OWN addend, signed with ITS OWN key, discriminator and address diversity
+        const Plain &p = *plainIt->second; const Decoded d = decodeFlags(p.flags);
+        if (!d.explained || p.symbol == "_beta" || p.symbol == "_charlie") { CHECK(now == was); ++untouchedSeen; continue; }
+        const uint64_t target = stubAddress(p.symbol) + d.addend; ++plainPatchedSeen;
+        if (d.auth) {
+          const uint64_t modifier = d.addrDiv ? ((slot & 0x0000ffffffffffffull) | ((uint64_t)d.disc << 48)) : d.disc;
+          CHECK(authenticates(d.keyData, now, modifier, target));
+          wrongModifierPlain.add(authenticates(d.keyData, now, modifier ^ 1, target));
+          wrongKeyPlain.add(authenticates(!d.keyData, now, modifier, target));
+        } else {
+          CHECK(now == (target | ((uint64_t)d.high7 << 57)));
+        }
+        continue;
+      }
       auto it = listed.find(slot);
       const bool shouldPatch = it != listed.end() && it->second->explained && it->second->symbol != "_beta" && it->second->symbol != "_charlie";
       if (!shouldPatch) { CHECK(now == was); ++untouchedSeen; continue; }
@@ -119,11 +149,12 @@ OVERRIDE_MAIN = <<~CPP
       }
     }
     CHECK(patchedSeen == 7);
+    // 7 + 3 patched. A wrong modifier or key is rejected, up to the chance that a short signature collides: the same tolerance as for the GOT
+    CHECK(plainPatchedSeen == 10 && wrongModifierPlain.trials == 7 && wrongModifierPlain.rejected * 2 > wrongModifierPlain.trials && wrongKeyPlain.trials == 7 && wrongKeyPlain.rejected * 2 > wrongKeyPlain.trials);
     printf("rejected with a wrong modifier: %u of %u\\n", wrongModifier.rejected, wrongModifier.trials);
     CHECK(wrongModifier.trials >= 4 && wrongModifier.rejected * 2 > wrongModifier.trials);
-    // the missing and the unexplained slot keep the cache's own pointer, and so do the client (plain table) slots and the control slots
+    // the missing and the unexplained slots (GOT and plain) keep the cache's own pointer, and so do the control slots
     for (const Got &g : f.got) if (g.symbol == "_beta" || g.symbol == "_charlie" || !g.explained) CHECK(word(after, f, g.slot) == word(before, f, g.slot));
-    for (const Plain &p : f.plain) CHECK(word(after, f, p.slot) == word(before, f, p.slot));
     for (uint64_t c : f.control) CHECK(word(after, f, c) == word(before, f, c));
 
     // --- idempotence: a second pass over a patched exporter does not even look the symbols up ---
@@ -173,16 +204,56 @@ OVERRIDE_MAIN = <<~CPP
     const bool plainAddress = understood && !refused;
     CHECK(stats.exports == 4 && stats.slots == 7 && stats.patched == (plainAddress ? 7u : 6u) && stats.unexplained == (understood ? 0u : 1u));
     CHECK(stats.missingExports == (refused ? 1u : 0u) && stats.missingSlots == (refused ? 1u : 0u));
+    // _beta also has one plain location: it follows the GOT slot's fate (one lookup per export, one log line)
+    CHECK(stats.plainSlots == 8 && stats.plainPatched == (plainAddress ? 8u : 7u) && stats.plainUnexplained == (understood ? 0u : 1u) && stats.plainMissing == (refused ? 1u : 0u));
     CHECK(gLogged == (understood ? 0u : 1u));
     if ( !understood ) CHECK(gLoggedLine.find("'_beta'") != std::string::npos && gLoggedLine.find("not understood") != std::string::npos);
     CHECK(classSymbols == (kind == 8 ? std::vector<std::string>{"_beta"} : std::vector<std::string>{}));
-    CHECK(seenSymbols == (understood ? std::vector<std::string>{"_alpha", "_beta", "_gamma", "_delta_data"} : std::vector<std::string>{"_alpha", "_gamma", "_delta_data"}));
+    CHECK(seenSymbols == (understood ? std::vector<std::string>{"_alpha", "_beta", "_gamma", "_delta_data", "_plain_only"} : std::vector<std::string>{"_alpha", "_gamma", "_delta_data", "_plain_only"}));
     const Snapshot after = snapshot(f);
+    for (const Plain &p : f.plain) {
+      if ( p.symbol != "_beta" ) continue;
+      const Decoded d = decodeFlags(p.flags);
+      if ( !plainAddress ) { CHECK(word(after, f, p.slot) == word(before, f, p.slot)); continue; }
+      CHECK(d.auth && d.keyData && !d.addrDiv && authenticates(1, word(after, f, p.slot), d.disc, stubAddress("_beta") + d.addend));
+    }
     for (const Got &g : f.got) {
       if ( g.symbol != "_beta" ) continue;
       if ( !plainAddress ) { CHECK(word(after, f, g.slot) == word(before, f, g.slot)); continue; }
       // the slot is the stub's address signed as the slot's flags say (data key, no address diversity, discriminator 1)
       CHECK(g.auth && g.keyData && !g.addrDiv && authenticates(1, word(after, f, g.slot), g.disc, stubAddress("_beta") + g.addend));
+    }
+    printf(failures ? "RESULT failed (%d)\\n" : "RESULT ok\\n", failures);
+    return failures != 0;
+  }
+
+  // A class export that only the plain table lists (no GOT slot): the same gate decides, through the same single lookup. Turns _plain_only
+  // into kind 8; a refusing resolver must leave its one plain location on the cache's pointer and count it missing.
+  static int mainPlainClass(const std::string &dir, bool refuseClass) {
+    const Fixture f = loadManifest(dir);
+    const DyldSharedCache *cache = mapFixture(dir);
+    size_t plainOnly = 0; while (f.exports[plainOnly].name != "_plain_only") ++plainOnly;
+    const uint64_t nameWord = f.arrays.at("imageExports").first + 8 * plainOnly + 4;
+    uint32_t nameKind; memcpy(&nameKind, (void *)nameWord, 4);
+    CHECK((nameKind >> 28) == 0);
+    poke(nameWord, 4, (nameKind & 0x0fffffffu) | (8u << 28));
+    const Snapshot before = snapshot(f);
+    __block std::vector<std::string> classSymbols;
+    auto resolver = ^bool(const char *symbol, bool classExport, uint64_t *address) {
+      if (classExport) classSymbols.push_back(symbol);
+      if (classExport && refuseClass) return false;
+      *address = stubAddress(symbol); return *address != 0;
+    };
+    DyldSharedCache::PatchOverrideStats stats;
+    CHECK(cache->overridePatchGotSlots(1, resolver, nullptr, &stats) == nullptr);
+    CHECK(classSymbols == std::vector<std::string>{"_plain_only"});
+    CHECK(stats.patched == 6 && stats.unexplained == 1 && stats.missingSlots == 0);          // the GOT is as before
+    CHECK(stats.plainSlots == 8 && stats.plainPatched == (refuseClass ? 6u : 7u) && stats.plainMissing == (refuseClass ? 1u : 0u) && stats.plainUnexplained == 1);
+    const Snapshot after = snapshot(f);
+    for (const Plain &p : f.plain) {
+      if ( p.symbol != "_plain_only" ) continue;
+      if ( refuseClass ) CHECK(word(after, f, p.slot) == word(before, f, p.slot));
+      else CHECK(word(after, f, p.slot) == (stubAddress("_plain_only") | ((uint64_t)decodeFlags(p.flags).high7 << 57)) && word(after, f, p.slot) != word(before, f, p.slot));
     }
     printf(failures ? "RESULT failed (%d)\\n" : "RESULT ok\\n", failures);
     return failures != 0;
@@ -219,6 +290,21 @@ OVERRIDE_MAIN = <<~CPP
     CHECK_ERR(cache->overridePatchGotSlots(2, good, nullptr, &stats), "could not make a DATA_CONST mapping writable");
     gFailProtect = 0;
     CHECK(snapshot(f).words == before.words && permissions(f.gotMapAddr) == "r--p");
+    // a plain location that is misaligned (the table check accepts it, as for the GOT) stops the override after the GOT part is done
+    const uint64_t locations = f.arrays.at("locations").first, clientImage = f.images[3].first;
+    uint64_t misaligned = 0;
+    for (uint64_t i = 0; i < f.arrays.at("locations").second; ++i) {
+      uint32_t offset; memcpy(&offset, (void *)(locations + 8 * i), 4);
+      if (clientImage + offset == f.plain[8].slot) misaligned = locations + 8 * i;           // the first plain location of exporter 2
+    }
+    CHECK(misaligned != 0 && f.plain[8].exporter == 2);
+    uint32_t savedOffset; memcpy(&savedOffset, (void *)misaligned, 4);
+    poke(misaligned, 4, savedOffset + 4);
+    const uint64_t plainSlot = f.plain[8].slot, plainWas = *slotPtr(plainSlot);
+    CHECK_ERR(cache->overridePatchGotSlots(2, good, nullptr, &stats), "misaligned");
+    CHECK(permissions(f.gotMapAddr) == "r--p");                                              // put back on the early exit
+    CHECK(*slotPtr(plainSlot) == plainWas);
+    poke(misaligned, 4, savedOffset);
     // a mapping that is writable already (DATA_CONST by flag, but writable by protection) must stay writable
     const uint64_t protField = flagsField + 12;                                  // initProt follows flags (8), maxProt (4)
     uint32_t savedProt; memcpy(&savedProt, (void *)protField, 4);
@@ -255,6 +341,7 @@ OVERRIDE_MAIN = <<~CPP
   int main(int argc, char **argv) {
     assert(argc >= 3);
     const std::string mode = argv[2];
+    if ( mode.rfind("plainclass", 0) == 0 ) return mainPlainClass(argv[1], mode.find("refuse") != std::string::npos);
     if ( mode.rfind("kind", 0) == 0 ) return mainKind(argv[1], (unsigned)atoi(mode.c_str() + 4), mode.find("refuse") != std::string::npos);
     return mode == "errors" ? mainErrors(argv[1]) : mode == "nopatch" ? mainNoPatchInfo(argv[1]) : mainOverride(argv[1]);
   }
@@ -270,7 +357,7 @@ Dir.mktmpdir('patch-info-v4-override-') do |dir|
   out, st = Open3.capture2e('python3', '-I', "#{root}/tests/gen-split-cache-fixture.py", "#{dir}/fxh", '--variant', 'patch_high', '--base', base)
   abort out unless st.success?
   # kind 8 is patched like kind 0 unless the resolver refuses a class export; the nonzero kinds around it (and the unused 15) are not understood
-  [%w[fx override], %w[fx errors], %w[fxh override], %w[fx kind8], %w[fx kind8refuse], %w[fx kind0refuse], %w[fx kind0], %w[fx kind1], %w[fx kind7], %w[fx kind9], %w[fx kind15]].each do |fixture, mode|
+  [%w[fx override], %w[fx errors], %w[fxh override], %w[fx kind8], %w[fx kind8refuse], %w[fx kind0refuse], %w[fx plainclass], %w[fx plainclassrefuse], %w[fx kind0], %w[fx kind1], %w[fx kind7], %w[fx kind9], %w[fx kind15]].each do |fixture, mode|
     out, st = Open3.capture2e("#{dir}/test", "#{dir}/#{fixture}", mode)
     puts out
     abort "patch info v4 override test (#{fixture} #{mode}) failed" unless st.success? && out.include?('RESULT ok')

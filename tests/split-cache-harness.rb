@@ -128,6 +128,13 @@ module SplitCacheHarness
     #define KERN_SUCCESS 0
     #define MACH_PORT_NULL 0
     static mach_port_t mach_task_self() { return 1; }
+    #define VM_FLAGS_ANYWHERE 1
+    static kern_return_t vm_allocate(mach_port_t, vm_address_t *address, vm_size_t size, int) {
+      void *p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if ( p == MAP_FAILED ) return 1;
+      *address = (vm_address_t)p; return 0;
+    }
+    static kern_return_t vm_deallocate(mach_port_t, vm_address_t address, vm_size_t size) { return munmap((void *)address, size) == 0 ? 0 : 1; }
     bool gEnableSharedCacheDataConst = true;
     // Tests inject a failure: 1 fails making a mapping writable, 2 fails putting it back read-only (nothing is changed then).
     int gFailProtect = 0;

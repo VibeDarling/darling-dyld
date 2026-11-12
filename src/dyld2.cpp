@@ -1777,7 +1777,7 @@ static void runAllStaticTerminators(void* extra)
 
 #ifdef DARLING
 // What the GOT override has done so far in this process.
-static struct { uint64_t patched, missing, unexplained; } sSplitCachePatchTotals;
+static struct { uint64_t patched, missing, unexplained, plainPatched, plainMissing, plainUnexplained; } sSplitCachePatchTotals;
 
 // An export can sit in another library of the libSystem family on Darling than in the cache: Apple's libsystem_malloc
 // exports reallocf, Darling's is in libsystem_c. The stand-in's clients reach both through the umbrella that re-exports
@@ -1820,7 +1820,9 @@ static bool findInReExportSiblings(const ImageLoader* standIn, const char* symbo
 // and _main binds them later (after applyInterposing). So the pass is a no-op during the launch's links, and _main runs
 // it when those binds are done, before the initializers: no cache image runs before its imports are fixed. Idempotent,
 // and a no-op without version 4 patch info or a cache image in the process. A symbol the loaded image does not export is looked up in its re-export siblings (findInReExportSiblings);
-// one that no Darling image defines keeps the cache's pointer and is counted.
+// one that no Darling image defines keeps the cache's pointer and is counted. The clients' own data pointers to those symbols
+// (CoreFoundation's static allocator holds _malloc and _free) are rewritten in the same pass, or cache code would free through the
+// cache's uninitialized copy of the library.
 static void overrideSplitCacheGotSlots()
 {
 	const DyldSharedCache* cache = sSharedCacheLoadInfo.loadAddress;
@@ -1883,14 +1885,18 @@ static void overrideSplitCacheGotSlots()
 		sSplitCachePatchTotals.patched += stats.patched;
 		sSplitCachePatchTotals.missing += stats.missingSlots;
 		sSplitCachePatchTotals.unexplained += stats.unexplained;
-		newUnexplained += stats.unexplained;
+		sSplitCachePatchTotals.plainPatched += stats.plainPatched;
+		sSplitCachePatchTotals.plainMissing += stats.plainMissing;
+		sSplitCachePatchTotals.plainUnexplained += stats.plainUnexplained;
+		newUnexplained += stats.unexplained + stats.plainUnexplained;
 	}
 	// one line per pass: with the verbose mapping option, and without it only for an anomaly (an encoding or an export kind
 	// that was refused). Missing symbols are normal (Darling lacks some of the exports), so they are only in the verbose line.
 	if ( (newUnexplained != 0) || ((exporters != 0) && verbose) )
-		dyld::log("dyld: split cache GOT override: patched=%llu missing=%llu unexplained=%llu (slots, all exporters so far)\n",
+		dyld::log("dyld: split cache GOT override: patched=%llu missing=%llu unexplained=%llu plain-patched=%llu plain-missing=%llu plain-unexplained=%llu (locations, all exporters so far)\n",
 				  (unsigned long long)sSplitCachePatchTotals.patched, (unsigned long long)sSplitCachePatchTotals.missing,
-				  (unsigned long long)sSplitCachePatchTotals.unexplained);
+				  (unsigned long long)sSplitCachePatchTotals.unexplained, (unsigned long long)sSplitCachePatchTotals.plainPatched,
+				  (unsigned long long)sSplitCachePatchTotals.plainMissing, (unsigned long long)sSplitCachePatchTotals.plainUnexplained);
 }
 #endif
 
