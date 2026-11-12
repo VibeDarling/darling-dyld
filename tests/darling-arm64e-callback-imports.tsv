@@ -22,6 +22,7 @@ __dyld_register_func_for_remove_image	A	mach-o/dyld.h arg0:func:fnptr	OK	T0
 __os_activity_initiate	A	os/activity.h arg3:activity_block:block	OK	T0
 __os_alloc_once	A	os/alloc_once_impl.h arg2:init:fnptr	OK	sweep
 __os_once	A	os/once_private.h arg2:function:fnptr	OK	T0
+__pthread_workqueue_init	A	pthread/workqueue_private.h arg0:func:fnptr	OK	sweep
 _aio_error	S	sys/aio.h arg0:aiocbp:struct sigevent.sigev_notify_function	OK	T0
 _aio_read	S	sys/aio.h arg0:aiocbp:struct sigevent.sigev_notify_function	OK	T0
 _aio_return	S	sys/aio.h arg0:aiocbp:struct sigevent.sigev_notify_function	OK	T0

@@ -944,6 +944,16 @@ static void checkOldActionSigning()
 	gHook = nullptr;
 }
 
+// arm64e libdispatch calls _pthread_workqueue_init(_dispatch_worker_thread2, 64, 0) with the worker signed; plain libpthread
+// stores the pointer and calls it with a plain blr from _pthread_wqthread
+static void checkWorkqueueInit()
+{
+	const uint64_t worker = oracleSign(codeWithSignature(0), 0);
+	gFakeResult = 0;
+	thunkFor("__pthread_workqueue_init")(worker, 64, 0, 0, 0, 0, 0, 0);
+	CHECK(gSeen[0] == oracleStrip(worker) && gSeen[1] == 64 && gSeen[2] == 0, "__pthread_workqueue_init: the worker reached the callee as 0x%llx", (unsigned long long)gSeen[0]);
+}
+
 static void checkSigaction()
 {
 	Fn8 t = thunkFor("_sigaction");
@@ -1082,6 +1092,7 @@ int main(int argc, char** argv)
 	checkDispatch();
 	checkRefusedBlocks();
 	checkSigaction();
+	checkWorkqueueInit();
 	checkSigactionFaults();
 	checkNoDescriptors();
 	checkOldActionSigning();
