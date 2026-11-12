@@ -65,6 +65,11 @@ extern "C" void __simple_kprintf(const char* format, ...);
 #endif
 #include "Tracing.h"
 #include "dyld2.h"
+#if defined(__aarch64__) || defined(__arm64__)
+#include "DarlingTSDIslands.h"
+#include "DarlingArm64eAdapters.h"
+extern "C" unsigned long sys_thread_get_native_tsd_slot_offset(void);
+#endif
 
 // <rdar://problem/8718137> use stack guard random value to add padding between dylibs
 extern "C" long __stack_chk_guard;
@@ -2087,6 +2092,49 @@ struct DATAdyld {
 extern "C" void stub_binding_helper();
 extern "C" int _dyld_func_lookup(const char* name, void** address);
 
+// An arm64e libdyld calls the pointer in its __dyld section with blraaz (IA, discriminator 0) and authenticates the address that
+// the lookup hands back the same way (autiza, a trap on failure), then re-signs it for its own use. Upstream's arm64e dyld
+// produces both signatures from compiler-signed function pointers (src/dyldLibSystemGlue.c re-signs them "from dyld's
+// 0-discriminator"). This dyld is plain arm64, so it signs with the hint-space pacia1716, as src/threadLocalVariables.c does
+// for the TLV thunk: the stored pointer is a wrapper whose result is signed.
+static void* signForArm64eLibdyld(void* pointer)
+{
+#if __arm64__ && !__has_feature(ptrauth_calls)
+	register uint64_t value __asm__("x17") = (uint64_t)pointer;
+	register uint64_t discriminator __asm__("x16") = 0;
+	__asm__ volatile("hint #8" : "+r"(value) : "r"(discriminator));
+	return (void*)value;
+#else
+	return pointer;
+#endif
+}
+
+static int dyldFuncLookupSigned(const char* name, void** address)
+{
+	const int found = _dyld_func_lookup(name, address);
+	if ( *address != NULL )
+		*address = signForArm64eLibdyld(*address);
+	return found;
+}
+
+static void* dyldFuncLookupForImage(const macho_header* mh)
+{
+#if __arm64__ && !__has_feature(ptrauth_calls)
+	if ( (mh->cputype == CPU_TYPE_ARM64) && dyld3::darling::cpusubtypeIsArm64e(mh->cpusubtype) )
+		return signForArm64eLibdyld((void*)&dyldFuncLookupSigned);
+#endif
+	return (void*)&_dyld_func_lookup;
+}
+
+static void setDyldFuncLookup(struct DATAdyld* dd, uint64_t sectionSize, const macho_header* mh)
+{
+	if ( sectionSize > offsetof(DATAdyld, dyldFuncLookup) ) {
+		void* const lookup = dyldFuncLookupForImage(mh);
+		if ( dd->dyldFuncLookup != lookup )
+			dd->dyldFuncLookup = lookup;
+	}
+}
+
 static const char* libDyldPath(const ImageLoader::LinkContext& context)
 {
 #if TARGET_OS_OSX
@@ -2141,10 +2189,7 @@ void ImageLoaderMachO::setupLazyPointerHandler(const LinkContext& context)
 									dyld::throwf("__dyld section not supported in %s", this->getPath());
 						#endif
 							}
-							if ( sect->size > offsetof(DATAdyld, dyldFuncLookup) ) {
-								if ( dd->dyldFuncLookup != (void*)&_dyld_func_lookup )
-									dd->dyldFuncLookup = (void*)&_dyld_func_lookup;
-							}
+							setDyldFuncLookup(dd, sect->size, mh);
 							if ( mh->filetype == MH_EXECUTE ) {
 								// there are two ways to get the program variables
 								if ( (sect->size > offsetof(DATAdyld, vars)) && (dd->vars.mh == mh) ) {
@@ -2740,22 +2785,14 @@ void ImageLoaderMachO::mapSegments(int fd, uint64_t offsetInFat, uint64_t lenInF
 #if defined(__aarch64__) || defined(__arm64__)
 			if ( (protection & PROT_EXEC) && loadAddress != MAP_FAILED && size > 0 ) {
 				if (mprotect(loadAddress, size, PROT_READ | PROT_WRITE) == 0) {
-					uint32_t* insns = (uint32_t*) loadAddress;
-					size_t count = size / sizeof(uint32_t);
-					for (size_t k = 0; k < count; k++) {
-						if ((insns[k] & 0xFFFFFFE0U) == 0xD53BD060U) {
-							uint32_t rt = insns[k] & 0x1FU;
-							insns[k] = 0xD53BD040U | rt; // mrs Xt, TPIDR_EL0
-							if (k + 1 < count && ((insns[k+1] & 0xFFC00000U) == 0x92400000U) &&
-							    ((insns[k+1] & 0x1FU) == rt) && (((insns[k+1] >> 5) & 0x1FU) == rt)) {
-								insns[k+1] = 0xF9402000U | (rt << 5) | rt; // ldr Xt, [Xt, #64]
-								k++;
-							}
-						}
-					}
+					size_t rewritten;
+					const bool complete = dyld3::darling_tsd::rewriteDiskTSDReads((uint32_t*)loadAddress, size / sizeof(uint32_t),
+					                                                              sys_thread_get_native_tsd_slot_offset(), &rewritten);
 					if (mprotect(loadAddress, size, protection) != 0) {
 						dyld::throwf("mprotect() failed to restore execute permission: %s", strerror(errno));
 					}
+					if (!complete)
+						dyld::throwf("'%s' reads its thread pointer from TPIDRRO_EL0 but the native loader names no TSD slot", this->getPath());
 					__builtin___clear_cache((char*)loadAddress, (char*)loadAddress + size);
 				}
 			}

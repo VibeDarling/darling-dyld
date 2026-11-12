@@ -43,10 +43,13 @@
 #include "dlfcn.h"
 
 #include "AllImages.h"
+#include "DarlingObjCCallbacks.h"
 #include "Loading.h"
 #include "Logging.h"
 #include "Diagnostics.h"
 #include "DyldSharedCache.h"
+#include "objc-shared-cache.h"
+#include "ObjCSectionInfo.h"
 #include "PathOverrides.h"
 #include "APIs.h"
 #include "Closure.h"
@@ -720,6 +723,31 @@ void _dyld_objc_notify_register(_dyld_objc_notify_mapped    mapped,
     gAllImages.setObjCNotifiers(mapped, init, unmapped);
 }
 
+// The block a v3/v4 mapped callback is handed. libobjc calls it when it makes a cache image's data
+// mutable before remapping a class or protocol reference. This loader maps the cache's data writable
+// already, so there is nothing to change; the line is the guest evidence that it was asked.
+static void markImageMutableImpl(void*, uint32_t objcImageIndex)
+{
+    log_apis("darling: objc mark_image_mutable index=%u\n", objcImageIndex);
+}
+
+static void logObjCSkip(const char* format, const char* path)
+{
+    log_apis(format, path);
+}
+
+void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
+{
+    log_apis("_dyld_objc_register_callbacks(%p)\n", callbacks);
+
+    darling::ObjCCallbackState& state = darling::objcCallbackState();
+    state.markImageMutableInvoke = markImageMutableImpl;
+    state.logSkip = logObjCSkip;
+    if ( !state.registerCallbacks(callbacks) )
+        halt(state.error);
+    gAllImages.setObjCNotifiers(darling::objcMappedThunk, darling::objcInitThunk, darling::objcUnmappedThunk);
+}
+
 
 const mach_header* dyld_image_header_containing_address(const void* addr)
 {
@@ -933,6 +961,26 @@ int dlclose(void* handle)
         setErrorString("invalid handle passed to dlclose()");
         return -1;
     }
+}
+
+const mach_header* _dyld_get_dlopen_image_header(void* handle)
+{
+    log_apis("_dyld_get_dlopen_image_header(%p)\n", handle);
+
+    if ( handle == RTLD_MAIN_ONLY )
+        return (const mach_header*)gAllImages.mainExecutable();
+    if ( (handle == RTLD_DEFAULT) || (handle == RTLD_NEXT) || (handle == RTLD_SELF) )
+        return nullptr;
+
+    const MachOLoaded*  mh;
+    bool                dontContinue;
+    parseDlHandle(handle, &mh, &dontContinue);
+
+    __block bool validHandle = false;
+    gAllImages.infoForImageWithLoadAddress(mh, ^(const LoadedImage& foundImage) {
+        validHandle = true;
+    });
+    return validHandle ? (const mach_header*)mh : nullptr;
 }
 
 
@@ -1531,6 +1579,41 @@ const char* _dyld_get_objc_selector(const char* selName)
 {
     log_apis("dyld_get_objc_selector()\n");
     return gAllImages.getObjCSelector(selName);
+}
+
+const void* _dyld_for_objc_header_opt_ro()
+{
+    log_apis("_dyld_for_objc_header_opt_ro()\n");
+    const objc_opt::objc_opt_t* opt = gAllImages.dyldCacheObjCOpt();
+    return (opt != nullptr) ? opt->headeropt_ro() : nullptr;
+}
+
+void* _dyld_for_objc_header_opt_rw()
+{
+    log_apis("_dyld_for_objc_header_opt_rw()\n");
+    const objc_opt::objc_opt_t* opt = gAllImages.dyldCacheObjCOpt();
+    return (opt != nullptr) ? opt->headeropt_rw() : nullptr;
+}
+
+uint32_t _dyld_objc_class_count()
+{
+    log_apis("_dyld_objc_class_count()\n");
+    const objc_opt::objc_opt_t* opt = gAllImages.dyldCacheObjCOpt();
+    if ( opt == nullptr )
+        return 0;
+    const objc::ClassHashTable* classes = opt->classOpt();
+    return (classes != nullptr) ? classes->classCount() : 0;
+}
+
+struct _dyld_section_info_result _dyld_lookup_section_info(const struct mach_header* mh,
+                                                           _dyld_section_location_info_t locationHandle,
+                                                           enum _dyld_section_location_kind kind)
+{
+    log_apis("_dyld_lookup_section_info()\n");
+    // A null or foreign handle is answered from the image's own section list, the fallback dyld4 takes.
+    // No caller in this dyld hands out section-location metadata yet.
+    (void)locationHandle;
+    return lookupObjCSectionInfo(mh, kind);
 }
 
 void _dyld_for_each_objc_class(const char* className,

@@ -81,6 +81,8 @@ Source is http://burtleburtle.net/bob/c/perfect.c
 */
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <optional>
 #ifdef CLOSURE_SELOPT_WRITE
 #include "Array.h"
 #include "Map.h"
@@ -107,12 +109,187 @@ Source is http://burtleburtle.net/bob/c/perfect.c
 #define S32(x) x = little_endian ? OSSwapHostToLittleInt32(x) : OSSwapHostToBigInt32(x)
 #define S64(x) x = little_endian ? OSSwapHostToLittleInt64(x) : OSSwapHostToBigInt64(x)
 
+// Perfect hash shared by the version-16 tables below and the legacy writer further down.
+namespace objc_opt {
+static uint64_t lookup8( uint8_t *k, size_t length, uint64_t level);
+}
+
+namespace objc {
+// The version-16 class/protocol tables (dyld-1376.6 common/OptimizerObjC.h). dyld reads these out of
+// the cache and never builds one, so only what the count and the name walk need is named here. The
+// arrays follow the fixed part; tab[] is where the variable-length layout begins.
+class StringHashTable {
+protected:
+    typedef uint8_t CheckByteType;
+    typedef int32_t StringOffset;
+
+    uint32_t version;    // never written
+    uint32_t capacity;
+    uint32_t occupied;
+    uint32_t shift;
+    uint32_t mask;
+    uint64_t salt;
+
+    uint32_t scramble[256];
+    uint8_t  tab[0];     // tab[mask+1], then checkbytes[capacity], then offsets[capacity]
+
+    const CheckByteType* checkbytes() const {
+        return (const CheckByteType*)&tab[mask + 1];
+    }
+    const StringOffset* offsets() const {
+        return (const StringOffset*)&checkbytes()[capacity];
+    }
+
+    uint32_t hash(const char* key, size_t keylen) const {
+        uint64_t val   = objc_opt::lookup8((uint8_t*)key, keylen, salt);
+        uint32_t index = (uint32_t)((shift == 64) ? 0 : (val >> shift)) ^ scramble[tab[val & mask]];
+        return index;
+    }
+
+    uint32_t hash(const char* key) const {
+        return hash(key, strlen(key));
+    }
+
+    // Reject strings that are not in the table without paging in the cstring data.
+    CheckByteType checkbyte(const char* key, size_t keylen) const {
+        return ((key[0] & 0x7) << 5) | ((uint8_t)keylen & 0x1f);
+    }
+
+    CheckByteType checkbyte(const char* key) const {
+        return checkbyte(key, strlen(key));
+    }
+
+    std::optional<uint32_t> tryGetIndex(const char* key) const {
+        size_t   keylen = strlen(key);
+        uint32_t h      = hash(key, keylen);
+
+        CheckByteType h_check   = checkbytes()[h];
+        CheckByteType key_check = checkbyte(key, keylen);
+        if ( h_check != key_check )
+            return {};
+
+        StringOffset offset = offsets()[h];
+        if ( offset == 0 )
+            return {};
+
+        const char* result = (const char*)this + offset;
+        if ( 0 != strcmp(key, result) )
+            return {};
+
+        return h;
+    }
+};
+
+// Precomputed version-16 selector table. The cache's selector table starts with a version word,
+// so its fields sit one word later than the version-15 objc_stringhash_t below.
+class SelectorHashTable : public StringHashTable {
+public:
+    // Readers that walk the table directly (dyld_shared_cache_util.cpp) use these names.
+    using StringHashTable::capacity;
+    using StringHashTable::offsets;
+    using StringHashTable::tryGetIndex;
+
+    const char* get(const char* key) const {
+        if ( std::optional<uint32_t> index = tryGetIndex(key) )
+            return getEntryForIndex(*index);
+        return nullptr;
+    }
+
+    const char* getEntryForIndex(uint32_t index) const {
+        return (const char*)this + offsets()[index];
+    }
+};
+
+class ObjectHashTable : public StringHashTable {
+protected:
+    struct ObjectData {
+        struct Object {
+            uint64_t isDuplicate       : 1,    // == 0
+                     objectCacheOffset : 47,
+                     dylibObjCIndex    : 16;
+        };
+        struct Duplicate {
+            uint64_t isDuplicate : 1,          // == 1
+                     index       : 47,
+                     count       : 16;
+        };
+        union {
+            Object    object;
+            Duplicate duplicate;
+            uint64_t  raw;
+        };
+
+        bool isDuplicate() const { return duplicate.isDuplicate; }
+        uint32_t duplicateCount() const { return (uint32_t)duplicate.count; }
+        uint32_t duplicateIndex() const { return (uint32_t)duplicate.index; }
+    };
+
+    // objectOffsets[capacity], then the uint32_t duplicate count, then duplicateOffsets[]
+    const ObjectData* objectOffsets() const { return (const ObjectData*)&offsets()[capacity]; }
+    const uint32_t& duplicateCount() const {
+        return *(const uint32_t*)&objectOffsets()[capacity];
+    }
+    const ObjectData* duplicateOffsets() const {
+        return (const ObjectData*)(&duplicateCount() + 1);
+    }
+
+    // Calls callback(objectCacheOffset, dylibObjCIndex, stopObjects) once per implementation of key, and
+    // stops when a callback sets stopObjects. A template rather than the block Apple's copy takes: this
+    // tree builds dyld for a plain arm64 target and the walk is driver-independent.
+    template <typename ObjectCallback>
+    void forEachObject(const char* key, ObjectCallback callback) const {
+        std::optional<uint32_t> index = tryGetIndex(key);
+        if ( !index.has_value() )
+            return;
+
+        const ObjectData& data = objectOffsets()[*index];
+        if ( !data.isDuplicate() ) {
+            bool stopObjects = false;
+            callback(data.object.objectCacheOffset, data.object.dylibObjCIndex, stopObjects);
+            return;
+        }
+
+        // The object appears in more than one header. The duplicates are one array for the whole table,
+        // and the table declares its length; a range past that array is cache content contradicting itself.
+        uint32_t count = data.duplicateCount();
+        uint32_t first = data.duplicateIndex();
+        uint32_t total = duplicateCount();
+        if ( (first > total) || (count > total - first) )
+            return;
+        const ObjectData* list = &duplicateOffsets()[first];
+        for ( uint32_t i = 0; i < count; ++i ) {
+            bool stopObjects = false;
+            callback(list[i].object.objectCacheOffset, list[i].object.dylibObjCIndex, stopObjects);
+            if ( stopObjects )
+                break;
+        }
+    }
+};
+
+class ClassHashTable : public ObjectHashTable {
+public:
+    uint32_t classCount() const { return occupied + duplicateCount(); }
+
+    template <typename ObjectCallback>
+    void forEachClass(const char* key, ObjectCallback callback) const {
+        forEachObject(key, callback);
+    }
+};
+
+class ProtocolHashTable : public ObjectHashTable {
+public:
+    template <typename ObjectCallback>
+    void forEachProtocol(const char* key, ObjectCallback callback) const {
+        forEachObject(key, callback);
+    }
+};
+} // namespace objc
+
+// Top-level optimization structure.
 namespace objc_opt {
 
 typedef int32_t objc_stringhash_offset_t;
 typedef uint8_t objc_stringhash_check_t;
-
-static uint64_t lookup8( uint8_t *k, size_t length, uint64_t level);
 
 #if defined(SELOPT_WRITE) || defined(CLOSURE_SELOPT_WRITE)
 
@@ -167,8 +344,8 @@ static void make_perfect(const string_map& strings, perfect_hash& phash);
 #endif // defined(SELOPT_WRITE)
 
 
-// Precomputed perfect hash table of strings.
-// Base class for precomputed selector table and class table.
+// Version-15 perfect hash table of strings.
+// Base class for the version-15 class and protocol tables.
 // Edit objc-sel-table.s if you change this structure.
 struct __attribute__((packed)) objc_stringhash_t {
     uint32_t capacity;
@@ -344,29 +521,21 @@ struct __attribute__((packed)) objc_stringhash_t {
 #endif
 };
 
-// Precomputed selector table.
-// Edit objc-sel-table.s if you change this structure.
-struct objc_selopt_t : objc_stringhash_t {
+// Precomputed version-16 selector table: a StringHashTable whose offsets() point at the strings.
+struct objc_selopt_t : objc::SelectorHashTable {
 
-    const char* getEntryForIndex(uint32_t index) const {
-        return (const char *)this + offsets()[index];
-    }
-
+    // Names kept for the version-15 readers.
     uint32_t getIndexForKey(const char *key) const {
-        return getIndex(key);
+        std::optional<uint32_t> index = tryGetIndex(key);
+        return index.has_value() ? *index : INDEX_NOT_FOUND;
     }
 
     uint32_t getSentinelIndex() const {
         return INDEX_NOT_FOUND;
     }
 
-    const char* get(const char *key) const
-    {
-        uint32_t h = getIndex(key);
-        if (h == INDEX_NOT_FOUND) return NULL;
-        return getEntryForIndex(h);
-    }
-
+    // The version-15 name for the table size. Its only caller bounds the 24-bit selector
+    // indices in SelectorReferenceFixup, and those indices range over capacity, not occupancy.
     size_t usedCount() const {
         return capacity;
     }
@@ -732,15 +901,35 @@ struct objc_protocolopt2_t : objc_clsopt_t {
 // Precomputed image list.
 struct objc_headeropt_ro_t;
 
-// Precomputed image list.
-struct objc_headeropt_rw_t;
+// One image's loaded state, as libobjc writes it through this table when it maps the image.
+struct header_info_rw {
+    uint64_t isLoaded           : 1,
+             allClassesRealized : 1,
+             next               : 62;
+};
+STATIC_ASSERT(sizeof(header_info_rw) == 8);
+
+// Precomputed image list. The class and protocol enumerations report an entry's definition image as
+// loaded only when libobjc has set that image's bit. The table is cache content, so a stride too small
+// to hold an entry reads nothing: an entry may be larger than this struct, never smaller.
+struct objc_headeropt_rw_t {
+    uint32_t count;
+    uint32_t entsize;
+    header_info_rw headers[0];  // sorted by mhdr address
+
+    bool isLoaded(uint32_t index) const {
+        if ( (index >= count) || (entsize < sizeof(header_info_rw)) )
+            return false;
+        return ((const header_info_rw*)((const uint8_t*)headers + index * entsize))->isLoaded;
+    }
+};
 
 // Precomputed class list.
 struct objc_clsopt_t;
 
 // Edit objc-sel-table.s if you change this value.
 // lldb and Symbolication read these structures. Inform them of any changes.
-enum { VERSION = 15 };
+enum { VERSION = 16 };
 
 // Values for objc_opt_t::flags
 enum : uint32_t {
@@ -759,6 +948,10 @@ struct alignas(alignof(void*)) objc_opt_t {
     int32_t unused_protocolopt_offset; // This is now 0 as we've moved to the new protocolopt_offset
     int32_t headeropt_rw_offset;
     int32_t protocolopt_offset;
+
+    int32_t largeSharedCachesClassOffset;               // v16: the class table
+    int32_t largeSharedCachesProtocolOffset;            // v16: the protocol table
+    int64_t relativeMethodSelectorBaseAddressOffset;    // v16: relative method lists
 
     const objc_selopt_t* selopt() const {
         if (selopt_offset == 0) return NULL;
@@ -792,6 +985,21 @@ struct alignas(alignof(void*)) objc_opt_t {
     struct objc_headeropt_rw_t* headeropt_rw() const {
         if (headeropt_rw_offset == 0) return NULL;
         return (struct objc_headeropt_rw_t *)((uint8_t *)this + headeropt_rw_offset);
+    }
+
+    const objc::ClassHashTable* classOpt() const {
+        if (largeSharedCachesClassOffset == 0) return NULL;
+        return (const objc::ClassHashTable *)((const uint8_t *)this + largeSharedCachesClassOffset);
+    }
+
+    const objc::ProtocolHashTable* protocolOpt() const {
+        if (largeSharedCachesProtocolOffset == 0) return NULL;
+        return (const objc::ProtocolHashTable *)((const uint8_t *)this + largeSharedCachesProtocolOffset);
+    }
+
+    const void* relativeMethodListsBaseAddress() const {
+        if (relativeMethodSelectorBaseAddressOffset == 0) return NULL;
+        return (const void *)((const uint8_t *)this + relativeMethodSelectorBaseAddressOffset);
     }
 };
 
