@@ -49,6 +49,11 @@ REPLAY = <<~'CPP'
 
   namespace dyld { void warn(const char*, ...) { } }
   struct MachHeader { int cpusubtype; };
+  typedef MachHeader mach_header;
+  // dyld's own image: the predicate reads its mach header through the symbol __dso_handle, which is the start of this arena (renamed
+  // here, because the C runtime of this host defines its own __dso_handle)
+  #define __dso_handle gDyldHandle
+  alignas(16384) uint8_t gDyldImage[0x8000] asm("gDyldHandle");
   struct ImageLoader {
     MachHeader mh; uint64_t lo, hi;
     // images with a real header and segments, for the function-entry predicate
@@ -82,7 +87,7 @@ REPLAY = <<~'CPP'
   static ImageLoader gArm64eTarget = { { 2 }, 0x5000, 0x6000 };
   // images with memory behind them, for the function-entry predicate: P plain, A arm64e, C plain in the cache, N plain without
   // function starts, B plain whose function-starts table lies outside its LINKEDIT, E plain whose load commands do not parse
-  enum { kP, kA, kC, kN, kB, kE, kImages };
+  enum { kP, kA, kC, kN, kB, kE, kD, kImages };
   static ImageLoader gReal[kImages];
   namespace dyld {
     ImageLoader* findImageContainingAddress(const void* a) {
@@ -163,8 +168,12 @@ REPLAY = <<~'CPP'
     CHECK(shift < 0x1000, "every placement of the plain image is a PAC fixed point");
     const uint8_t starts[] = { 0x80, 0x20, 0x40, 0xD0, 0x1F, 0x00 };
     for (int k = 0; k != kImages; ++k) {
-      uint8_t* base = arena[k] + ((k == kP) ? shift : 0);
-      memcpy(base + 0x3010, starts, sizeof(starts));
+      uint8_t* base = (k == kD) ? gDyldImage : arena[k] + ((k == kP) ? shift : 0);
+      // dyld's starts: 0x1000, 0x1040, 0x1080, 0x10c0, 0x1100 (so that one of them is not a PAC fixed point), plain images': see above
+      static const uint8_t dyldStarts[] = { 0x80, 0x20, 0x40, 0x40, 0x40, 0x40, 0x00 };
+      const uint8_t* blob = (k == kD) ? dyldStarts : starts;
+      const size_t blobSize = (k == kD) ? sizeof(dyldStarts) : sizeof(starts);
+      memcpy(base + 0x3010, blob, blobSize);
       ((MachHeader*)base)->cpusubtype = (k == kA) ? 2 : 0;
       ImageLoader& im = gReal[k];
       im.header = (const MachHeader*)base; im.lo = (uint64_t)base; im.hi = (uint64_t)base + 0x4000;
@@ -173,7 +182,7 @@ REPLAY = <<~'CPP'
       im.segs[1] = { false, (uint64_t)base + 0x2000, (uint64_t)base + 0x3000 };
       FakeLinkEdit& le = gLinkEdit[gLinkEditCount++];
       le.header = (uint64_t)base; le.hasStarts = (k != kN); le.diagError = (k == kE);
-      le.cmd = { 0x26, 16, 0x9010, (uint32_t)sizeof(starts) };
+      le.cmd = { 0x26, 16, 0x9010, (uint32_t)blobSize };
       if ( k == kB ) le.cmd.datasize = 0x2000;
       le.layout = { 0x7000, 0, (uintptr_t)base + 0x3000 - 0x7000, 0x9000, 0x1000, 2, 2 };
     }
@@ -238,6 +247,17 @@ REPLAY = <<~'CPP'
     CHECK(!darlingAddressIsPlainFunctionEntry(B + 0x1000), "a function-starts table outside the LINKEDIT was read");
     CHECK(!darlingAddressIsPlainFunctionEntry(E + 0x1000), "an image whose load commands do not parse signed an address");
     CHECK(!darlingAddressIsPlainFunctionEntry(0) && !darlingAddressIsPlainFunctionEntry(0x1234), "an address in no image was accepted");
+    // dyld's own functions: no image of the list holds dyld, so its entries are checked against its own header and function starts
+    const uint64_t D = (uint64_t)gReal[kD].header;
+    CHECK(D == (uint64_t)&gDyldImage[0] && dyld::findImageContainingAddress((const void*)(D + 0x1000)) == nullptr, "the dyld fixture is in the image list");
+    const uint64_t dyldEntries[] = { D + 0x1000, D + 0x1040, D + 0x1080, D + 0x10c0, D + 0x1100 };
+    for (uint64_t entry : dyldEntries)
+      CHECK(darlingAddressIsPlainFunctionEntry(entry), "a function start of dyld itself (%llx) was refused", (unsigned long long)entry);
+    CHECK(!darlingAddressIsPlainFunctionEntry(D + 0x1004) && !darlingAddressIsPlainFunctionEntry(D + 0x1044) && !darlingAddressIsPlainFunctionEntry(D + 0x1120) && !darlingAddressIsPlainFunctionEntry(D), "a mid-function address of dyld or its header was accepted");
+    CHECK(!darlingAddressIsPlainFunctionEntry(D - 0x40) && !darlingAddressIsPlainFunctionEntry(D + 0x3010) && !darlingAddressIsPlainFunctionEntry(D + 0x9000), "an address before dyld's header or in its LINKEDIT was accepted");
+    ((MachHeader*)gDyldImage)->cpusubtype = 2;
+    CHECK(!darlingAddressIsPlainFunctionEntry(D + 0x1000), "an arm64e dyld signed an address");
+    ((MachHeader*)gDyldImage)->cpusubtype = 0;
     CHECK(!darlingAddressIsPlainFunctionEntry(oracleSign(P + 0x1000, 0)), "an already signed address was accepted");
     // the decision
     ImageLoader calleeImage = { { 2 }, (uint64_t)&fakeCallee, (uint64_t)&fakeCallee + 0x40 };
@@ -290,7 +310,9 @@ REPLAY = <<~'CPP'
     // process so that none is a fixed point of its own signature.
     const uint64_t midFunction = notAFixedPoint(P + 0x1004, P + 0x1040, 4);
     const uint64_t inArm64e = notAFixedPoint(A + 0x1000, A + 0x1040, 4);
-    CHECK((midFunction != 0) && (inArm64e != 0), "no value free of PAC fixed points for the atexit checks");
+    const uint64_t dyldEntry = notAFixedPoint(D + 0x1000, D + 0x1140, 0x40);
+    const uint64_t dyldMid = notAFixedPoint(D + 0x1004, D + 0x1040, 4);
+    CHECK((midFunction != 0) && (inArm64e != 0) && (dyldEntry != 0) && (dyldMid != 0), "no value free of PAC fixed points for the atexit checks");
     const char* const atexitSymbols[] = { "_atexit", "___cxa_atexit" };
     for (const char* atexitSymbol : atexitSymbols) {
       const uint64_t atexitBound = hook4(&plainImporter, BIND_TYPE_POINTER, atexitSymbol, 0, callee, &calleeImage);
@@ -301,6 +323,11 @@ REPLAY = <<~'CPP'
       CHECK(gSeen[0] == oracleSign(P + 0x1040, 0), "%s: a plain handler was not signed (IA, 0)", atexitSymbol);
       CHECK(gSeen[1] == 0x7001 && gSeen[2] == 0x7002, "%s: the argument and the dso handle changed", atexitSymbol);
       const uint64_t others[] = { midFunction, inArm64e, 0 };
+      // dyld registers its own dyld::runAllStaticTerminators here (src/dyld2.cpp:1994), through libdyld's cxa_atexit_thunk
+      ((Fn8)atexitBound)(dyldEntry, 0x7001, 0x7002, 3, 4, 5, 6, 7);
+      CHECK(gSeen[0] == oracleSign(dyldEntry, 0), "%s: dyld's own function was not signed (IA, 0)", atexitSymbol);
+      ((Fn8)atexitBound)(dyldMid, 0x7001, 0x7002, 3, 4, 5, 6, 7);
+      CHECK(gSeen[0] == dyldMid, "%s: a mid-function address of dyld was signed", atexitSymbol);
       for (uint64_t other : others) {
         ((Fn8)atexitBound)(other, 0x7001, 0x7002, 3, 4, 5, 6, 7);
         CHECK(gSeen[0] == other, "%s: %llx, which is no entry of a plain image, was signed", atexitSymbol, (unsigned long long)other);
@@ -430,13 +457,16 @@ Dir.mktmpdir('darling-arm64e-adapters-hooks-') do |dir|
     'the reverse hook thunks an interposed address' => [:loader, ' || !exporter->containsAddress((void*)symbolAddress)', ''],
     'the reverse hook ignores the exporter\'s cpu subtype' => [:loader, 'dyld3::darling::cpusubtypeIsArm64e(exporter->machHeader()->cpusubtype), &darling', 'true, &darling'],
     'the reverse hook passes no predicate' => [:loader, ', &darlingAddressIsPlainFunctionEntry)', ', nullptr)'],
-    'the entry predicate accepts an image of the cache' => [:loader, '(image == NULL) || image->inSharedCache()', '(image == NULL)'],
-    'the entry predicate accepts an arm64e image' => [:loader, "\tif ( dyld3::darling::cpusubtypeIsArm64e(image->machHeader()->cpusubtype) )\n\t\treturn false;\n", ''],
-    'the entry predicate accepts an address outside the executable segments' => [:loader, "\tif ( !inExecutableSegment )\n\t\treturn false;\n", ''],
+    'the entry predicate accepts an image of the cache' => [:loader, "\t\tif ( image->inSharedCache() )\n\t\t\treturn false;\n", ''],
+    'the entry predicate accepts an arm64e image' => [:loader, "\t\tif ( dyld3::darling::cpusubtypeIsArm64e(image->machHeader()->cpusubtype) )\n\t\t\treturn false;\n", ''],
+    'the entry predicate accepts an address outside the executable segments' => [:loader, "\t\tif ( !inExecutableSegment )\n\t\t\treturn false;\n", ''],
     'the entry predicate ignores a load-command error' => [:loader, 'diag.hasError() || ', ''],
     'the entry predicate accepts an image with no function starts' => [:loader, ' || (leInfo.functionStarts == NULL) )', ' )'],
     'the entry predicate reads a table outside the LINKEDIT' => [:loader, "\t\treturn false;\n\tconst uint8_t* blob", "\t\t;\n\tconst uint8_t* blob"],
     'the entry predicate forgets the slide' => [:loader, '(layout.linkeditUnslidVMAddr + layout.slide)', '(layout.linkeditUnslidVMAddr)'],
+    'the entry predicate has no branch for dyld itself' => [:loader, "\t\tml = (const dyld3::MachOLoaded*)&__dso_handle;\n\t\tif ( dyld3::darling::cpusubtypeIsArm64e(__dso_handle.cpusubtype) )\n\t\t\treturn false;\n", "\t\treturn false;\n"],
+    'the entry predicate signs for an arm64e dyld' => [:loader, "\t\tif ( dyld3::darling::cpusubtypeIsArm64e(__dso_handle.cpusubtype) )\n\t\t\treturn false;\n", ''],
+    'the entry predicate reads the function starts after the header of dyld' => [:loader, '&__dso_handle;', '&__dso_handle + 1;'],
     'the entry predicate measures the offset from zero' => [:loader, 'address - (uint64_t)(uintptr_t)ml)', 'address)'],
     'off means on' => [:dyld2, 'strcmp(value, "off") == 0 ? dyld3::darling::AdapterMode::Off', 'strcmp(value, "off") == 0 ? dyld3::darling::AdapterMode::On'],
   }

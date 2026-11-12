@@ -864,23 +864,35 @@ uintptr_t ImageLoaderMachOCompressed::resolve(const LinkContext& context, const 
 #ifdef DARLING
 // True when `address` is a function entry of a loaded plain image: it lies in an executable segment of an image that is
 // neither arm64e nor in the shared cache, and its offset from the mach header is one of the image's own LC_FUNCTION_STARTS.
+// dyld's own text is no image in the list (dyld registers dyld::runAllStaticTerminators with atexit, and its callbacks reach
+// other arm64e exports), so an address that is in no image is checked against dyld's own mach header, __dso_handle, and
+// function starts. dyld is a plain arm64 image; an arm64e one is refused.
 // Metadata only. findImageContainingAddress reads the image list, and the function starts are read from the image's mapped
 // LINKEDIT, both without dyld's lock, like dladdr (see the residual trust in DarlingArm64eAdapters.h).
 static bool darlingAddressIsPlainFunctionEntry(uint64_t address)
 {
+	extern const mach_header __dso_handle;
 	const ImageLoader* image = dyld::findImageContainingAddress((const void*)address);
-	if ( (image == NULL) || image->inSharedCache() )
-		return false;
-	const dyld3::MachOLoaded* ml = (const dyld3::MachOLoaded*)image->machHeader();
-	if ( dyld3::darling::cpusubtypeIsArm64e(image->machHeader()->cpusubtype) )
-		return false;
-	bool inExecutableSegment = false;
-	for (unsigned i = 0, n = image->segmentCount(); i != n; ++i) {
-		if ( image->segExecutable(i) && (address >= image->segActualLoadAddress(i)) && (address < image->segActualEndAddress(i)) )
-			inExecutableSegment = true;
+	const dyld3::MachOLoaded* ml;
+	if ( image != NULL ) {
+		if ( image->inSharedCache() )
+			return false;
+		ml = (const dyld3::MachOLoaded*)image->machHeader();
+		if ( dyld3::darling::cpusubtypeIsArm64e(image->machHeader()->cpusubtype) )
+			return false;
+		bool inExecutableSegment = false;
+		for (unsigned i = 0, n = image->segmentCount(); i != n; ++i) {
+			if ( image->segExecutable(i) && (address >= image->segActualLoadAddress(i)) && (address < image->segActualEndAddress(i)) )
+				inExecutableSegment = true;
+		}
+		if ( !inExecutableSegment )
+			return false;
 	}
-	if ( !inExecutableSegment )
-		return false;
+	else {
+		ml = (const dyld3::MachOLoaded*)&__dso_handle;
+		if ( dyld3::darling::cpusubtypeIsArm64e(__dso_handle.cpusubtype) )
+			return false;
+	}
 	Diagnostics diag;
 	dyld3::MachOLoaded::LinkEditInfo leInfo = {};
 	ml->getLinkEditPointers(diag, leInfo);
