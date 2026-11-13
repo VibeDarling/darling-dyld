@@ -12,6 +12,7 @@ dyld2_h = File.read("#{root}/src/dyld2.h")
 runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
 runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
 without_root = dyld2[/^static const char\* pathWithoutRoot\(.*?^\}/m] or abort 'pathWithoutRoot missing'
+spelling = dyld2[/^static bool findInSharedCacheImageBySpelling\(.*?^\}/m] or abort 'findInSharedCacheImageBySpelling missing'
 load5 = dyld2[/^static ImageLoader\* loadPhase5load\(.*?^\}/m] or abort 'loadPhase5load missing'
 relative = dyld2[/^static bool isFileRelativePath\(.*?^\}/m] or abort 'isFileRelativePath missing'
 records = (dyld2[/^static std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;.*?^\}/m] or abort 'override vector missing') + "\n" +
@@ -39,6 +40,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
     #include <errno.h>
     #include <sys/stat.h>
     #include <sys/types.h>
+    #include <limits.h>
     #include <string>
     #include <vector>
     #include <map>
@@ -132,6 +134,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       #{records}
       #{in_cache}
       #{without_root}
+      #{spelling}
       #{load5}
     }
     ImageLoader* ImageLoaderMachO::instantiateFromCache(macho_header*, const char* path, long, const struct stat& sb, ImageLoader::LinkContext&) {
@@ -274,7 +277,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
 
       // --- loadPhase1: an allow-listed path (any alias) cannot be replaced by a search-path override ---
       auto cannotOverride = [&](const char* path) {
-        #{pinned.gsub('sSharedCacheLoadInfo', 'dyld::sSharedCacheLoadInfo')}
+        #{pinned.gsub('sSharedCacheLoadInfo', 'dyld::sSharedCacheLoadInfo').gsub('findInSharedCacheImageBySpelling', 'dyld::findInSharedCacheImageBySpelling')}
         return pathIsInDyldCacheWhichCannotBeOverridden;
       };
       CHECK(cannotOverride(kLibz) && cannotOverride(kLibzAlias));
@@ -282,6 +285,19 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       f.cache.split = false;
       CHECK(!cannotOverride(kLibz));
       f.cache.split = true;
+      // the path loadPhase0 puts DYLD_ROOT_PATH in front of, and a symlinked spelling of it, are pinned like the cache name
+      {
+        char tmpl[] = "/tmp/pinned-alias-XXXXXX"; char* made = mkdtemp(tmpl); CHECK(made != nullptr);
+        char* realRoot = realpath(made, nullptr); std::string root = realRoot; free(realRoot);
+        system(("mkdir -p '" + root + "/usr/lib' && touch '" + root + "/usr/lib/libz.1.dylib' && ln -s libz.1.dylib '" + root + "/usr/lib/libz-link.dylib' && ln -s libnone.dylib '" + root + "/usr/lib/libdangling.dylib'").c_str());
+        const char* roots[2] = { root.c_str(), nullptr };
+        dyld::gLinkContext.rootPaths = roots;
+        const std::string prefixed = root + kLibz, linked = root + "/usr/lib/libz-link.dylib", dangling = root + "/usr/lib/libdangling.dylib";
+        CHECK(cannotOverride(prefixed.c_str()) && cannotOverride(linked.c_str()));
+        CHECK(!cannotOverride(dangling.c_str()));
+        dyld::gLinkContext.rootPaths = nullptr;
+        system(("rm -rf '" + root + "'").c_str());
+      }
 
       if (failures) { printf("%d failure(s)\\n", failures); return 1; }
       puts("PASS loadPhase5load precedence (split and old caches), stat zeroing, override record, unfiltered lookups, pinned search paths");

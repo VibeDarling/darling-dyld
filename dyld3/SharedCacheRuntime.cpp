@@ -1927,13 +1927,11 @@ SharedCacheLoadSource chooseSharedCacheLoadSource(bool isSplitCache, bool inCach
     return existsOnDisk ? kSharedCacheLoadFromDisk : kSharedCacheLoadFromCache;
 }
 
-bool pathIsPinnedToSharedCache(const SharedCacheLoadInfo& loadInfo, const char* path)
+bool pathIsPinnedToSharedCache(const SharedCacheLoadInfo& loadInfo, const SharedCacheFindDylibResults& found)
 {
-    if ( (loadInfo.loadAddress == nullptr) || !loadInfo.loadAddress->isSplitCache() )
+    if ( (loadInfo.loadAddress == nullptr) || !loadInfo.loadAddress->isSplitCache() || (found.cacheImageIndex == kNoCacheImageIndex) )
         return false;
-    SharedCacheFindDylibResults results;
-    return findInSharedCacheImage(loadInfo, path, &results)
-        && sharedCachePathIsAllowListed(results.pathInCache, sharedCacheAllowList());
+    return sharedCachePathIsAllowListed(found.pathInCache, sharedCacheAllowList());
 }
 
 #if defined(DARLING) && !TARGET_OS_SIMULATOR

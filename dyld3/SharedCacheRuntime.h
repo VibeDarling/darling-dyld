@@ -156,7 +156,7 @@ SharedCacheLoadSource chooseSharedCacheLoadSource(bool isSplitCache, bool inCach
 
 // True when path (or an alias of it) is an allow-listed image of a split cache, so no search-path override
 // may replace it either.
-bool pathIsPinnedToSharedCache(const SharedCacheLoadInfo& loadInfo, const char* path);
+bool pathIsPinnedToSharedCache(const SharedCacheLoadInfo& loadInfo, const SharedCacheFindDylibResults& found);
 
 void deallocateExistingSharedCache();
 

@@ -11,6 +11,7 @@ dyld2_h = File.read("#{root}/src/dyld2.h")
 runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
 runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
 without_root = dyld2[/^static const char\* pathWithoutRoot\(.*?^\}/m] or abort 'pathWithoutRoot missing'
+spelling = dyld2[/^static bool findInSharedCacheImageBySpelling\(.*?^\}/m] or abort 'findInSharedCacheImageBySpelling missing'
 load5 = dyld2[/^static ImageLoader\* loadPhase5load\(.*?^\}/m] or abort 'loadPhase5load missing'
 relative = dyld2[/^static bool isFileRelativePath\(.*?^\}/m] or abort 'isFileRelativePath missing'
 records = (dyld2[/^static std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;.*?^\}/m] or abort 'override vector missing') + "\n" +
@@ -44,6 +45,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
     #include <fcntl.h>
     #include <sys/stat.h>
     #include <sys/types.h>
+    #include <limits.h>
     #include <string>
     #include <vector>
     #include <map>
@@ -142,6 +144,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       #{records}
       #{in_cache}
       #{without_root}
+      #{spelling}
       #{load5}
     }
     ImageLoader* ImageLoaderMachO::instantiateFromCache(macho_header*, const char* path, long, const struct stat& sb, ImageLoader::LinkContext&) {

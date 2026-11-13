@@ -3739,6 +3739,28 @@ static const char* pathWithoutRoot(const char* path)
 }
 
 
+// The split cache's path table lists the canonical install name and the aliases its builder recorded; a path that reaches
+// a cache image only through directory symlinks (CoreServices.framework/Frameworks/LaunchServices.framework/LaunchServices
+// goes through two) is in neither. Every spelling of a cache image's path has to get the same decision from the policy,
+// so an absolute path that a split cache does not list is resolved through the file system and looked up again. A
+// relative path, a leaf name or an @rpath spelling is never a cache path, and realpath would resolve it against the
+// working directory, so it is looked up as it is. found is the cache's answer, canonical path included; resolved is scratch.
+static bool findInSharedCacheImageBySpelling(const char* path, char (&resolved)[PATH_MAX], dyld3::SharedCacheFindDylibResults& found)
+{
+	const char* const asCacheKnowsIt = pathWithoutRoot(path);
+	if ( dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, asCacheKnowsIt, &found) )
+		return true;
+	if ( (sSharedCacheLoadInfo.loadAddress == nullptr) || !sSharedCacheLoadInfo.loadAddress->isSplitCache() || (path[0] != '/') )
+		return false;
+	if ( realpath(path, resolved) == NULL )
+		return false;
+	const char* const resolvedAsCacheKnowsIt = pathWithoutRoot(resolved);
+	if ( strcmp(resolvedAsCacheKnowsIt, asCacheKnowsIt) == 0 )
+		return false;
+	return dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, resolvedAsCacheKnowsIt, &found);
+}
+
+
 // try to open file
 static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const LoadContext& context, unsigned& cacheIndex, std::vector<const char*>* exceptions)
 {
@@ -3774,7 +3796,8 @@ static ImageLoader* loadPhase5load(const char* path, const char* orgPath, const 
 #else
 
 	auto findSharedCacheImage = ^() {
-		return dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, pathWithoutRoot(path), &shareCacheResults);
+		char resolved[PATH_MAX];
+		return findInSharedCacheImageBySpelling(path, resolved, shareCacheResults);
 	};
 
 #endif
@@ -4212,8 +4235,11 @@ static ImageLoader* loadPhase1(const char* path, const char* orgPath, const Load
 
 	bool pathIsInDyldCacheWhichCannotBeOverridden = false;
 	if ( sSharedCacheLoadInfo.loadAddress != nullptr ) {
+		char resolved[PATH_MAX];
+		dyld3::SharedCacheFindDylibResults found;
 		pathIsInDyldCacheWhichCannotBeOverridden = sSharedCacheLoadInfo.loadAddress->hasNonOverridablePath(path)
-												|| dyld3::pathIsPinnedToSharedCache(sSharedCacheLoadInfo, path);
+												|| ( findInSharedCacheImageBySpelling(path, resolved, found)
+													&& dyld3::pathIsPinnedToSharedCache(sSharedCacheLoadInfo, found) );
 	}
 
 	// <rdar://problem/48490116> dyld customer cache cannot be overridden

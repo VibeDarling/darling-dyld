@@ -121,32 +121,34 @@ Dir.mktmpdir('shared-cache-precedence-') do |dir|
       f.images[1].address = 0x200000; f.images[1].pathFileOffset = offsetof(Fixture, objc);
       SharedCacheLoadInfo load = { &f.cache, 0 };
       SharedCacheFindDylibResults res = {};
+      // the lookup first, as loadPhase1 does, then the pin of what it found
+      auto pinnedByPath = [&](const SharedCacheLoadInfo& info, const char* path) { SharedCacheFindDylibResults r = {}; findInSharedCacheImage(info, path, &r); return pathIsPinnedToSharedCache(info, r); };
       for (const char* name : { "/usr/lib/libz.dylib", "/usr/lib/libz.1.dylib" }) {
         CHECK(findInSharedCacheImage(load, name, &res) && res.cacheImageIndex == 0 && strcmp(res.pathInCache, kLibzPath) == 0);
         CHECK(chooseSharedCacheLoadSource(true, true, true, res.pathInCache, sharedCacheAllowList()) == C);
-        CHECK(pathIsPinnedToSharedCache(load, name));
+        CHECK(pinnedByPath(load, name));
       }
       // The alias string itself must not be what the rule sees: it is not allow-listed, so a disk copy would win.
       CHECK(chooseSharedCacheLoadSource(true, true, true, "/usr/lib/libz.dylib", sharedCacheAllowList()) == D);
       CHECK(findInSharedCacheImage(load, kOther, &res) && res.cacheImageIndex == 1);
-      CHECK(!pathIsPinnedToSharedCache(load, kOther));
-      CHECK(!pathIsPinnedToSharedCache(load, "/usr/lib/libnotthere.dylib"));
-      CHECK(!pathIsPinnedToSharedCache(load, "/usr/lib/libz.1.dylibx"));
+      CHECK(!pinnedByPath(load, kOther));
+      CHECK(!pinnedByPath(load, "/usr/lib/libnotthere.dylib"));
+      CHECK(!pinnedByPath(load, "/usr/lib/libz.1.dylibx"));
       // Both routes agree on a cache image whose recorded path is unusable: not pinned, today's rule.
       for (const char* odd : { "", "relative/libobjc.dylib", longer.c_str() }) {
         strcpy(f.objc, odd);
         CHECK(findInSharedCacheImage(load, kOther, &res) && strcmp(res.pathInCache, odd) == 0);
-        CHECK(!pathIsPinnedToSharedCache(load, kOther));
+        CHECK(!pinnedByPath(load, kOther));
         CHECK(chooseSharedCacheLoadSource(true, true, true, res.pathInCache, sharedCacheAllowList()) == D);
         CHECK(chooseSharedCacheLoadSource(true, true, false, res.pathInCache, sharedCacheAllowList()) == C);
       }
       strcpy(f.objc, kOther);
       // Old caches and a missing cache pin nothing, even for the allow-listed path.
       f.cache.split = false;
-      CHECK(!pathIsPinnedToSharedCache(load, kLibzPath));
+      CHECK(!pinnedByPath(load, kLibzPath));
       f.cache.split = true;
       SharedCacheLoadInfo none = { nullptr, 0 };
-      CHECK(!pathIsPinnedToSharedCache(none, kLibzPath));
+      CHECK(!pinnedByPath(none, kLibzPath));
       // The lookup itself is not filtered by the list: a path that is in the cache but not allow-listed is still found.
       CHECK(findInSharedCacheImage(load, kOther, &res) && strcmp(res.pathInCache, kOther) == 0);
 
