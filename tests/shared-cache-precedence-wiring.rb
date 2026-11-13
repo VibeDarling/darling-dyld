@@ -124,7 +124,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       }
       bool sandboxBlockedStat(const char*) { return false; }
       const char* mkstringf(const char*, ...) { return ""; }
-      bool gLogCachePolicy = false;           // DYLD_PRINT_CACHE_POLICY is not exercised here
+      bool gLogCachePolicy = false;           // DARLING_DYLD_POLICY_LOG is not exercised here
       void log(const char*, ...) {}
       __attribute__((noreturn)) void throwf(const char* fmt, ...) { char buf[256]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap); throw std::string(buf); }
       #{record_struct}

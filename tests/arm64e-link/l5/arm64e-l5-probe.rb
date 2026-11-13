@@ -94,8 +94,8 @@ Dir.mktmpdir('l5-runner-') do |dir|
   launcher_env = File.exist?(env['STUB_OUT'] + '.env') ? File.read(env['STUB_OUT'] + '.env') : ''
   check 'run_l5.sh runs against a stub launcher (Darling is not booted)', st.success? && !guest.empty?, e[0, 200]
   c3 = guest[/CONFIG c3; (.*?)"\$E"/m, 1].to_s
-  check 'the c3 guest command sets the cache variable, DYLD_PRINT_OBJC_NOTIFICATIONS=1 and DYLD_PRINT_CACHE_POLICY=1',
-        c3.include?('DYLD_PRINT_OBJC_NOTIFICATIONS=1') && c3.include?('DYLD_PRINT_CACHE_POLICY=1') &&
+  check 'the c3 guest command sets the cache variable, DYLD_PRINT_OBJC_NOTIFICATIONS=1 and DARLING_DYLD_POLICY_LOG=1',
+        c3.include?('DYLD_PRINT_OBJC_NOTIFICATIONS=1') && c3.include?('DARLING_DYLD_POLICY_LOG=1') &&
         c3.include?('DYLD_SHARED_CACHE_SPLIT_DIR='), c3
   c1 = guest[/CONFIG c1; (.*?); echo CONFIG selftest/m, 1]
   st = guest[/CONFIG selftest; (.*)/m, 1]
@@ -103,7 +103,7 @@ Dir.mktmpdir('l5-runner-') do |dir|
         !c1.nil? && !st.nil? && !c1.include?('DYLD_') && !st.include?('DYLD_') && !guest.split('CONFIG c3').first.include?('DYLD_'),
         [c1, st].inspect
   check 'no DYLD variable reaches the launcher environment', !launcher_env.include?('DYLD_PRINT_OBJC_NOTIFICATIONS') &&
-        !launcher_env.include?('DYLD_PRINT_CACHE_POLICY') && !launcher_env.include?('DYLD_SHARED_CACHE_SPLIT_DIR'), launcher_env.lines.grep(/DYLD_/).inspect
+        !launcher_env.include?('DARLING_DYLD_POLICY_LOG') && !launcher_env.include?('DYLD_SHARED_CACHE_SPLIT_DIR'), launcher_env.lines.grep(/DYLD_/).inspect
 end
 
 # ---------------------------------------------------------------- the native harness

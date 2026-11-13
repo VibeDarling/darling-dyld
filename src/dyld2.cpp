@@ -266,7 +266,7 @@ struct EnvironmentVariables {
 							//	DYLD_PRINT_DOFS					==> gLinkContext.verboseDOF
 							//	DYLD_PRINT_APIS					==> gLogAPIs
 							//	DYLD_PRINT_OBJC_NOTIFICATIONS	==> gLogObjCNotifications (Darling only)
-							//	DYLD_PRINT_CACHE_POLICY			==> gLogCachePolicy (Darling only)
+							//	DARLING_DYLD_POLICY_LOG			==> gLogCachePolicy (Darling only, own prefix: see processDarlingLogVariable)
 							//	DYLD_IGNORE_PREBINDING			==> gLinkContext.prebindUsage
 							//	DYLD_PREBIND_DEBUG				==> gLinkContext.verbosePrebinding
 							//	DYLD_NEW_LOCAL_SHARED_REGIONS	==> gLinkContext.sharedRegionMode
@@ -2335,9 +2335,6 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	else if ( strcmp(key, "DYLD_PRINT_OBJC_NOTIFICATIONS") == 0 ) {
 		gLogObjCNotifications = true;
 	}
-	else if ( strcmp(key, "DYLD_PRINT_CACHE_POLICY") == 0 ) {
-		gLogCachePolicy = true;
-	}
 #if SUPPORT_ACCELERATE_TABLES
 	else if ( strcmp(key, "DYLD_PRINT_APIS_APP") == 0 ) {
 		gLogAppAPIs = true;
@@ -2638,6 +2635,19 @@ static void defaultUninitializedFallbackPaths(const char* envp[])
 }
 
 
+// Darling's own diagnostics are named DARLING_DYLD_*, not DYLD_PRINT_*: they print only Darling's own
+// load decisions, and the DYLD_PRINT_ family names Apple's tracing switches. Presence turns one on, as with
+// DYLD_PRINT_*, and restricted processes ignore them the same way (the caller checks allowEnvVarsPrint).
+static void processDarlingLogVariable(const char* keyEqualsValue)
+{
+	const char* equals = strchr(keyEqualsValue, '=');
+	if ( equals == NULL )
+		return;
+	const size_t keyLen = equals - keyEqualsValue;
+	if ( (keyLen == strlen("DARLING_DYLD_POLICY_LOG")) && (strncmp(keyEqualsValue, "DARLING_DYLD_POLICY_LOG", keyLen) == 0) )
+		gLogCachePolicy = true;
+}
+
 static void checkEnvironmentVariables(const char* envp[])
 {
 	if ( !gLinkContext.allowEnvVarsPath && !gLinkContext.allowEnvVarsPrint )
@@ -2663,6 +2673,9 @@ static void checkEnvironmentVariables(const char* envp[])
 		else if ( strncmp(keyEqualsValue, "LD_LIBRARY_PATH=", 16) == 0 ) {
 			const char* path = &keyEqualsValue[16];
 			sEnv.LD_LIBRARY_PATH = parseColonList(path, NULL);
+		}
+		else if ( (strncmp(keyEqualsValue, "DARLING_DYLD_", 13) == 0) && gLinkContext.allowEnvVarsPrint ) {
+			processDarlingLogVariable(keyEqualsValue);
 		}
 	}
 

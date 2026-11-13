@@ -70,15 +70,16 @@ GATE_PINS = {
                ->(t) { t.match?(/else if \( strcmp\(key, "DYLD_PRINT_OBJC_NOTIFICATIONS"\) == 0 \) \{\n\t\tgLogObjCNotifications = true;\n\t\}/) &&
                        t.match?(/^bool\s+gLogObjCNotifications = false;/) }],
   objc_extern: ['dyld2.h declares gLogObjCNotifications', :hdr, ->(t) { t.match?(/extern bool\s+gLogObjCNotifications;/) }],
-  policy_parse: ['dyld2 parses DYLD_PRINT_CACHE_POLICY into gLogCachePolicy', :dyld2,
-                 ->(t) { t.match?(/else if \( strcmp\(key, "DYLD_PRINT_CACHE_POLICY"\) == 0 \) \{\n\t\tgLogCachePolicy = true;\n\t\}/) &&
+  policy_parse: ['dyld2 parses DARLING_DYLD_POLICY_LOG into gLogCachePolicy, for unrestricted processes only', :dyld2,
+                 ->(t) { t.match?(/\tif \( \(keyLen == strlen\("DARLING_DYLD_POLICY_LOG"\)\) && \(strncmp\(keyEqualsValue, "DARLING_DYLD_POLICY_LOG", keyLen\) == 0\) \)\n\t\tgLogCachePolicy = true;\n/) &&
+                         t.match?(/else if \( \(strncmp\(keyEqualsValue, "DARLING_DYLD_", 13\) == 0\) && gLinkContext\.allowEnvVarsPrint \) \{\n\t\t\tprocessDarlingLogVariable\(keyEqualsValue\);\n\t\t\}/) &&
                          t.match?(/^bool\s+gLogCachePolicy = false;/) &&
-                         t.include?("//\tDYLD_PRINT_CACHE_POLICY\t\t\t==> gLogCachePolicy (Darling only)") }],
+                         !t.include?('"DYLD_PRINT_CACHE_POLICY"') }],
   policy_extern: ['dyld2.h declares gLogCachePolicy', :hdr, ->(t) { t.match?(/extern bool\s+gLogCachePolicy;/) }],
   policy_gated: ['the cache policy line is printed only under gLogCachePolicy', :dyld2,
                  ->(t) { t.match?(/\tif \( gLogCachePolicy \) \{\n(?:[^\n]*\n){0,2}\t\tdyld::log\("cache load source %s: policy=%s allow_list=%s\\n", found\.pathInCache \? found\.pathInCache : path,\n\t\t\t\t  source == dyld3::kSharedCacheLoadFromCache \? "cache" : "disk", allowListed \? "hit" : "miss"\);\n\t\}\n/) }],
-  policy_man: ['the man page documents DYLD_PRINT_CACHE_POLICY', :man,
-               ->(t) { t.match?(/^\.B DYLD_PRINT_CACHE_POLICY$/) && t.match?(/^DYLD_PRINT_CACHE_POLICY$/) }],
+  policy_man: ['the man page documents DARLING_DYLD_POLICY_LOG', :man,
+               ->(t) { t.match?(/^\.B DARLING_DYLD_POLICY_LOG$/) && t.match?(/^DARLING_DYLD_POLICY_LOG$/) }],
   hooks_gated: ['dyldAPIs.cpp installs the notification and skip hooks only under the flag', :apis,
                 ->(t) { t.match?(/if \( dyld::gLogObjCNotifications \) \{\n\t\tstate\.logSkip = logObjCSkip;\n\t\tstate\.logRegistered = logObjCRegistered;\n\t\tstate\.logDelivered = logObjCDelivered;\n\t\}\n\tif \( !state\.registerCallbacks/) &&
                         !t.match?(/^\tstate\.logSkip = /) &&
@@ -991,9 +992,11 @@ Dir.mktmpdir('dyld-objc-callbacks-') do |dir|
   gate_probes = [
     ['the objc notification flag is parsed', :objc_parse, :dyld2, 'gLogObjCNotifications = true;', 'gLogObjCNotifications = false;'],
     ['the cache policy flag is parsed', :policy_parse, :dyld2, 'gLogCachePolicy = true;', 'gLogCachePolicy = false;'],
+    ['the Darling log variables ignore restricted processes', :policy_parse, :dyld2,
+     "13) == 0) && gLinkContext.allowEnvVarsPrint ) {", "13) == 0) ) {"],
     ['the cache policy flag is declared', :policy_extern, :hdr, 'gLogCachePolicy;', 'gLogCachePolicyX;'],
     ['the cache policy line has its gate', :policy_gated, :dyld2, "\tif ( gLogCachePolicy ) {\n\t\tconst bool allowListed", "\t{\n\t\tconst bool allowListed"],
-    ['the cache policy flag is documented', :policy_man, :man, ".B DYLD_PRINT_CACHE_POLICY\n", ".B DYLD_PRINT_CACHE\n"],
+    ['the cache policy flag is documented', :policy_man, :man, ".B DARLING_DYLD_POLICY_LOG\n", ".B DARLING_DYLD_POLICY\n"],
     ['the skip hook is installed only under the flag', :hooks_gated, :apis,
      "\t\tstate.logSkip = logObjCSkip;\n\t\tstate.logRegistered", "\t\tstate.logRegistered"],
     ['the skip hook is not installed unconditionally', :hooks_gated, :apis,

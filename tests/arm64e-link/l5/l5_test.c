@@ -82,7 +82,7 @@ static int l5_policy_from_log(const char *out, char *policy, int sz) {
 // rejects it. Returns the failure reason, or 0 when `policy` holds "cache".
 static const char *l5_policy_verdict(const char *out, char *policy, int sz) {
     if (!l5_policy_from_log(out, policy, sz))
-        return "no loader policy line for /usr/lib/libobjc.A.dylib (DYLD_PRINT_CACHE_POLICY=1 set?)";
+        return "no loader policy line for /usr/lib/libobjc.A.dylib (DARLING_DYLD_POLICY_LOG=1 set?)";
     if (!L5_POLICY_ANY && !streq(policy, "cache"))
         return "the loader's policy for /usr/lib/libobjc.A.dylib is not cache";
     return 0;
