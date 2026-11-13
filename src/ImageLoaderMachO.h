@@ -291,6 +291,10 @@ protected:
 };
 
 
+// the install name of libSystem for this process (the DriverKit one under driverkit)
+extern const char* libSystemPath(const ImageLoader::LinkContext& context);
+
+
 #endif // __IMAGELOADERMACHO__
 
 

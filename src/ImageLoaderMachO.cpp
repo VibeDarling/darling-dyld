@@ -2290,7 +2290,7 @@ void ImageLoaderMachO::doImageInit(const LinkContext& context)
 	}
 }
 
-static const char* libSystemPath(const ImageLoader::LinkContext& context)
+const char* libSystemPath(const ImageLoader::LinkContext& context)
 {
 #if TARGET_OS_OSX
 	if ( context.driverKit )

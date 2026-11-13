@@ -1749,6 +1749,31 @@ static void runAllStaticTerminators(void* extra)
 	}
 }
 
+// DELIBERATE DIVERGENCE FROM DYLD4. dyld4's runAllInitializersForMain (DyldAPIs.cpp:4042-4075) runs libSystem's own
+// initializer and then each libsystem image's own initializer, following no upward link, and then walks the main
+// executable. Darling mixes its own libSystem family with the macOS cache's images, so the graph has a cycle that
+// dyld4 never sees on macOS (CoreFoundation, libobjc, libswiftCore and Foundation, with Metal below Foundation):
+// walking the main executable first reaches CoreFoundation from CFNetwork and initializes Metal while CoreFoundation
+// is still in progress. So libSystem's whole walk runs first, and then libobjc's, by install name: libobjc's walk
+// completes CoreFoundation before Foundation's other dependents. libxpc, libdispatch and libsystem_trace link libobjc
+// upward, so libSystem's walk usually reaches it first by itself; the explicit step keeps the order independent of that.
+static void runInitializersOf(const char* installName, ImageLoader::InitializerTimingList& timingInfo)
+{
+	for (ImageLoader* image : sAllImages) {
+		const char* installPath = image->getInstallPath();
+		if ( (installPath != NULL) && (strcmp(installPath, installName) == 0) ) {
+			image->runInitializers(gLinkContext, timingInfo);
+			return;
+		}
+	}
+}
+
+static void runRuntimeInitializersFirst(ImageLoader::InitializerTimingList& timingInfo)
+{
+	runInitializersOf(libSystemPath(gLinkContext), timingInfo);
+	runInitializersOf("/usr/lib/libobjc.A.dylib", timingInfo);
+}
+
 void initializeMainExecutable()
 {
 	// record that we've reached this step
@@ -1757,6 +1782,7 @@ void initializeMainExecutable()
 	// run initialzers for any inserted dylibs
 	ImageLoader::InitializerTimingList initializerTimes[allImagesCount()];
 	initializerTimes[0].count = 0;
+	runRuntimeInitializersFirst(initializerTimes[0]);
 	const size_t rootCount = sImageRoots.size();
 	if ( rootCount > 1 ) {
 		for(size_t i=1; i < rootCount; ++i) {
