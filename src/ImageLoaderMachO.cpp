@@ -65,6 +65,10 @@ extern "C" void __simple_kprintf(const char* format, ...);
 #endif
 #include "Tracing.h"
 #include "dyld2.h"
+#if defined(__aarch64__) || defined(__arm64__)
+#include "DarlingTSDIslands.h"
+extern "C" unsigned long sys_thread_get_native_tsd_slot_offset(void);
+#endif
 
 // <rdar://problem/8718137> use stack guard random value to add padding between dylibs
 extern "C" long __stack_chk_guard;
@@ -2740,22 +2744,14 @@ void ImageLoaderMachO::mapSegments(int fd, uint64_t offsetInFat, uint64_t lenInF
 #if defined(__aarch64__) || defined(__arm64__)
 			if ( (protection & PROT_EXEC) && loadAddress != MAP_FAILED && size > 0 ) {
 				if (mprotect(loadAddress, size, PROT_READ | PROT_WRITE) == 0) {
-					uint32_t* insns = (uint32_t*) loadAddress;
-					size_t count = size / sizeof(uint32_t);
-					for (size_t k = 0; k < count; k++) {
-						if ((insns[k] & 0xFFFFFFE0U) == 0xD53BD060U) {
-							uint32_t rt = insns[k] & 0x1FU;
-							insns[k] = 0xD53BD040U | rt; // mrs Xt, TPIDR_EL0
-							if (k + 1 < count && ((insns[k+1] & 0xFFC00000U) == 0x92400000U) &&
-							    ((insns[k+1] & 0x1FU) == rt) && (((insns[k+1] >> 5) & 0x1FU) == rt)) {
-								insns[k+1] = 0xF9402000U | (rt << 5) | rt; // ldr Xt, [Xt, #64]
-								k++;
-							}
-						}
-					}
+					size_t rewritten;
+					const bool complete = dyld3::darling_tsd::rewriteDiskTSDReads((uint32_t*)loadAddress, size / sizeof(uint32_t),
+					                                                              sys_thread_get_native_tsd_slot_offset(), &rewritten);
 					if (mprotect(loadAddress, size, protection) != 0) {
 						dyld::throwf("mprotect() failed to restore execute permission: %s", strerror(errno));
 					}
+					if (!complete)
+						dyld::throwf("'%s' reads its thread pointer from TPIDRRO_EL0 but the native loader names no TSD slot", this->getPath());
 					__builtin___clear_cache((char*)loadAddress, (char*)loadAddress + size);
 				}
 			}
