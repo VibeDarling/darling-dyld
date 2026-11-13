@@ -14,6 +14,8 @@ fn_t __ptrauth(ptrauth_key_asib, 1, 0x77) exe_auth_bind_addr = fn_b;
 int *exe_plain_bind = &lib_value;
 int *exe_plain_bind_addend = &lib_array[2];
 int *exe_plain_bind_negative = &lib_array[-1];
+// an authenticated bind has no addend field in its chained-fixup entry; the addend must go in the import table
+int *__ptrauth(ptrauth_key_asda, 1, 0x55) exe_auth_bind_addend = &lib_array[2];
 
 int exe_data = 5;
 int *exe_plain_rebase = &exe_data;

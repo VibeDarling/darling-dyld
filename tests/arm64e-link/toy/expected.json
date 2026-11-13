@@ -1,5 +1,5 @@
 {
-  "_comment": "ld64 puts the negative addend of _exe_plain_bind_negative in a second _lib_array import (imports_format 3, DYLD_CHAINED_IMPORT_ADDEND64). Chained-fixup entry each global in toy_lib.c / toy_main.c must produce. at/target/import are [symbol, byte offset]; symbols keep the Mach-O underscore. Unqualified function pointers are signed IA/0 by the arm64e ABI, plain data pointers are not signed.",
+  "_comment": "ld64 puts the negative addend of _exe_plain_bind_negative and the addend of the authenticated _exe_auth_bind_addend (its fixup has no addend field) in further _lib_array imports (imports_format 3, DYLD_CHAINED_IMPORT_ADDEND64). Chained-fixup entry each global in toy_lib.c / toy_main.c must produce. at/target/import are [symbol, byte offset]; symbols keep the Mach-O underscore. Unqualified function pointers are signed IA/0 by the arm64e ABI, plain data pointers are not signed.",
   "lib": {
     "install_name": "@rpath/libtoy.dylib",
     "fixups": [
@@ -18,10 +18,11 @@
   },
   "exe": {
     "load_dylib": "@rpath/libtoy.dylib",
-    "imports": ["_fn_a", "_fn_b", "_lib_value", "_lib_array", "_lib_array"],
+    "imports": ["_fn_a", "_fn_b", "_lib_value", "_lib_array", "_lib_array", "_lib_array"],
     "fixups": [
       {"at": ["_exe_auth_bind", 0], "kind": "auth_bind", "key": "IA", "addr_div": false, "diversity": 0, "import": "_fn_a", "addend": 0},
       {"at": ["_exe_auth_bind_addr", 0], "kind": "auth_bind", "key": "IB", "addr_div": true, "diversity": 119, "import": "_fn_b", "addend": 0},
+      {"at": ["_exe_auth_bind_addend", 0], "kind": "auth_bind", "key": "DA", "addr_div": true, "diversity": 85, "import": "_lib_array", "addend": 8},
       {"at": ["_exe_plain_bind", 0], "kind": "bind", "import": "_lib_value", "addend": 0},
       {"at": ["_exe_plain_bind_addend", 0], "kind": "bind", "import": "_lib_array", "addend": 8},
       {"at": ["_exe_plain_bind_negative", 0], "kind": "bind", "import": "_lib_array", "addend": -4},
@@ -29,5 +30,15 @@
       {"at": ["_exe_auth_rebase", 0], "kind": "auth_rebase", "key": "IA", "addr_div": false, "diversity": 153, "target": ["_local_fn", 0]}
     ],
     "auth_got": {"section": "__DATA_CONST,__auth_got", "kind": "auth_bind", "key": "IA", "addr_div": true, "diversity": 0, "imports": ["_fn_a"]}
+  },
+  "addend_exe": {
+    "_comment": "toy_addend.c: only small positive addends on authenticated binds. Their fixups carry no addend, so each (symbol, addend) pair is an import, and imports_format 2 (DYLD_CHAINED_IMPORT_ADDEND) is the smallest format that holds them.",
+    "load_dylib": "@rpath/libtoy.dylib",
+    "imports_format": 2,
+    "imports": ["_lib_array", "_lib_array"],
+    "fixups": [
+      {"at": ["_small_auth_8", 0], "kind": "auth_bind", "key": "DA", "addr_div": true, "diversity": 85, "import": "_lib_array", "addend": 8},
+      {"at": ["_small_auth_16", 0], "kind": "auth_bind", "key": "DA", "addr_div": true, "diversity": 102, "import": "_lib_array", "addend": 16}
+    ]
   }
 }

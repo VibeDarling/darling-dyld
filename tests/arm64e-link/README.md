@@ -59,6 +59,9 @@ rebase target is a vmaddr; the test checks both. The one ld64 quirk the parser
 tolerates is that the starts record size field is 2 bytes larger than the
 record (llvm-objdump rejects it as an overlap). ld64 emitted 64-bit imports
 (format 3) for the toy executable because one import carries a negative addend.
+A second toy executable (`toy/toy_addend.c`) has only small positive addends on authenticated binds, whose fixups have
+no addend field: its imports must be format 2 with the addends in the import table. That needs an ld64 that keeps the addend of
+an authenticated bind (cctools-port fix); an older ld64 writes format 1 and the addends are lost, which the test reports.
 `parser_unit.py` covers cases no toy produces (bind ordinals above 255, the
 signed 19-bit inline addend, the special-ordinal boundary at 0xF0 and 0xFFF0).
 

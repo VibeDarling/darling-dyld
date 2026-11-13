@@ -230,6 +230,21 @@ Dir.mktmpdir('arm64e-link-') do |dir|
     check('exe __auth_got imports', auth_got.map { |f| f['import'] }.sort == ag['imports'].sort, auth_got.map { |f| f['import'] }.inspect)
     check_chains(exe, 'exe')
 
+    # --- authenticated binds with only small positive addends (no wide addend to force a larger import format)
+    ae = expected['addend_exe']
+    addend_out = File.join(dir, 'toy_addend')
+    _o, err, st = tool(*build_args([File.join(HERE, 'toy/toy_addend.c')], addend_out, 'exe', ['--entry', '_main', '--lib', lib_out]),
+                       env: { 'LD64' => LD64 })
+    check('addend toy executable builds and verifies', st.success?, err)
+    if File.exist?(addend_out)
+      add = dump(addend_out)
+      check('addend exe imports', add['chained']['imports'].map { |i| i['name'] } == ae['imports'], add['chained']['imports'].inspect)
+      check('addend exe imports_format', add['chained']['imports_format'] == ae['imports_format'], add['chained']['imports_format'].inspect)
+      check('addend exe fixup count', add['chained']['fixups'].size == ae['fixups'].size, add['chained']['fixups'].size.to_s)
+      check_table(add, ae['fixups'], 'addend exe')
+      check_chains(add, 'addend exe')
+    end
+
     # --- parser fails loud on a corrupted chain
     bad = File.join(dir, 'libtoy.badnext')
     data = File.binread(lib_out)
