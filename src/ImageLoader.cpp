@@ -1644,7 +1644,9 @@ void ImageLoader::recursiveInitialization(const LinkContext& context, mach_port_
 						uninitUps.imagesAndPaths[uninitUps.count] = { dependentImage, libPath(i) };
 						uninitUps.count++;
 					}
-					else if ( dependentImage->fDepth >= fDepth ) {
+					else {
+						// no depth test, as in dyld4's runInitializersBottomUp: the in-progress state breaks cycles, and a
+						// depth test would skip a dependent (and so initialize it after its dependents) whenever a cycle gave it a lower depth
 						dependentImage->recursiveInitialization(context, this_thread, libPath(i), timingInfo, uninitUps);
 					}
                 }
