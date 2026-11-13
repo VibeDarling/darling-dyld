@@ -2262,6 +2262,38 @@ void _dyld_objc_notify_register(_dyld_objc_notify_mapped    mapped,
 	p(mapped, init, unmapped);
 }
 
+void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
+{
+	if ( gUseDyld3 )
+		return dyld3::_dyld_objc_register_callbacks(callbacks);
+
+	DYLD_LOCK_THIS_BLOCK;
+    typedef void (*funcType)(const struct _dyld_objc_callbacks*);
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_objc_register_callbacks", &p);
+	p(callbacks);
+}
+
+// RTLD_SELF names the image that called this function, so it is answered here: forwarded to the loader,
+// the return address would be this frame instead. Everything else the loader resolves.
+const struct mach_header* _dyld_get_dlopen_image_header(void* handle)
+{
+	if ( handle == RTLD_SELF )
+		return _dyld_get_image_header_containing_address(__builtin_return_address(0));
+	if ( gUseDyld3 )
+		return dyld3::_dyld_get_dlopen_image_header(handle);
+
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef const struct mach_header* (*funcType)(void*);
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_get_dlopen_image_header", &p);
+	return p(handle);
+}
+
 void _dyld_missing_symbol_abort()
 {
     return dyld3::_dyld_missing_symbol_abort();
@@ -2284,6 +2316,58 @@ const char* _dyld_get_objc_selector(const char* selName)
     return nullptr;
 }
 
+// The loader decides whether its objc tables fit the libobjc in the process, so these forward to it
+// like the enumerations below; libdyld's own copy of the cache's table (gObjCOpt) answers selectors only.
+const void* _dyld_for_objc_header_opt_ro(void)
+{
+    if ( gUseDyld3 )
+        return dyld3::_dyld_for_objc_header_opt_ro();
+
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef const void* (*funcType)(void);
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_for_objc_header_opt_ro", &p);
+	return p();
+}
+
+void* _dyld_for_objc_header_opt_rw(void)
+{
+    if ( gUseDyld3 )
+        return dyld3::_dyld_for_objc_header_opt_rw();
+
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef void* (*funcType)(void);
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_for_objc_header_opt_rw", &p);
+	return p();
+}
+
+uint32_t _dyld_objc_class_count(void)
+{
+    if ( gUseDyld3 )
+        return dyld3::_dyld_objc_class_count();
+
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef uint32_t (*funcType)(void);
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_objc_class_count", &p);
+	return p();
+}
+
+struct _dyld_section_info_result _dyld_lookup_section_info(const struct mach_header* mh,
+                                                            _dyld_section_location_info_t locationHandle,
+                                                            enum _dyld_section_location_kind kind)
+{
+    // The image's own section list answers both loaders; the handle only saves that walk in dyld4.
+    return dyld3::_dyld_lookup_section_info(mh, locationHandle, kind);
+}
+
 // This dyld2 loader does not allocate a separate protected dyld stack.
 extern "C" void _dyld_stack_range(const void** stackBottom, const void** stackTop)
 {
@@ -2297,12 +2381,28 @@ void _dyld_for_each_objc_class(const char* className,
                            void (^callback)(void* classPtr, bool isLoaded, bool* stop)) {
     if ( gUseDyld3 )
         return dyld3::_dyld_for_each_objc_class(className, callback);
+
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef void (*funcType)(const char*, void (^)(void*, bool, bool*));
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_for_each_objc_class", &p);
+	p(className, callback);
 }
 
 void _dyld_for_each_objc_protocol(const char* protocolName,
                                   void (^callback)(void* protocolPtr, bool isLoaded, bool* stop)) {
     if ( gUseDyld3 )
         return dyld3::_dyld_for_each_objc_protocol(protocolName, callback);
+
+	DYLD_NO_LOCK_THIS_BLOCK;
+    typedef void (*funcType)(const char*, void (^)(void*, bool, bool*));
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+	if(p == NULL)
+	    dyld_func_lookup_and_resign("__dyld_for_each_objc_protocol", &p);
+	p(protocolName, callback);
 }
 
 void _dyld_register_driverkit_main(void (*mainFunc)(void))

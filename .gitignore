@@ -8,3 +8,4 @@ dyld.xcodeproj/xcshareddata/
 .DS_Store
 .pyc
 
+__pycache__/

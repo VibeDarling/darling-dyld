@@ -36,6 +36,10 @@ DYLD_DISABLE_DOFS
 .br
 DYLD_PRINT_APIS
 .br
+DARLING_DYLD_OBJC_LOG
+.br
+DARLING_DYLD_POLICY_LOG
+.br
 DYLD_PRINT_BINDINGS
 .br
 DYLD_PRINT_INITIALIZERS
@@ -209,6 +213,15 @@ __attribute__((constructor)), and -init functions.
 .TP
 .B DYLD_PRINT_APIS
 Causes dyld to print a line whenever a dyld API is called (e.g. NSAddImage()).
+.TP
+.B DARLING_DYLD_OBJC_LOG
+Causes dyld to print the version the objc runtime registered its callbacks with, and a line for each
+image it hands to the runtime's mapped and init callbacks, a line for each plain image it withholds from an
+arm64e runtime, and a line each time the runtime asks to make an image mutable (Darling only, dyld2 loader only).
+.TP
+.B DARLING_DYLD_POLICY_LOG
+Causes dyld to print, for each image the shared cache could supply, whether it is loaded from the cache or
+from disk and whether its path is on the cache allow list (Darling only, dyld2 loader only).
 .TP
 .B DYLD_PRINT_SEGMENTS
 Causes dyld to print out a line containing the name and address range of each mach-o segment

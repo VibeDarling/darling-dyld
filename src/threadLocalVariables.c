@@ -298,6 +298,22 @@ static void tlv_normalize_descriptor(TLVDescriptor* descriptor, unsigned long st
 #endif
 }
 
+// An arm64e image reaches a descriptor's thunk with blraaz (key IA, discriminator 0, no address diversity), and its
+// linker leaves only a plain bind of _tlv_bootstrap in that slot, so the thunk stored here must be signed for it.
+// Any other image calls the slot with a plain branch. libdyld itself is plain arm64, hence the hint-space pacia1716.
+static void* tlv_thunk_for_image(const struct mach_header* mh)
+{
+#if __arm64__
+	if ( (mh->cputype == CPU_TYPE_ARM64) && ((mh->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E) ) {
+		register uint64_t value __asm__("x17") = (uint64_t)tlv_get_addr;
+		register uint64_t discriminator __asm__("x16") = 0;
+		__asm__ volatile("hint #8" : "+r"(value) : "r"(discriminator));
+		return (void*)value;
+	}
+#endif
+	return (void*)tlv_get_addr;
+}
+
 // called when image is loaded
 static void tlv_initialize_descriptors(const struct mach_header* mh)
 {
@@ -305,6 +321,7 @@ static void tlv_initialize_descriptors(const struct mach_header* mh)
 	intptr_t		slide = 0;
 	bool			slideComputed = false;
 	const bool cacheV2 = tlv_image_uses_cache_v2(mh);
+	void* const thunk = tlv_thunk_for_image(mh);
 	const unsigned long storageSize = cacheV2 ? tlv_storage_size(mh) : 0;
 	const uint32_t cmd_count = mh->ncmds;
 	const struct load_command* const cmds = (struct load_command*)(((uint8_t*)mh) + sizeof(macho_header));
@@ -334,7 +351,7 @@ static void tlv_initialize_descriptors(const struct mach_header* mh)
 						for (TLVDescriptor* d=start; d < end; ++d) {
 							if ( cacheV2 )
 								tlv_normalize_descriptor(d, storageSize);
-							d->thunk = tlv_get_addr;
+							d->thunk = (void* (*)(TLVDescriptor*))thunk;
 							d->key = key;
 							// Legacy offsets remain unchanged; v2 offsets are normalized above.
 						}
