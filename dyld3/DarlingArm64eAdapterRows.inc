@@ -12,8 +12,10 @@
 // variable (copy and dispose helpers, which arm64e signs), and with any heap block, stop with SIGTRAP and a message that
 // names the symbol and the arm64e shim. Most Objective-C dispatch_async calls are in that group. Only blocks with plain
 // captures on the stack, and global blocks, run. That is deliberate (the alternative corrupts shared blocks) and is the
-// evidence that the shim (decision Q3 option B) is needed from L5.
+// evidence that the shim (decision Q3 option B) is needed from L5. The exception is a row flagged invoke-only (last field
+// true): its callee runs the block before it returns and never copies it, so a stack block with helpers runs too.
 #define BLK "a block argument: only dispatch_async and dispatch_once are shown (L2 checks 07-09)"
+#define INVOKE_ONLY "the callee only calls the block before it returns (dyld sources: dyld3/APIs.cpp, src/dyld_process_info.cpp), so a stack block with helpers may be passed; shape of the dispatch_async row"
 #define STACKARG "the callback is not passed in a register, which the thunks do not handle"
 #define STRUCT "a struct that holds a code pointer: only the sigaction handler is shown (L2 check 18)"
 	{ "___cxa_atexit", 0x1, 0, 0, ReturnFix::None, 3, AdapterStatus::Probed, "L2 check 02" },
@@ -62,7 +64,7 @@
 	{ "__Unwind_Resume", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::HandledElsewhere, "the exception_cleanup member of _Unwind_Exception is read by libunwind; its PAC handling is the libunwind patch (T1), not a thunk" },
 	{ "__dyld_for_each_objc_class", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, BLK" (mach-o/dyld_priv.h)" },
 	{ "__dyld_for_each_objc_protocol", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, BLK" (mach-o/dyld_priv.h)" },
-	{ "__dyld_process_info_for_each_aot_image", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, BLK" (mach-o/dyld_process_info.h)" },
+	{ "__dyld_process_info_for_each_aot_image", 0x0, 2, 0, ReturnFix::None, 2, AdapterStatus::ShapeOnly, INVOKE_ONLY" (mach-o/dyld_process_info.h, the block is argument 1)", true },
 	{ "__dyld_register_for_bulk_image_loads", 0x1, 0, 0, ReturnFix::None, 1, AdapterStatus::ShapeOnly, "T0 header rule, mach-o/dyld_priv.h: code pointer in argument 0; the shape of L2 checks 01-06" },
 	{ "__dyld_register_func_for_remove_image", 0x1, 0, 0, ReturnFix::None, 1, AdapterStatus::ShapeOnly, "T0 header rule, mach-o/dyld.h: code pointer in argument 0; the shape of L2 checks 01-06" },
 	{ "__os_activity_initiate", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, BLK" (os/activity.h)" },
@@ -144,7 +146,7 @@
 	{ "_dispatch_sync", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, BLK" (dispatch/queue.h)" },
 	{ "_dispatch_sync_f", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "T0 header rule, dispatch/queue.h: code pointer in argument 2; the shape of L2 checks 01-06" },
 	{ "_dispatch_write", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, BLK" (dispatch/io.h)" },
-	{ "_dyld_get_image_versions", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, BLK" (mach-o/dyld_priv.h)" },
+	{ "_dyld_get_image_versions", 0x0, 2, 0, ReturnFix::None, 2, AdapterStatus::ShapeOnly, INVOKE_ONLY" (mach-o/dyld_priv.h, the block is argument 1)", true },
 	{ "_fts_children", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, STRUCT" (fts.h arg0::struct union (anonymous at <sdk>/usr/include/fts.h:81:2).fts_compar)" },
 	{ "_fts_close", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, STRUCT" (fts.h arg0::struct union (anonymous at <sdk>/usr/include/fts.h:81:2).fts_compar)" },
 	{ "_fts_open", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly, "T0 header rule, fts.h: code pointer in argument 2; the shape of L2 checks 01-06" },

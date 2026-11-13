@@ -121,6 +121,8 @@ const char* validateAdapterRows(const AdapterRow* rows, size_t count)
 			return "a row has both a block and a struct argument";
 		if ( (r.blockArg != 0) && ((r.authMask >> (r.blockArg - 1)) & 1) )
 			return "the block argument is also in the auth mask";
+		if ( r.blockInvokeOnly && (r.blockArg == 0) )
+			return "a row is marked invoke-only but has no block argument";
 		if ( (r.structArg != 0) && ((r.authMask >> (r.structArg - 1)) & 1) )
 			return "the struct argument is also in the auth mask";
 	}
@@ -469,7 +471,8 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 	// An address-diversified invoke is authenticated with the address of its own field. A stack block is rewritten for the
 	// call only (the callee copies it or runs it before it returns) and gets its signature back afterwards. A heap block
 	// is shared: plain code needs its invoke unsigned and arm64e code needs it signed, and no rewrite serves both, so it
-	// is refused. So is any block with copy or dispose helpers, whose pointers arm64e signs and plain code calls unsigned.
+	// is refused. So is any block with copy or dispose helpers, whose pointers arm64e signs and plain code calls unsigned,
+	// unless the row says the callee only runs the block (blockInvokeOnly): then nothing calls the helpers.
 	void** restoreSlot = nullptr;
 	void* restoreValue = nullptr;
 	if ( (row->blockArg != 0) && (a[row->blockArg - 1] != 0) ) {
@@ -479,7 +482,7 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 			a[row->blockArg - 1] = (uint64_t)mirrorOfGlobalBlock(block, plainInvoke);
 		}
 		else {
-			if ( block->flags & kBlockHasCopyDispose )
+			if ( (block->flags & kBlockHasCopyDispose) && !row->blockInvokeOnly )
 				refuseBlock(row, "a block with copy and dispose helpers");
 			if ( block->flags & kBlockNeedsFree )
 				refuseBlock(row, "a heap block");

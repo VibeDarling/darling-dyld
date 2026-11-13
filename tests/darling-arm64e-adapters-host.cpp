@@ -224,6 +224,8 @@ static void checkTable()
 	bad({ "_a", 0, 1, 1, ReturnFix::None, 2, AdapterStatus::Probed, "e" }, "block and struct together");
 	bad({ "_a", 0, 0, 2, ReturnFix::None, 2, AdapterStatus::Probed, "e" }, "a struct argument with no old action after it");
 	bad({ "_a", 1, 1, 0, ReturnFix::None, 2, AdapterStatus::Probed, "e" }, "block argument also stripped");
+	bad({ "_a", 0, 0, 0, ReturnFix::None, 1, AdapterStatus::Probed, "e", true }, "invoke-only with no action");
+	bad({ "_a", 1, 0, 0, ReturnFix::None, 1, AdapterStatus::Probed, "e", true }, "invoke-only with no block argument");
 	bad({ "_a", 1, 0, 0, ReturnFix::None, 1, AdapterStatus::Unsupported, "e" }, "unsupported row with an action");
 	bad({ "_a", 1, 0, 0, ReturnFix::None, 1, AdapterStatus::HandledElsewhere, "e" }, "handled-elsewhere row with an action");
 }
@@ -728,6 +730,9 @@ static void checkRefusedBlocks()
 		{ "_dispatch_async", kHeap, "a heap block" }, { "_dispatch_once", kHeap, "a heap block" },
 		{ "_dispatch_async", 1 << 25, "a block with copy and dispose helpers" },
 		{ "_dispatch_async", kHeap | (1 << 25), "a block with copy and dispose helpers" }, { "_dispatch_once", 1 << 25, "a block with copy and dispose helpers" },
+		// an invoke-only row still refuses a heap block, with or without helpers: it is shared and cannot be rewritten
+		{ "_dyld_get_image_versions", kHeap, "a heap block" }, { "_dyld_get_image_versions", kHeap | (1 << 25), "a heap block" },
+		{ "__dyld_process_info_for_each_aot_image", kHeap, "a heap block" }, { "__dyld_process_info_for_each_aot_image", kHeap | (1 << 25), "a heap block" },
 	};
 	for (const Case& c : cases) {
 		*gSharedBlock = { nullptr, c.flags, 0, (void*)oracleSign(codeWithSignature((uint64_t)&gSharedBlock->invoke), (uint64_t)&gSharedBlock->invoke), nullptr };
@@ -743,9 +748,48 @@ static void checkRefusedBlocks()
 	}
 }
 
+// The rows flagged blockInvokeOnly (dyld_get_image_versions, _dyld_process_info_for_each_aot_image): the callee is plain code that
+// calls the block before it returns, so a stack block with copy and dispose helpers is passed with only its invoke
+// authenticated, and gets its signature back. The callee here does what dyld's does: it calls invoke through the block it was given.
+static int gBlockRuns;
+static void* gHelperSeen;
+static int32_t gFlagsSeen;
+static void blockInvoked(Block* b, int x) { (void)b; gBlockRuns += x; }
+static void callTheBlock(const uint64_t* a)
+{
+	Block* b = (Block*)a[1];
+	gFlagsSeen = b->flags;
+	gHelperSeen = b->descriptor;
+	((void (*)(Block*, int))b->invoke)(b, 1);
+}
+static void checkInvokeOnlyBlocks()
+{
+	for (const char* name : { "_dyld_get_image_versions", "__dyld_process_info_for_each_aot_image" }) {
+		Fn8 t = thunkFor(name);
+		gHook = callTheBlock;
+		gFakeResult = 0;
+		for (int32_t flags : { 0, (int32_t)(1 << 25) }) {
+			const bool helpers = flags != 0;
+			Block stack = { nullptr, flags, 0, nullptr, (void*)0x7000 };
+			const uint64_t target = (uint64_t)&blockInvoked;
+			stack.invoke = (void*)oracleSign(target, (uint64_t)&stack.invoke);
+			const Block before = stack;
+			gBlockRuns = 0;
+			t(0x1010, (uint64_t)&stack, 0, 0, 0, 0, 0, 0);
+			CHECK(gSeen[0] == 0x1010 && gSeen[1] == (uint64_t)&stack, "%s: the arguments changed (helpers %d)", name, helpers);
+			CHECK(gBlockRuns == 1, "%s: the callee could not run a stack block (helpers %d, runs %d)", name, helpers, gBlockRuns);
+			CHECK(gFlagsSeen == flags && gHelperSeen == before.descriptor, "%s: flags or descriptor changed for the callee (helpers %d)", name, helpers);
+			CHECK(memcmp(&stack, &before, sizeof(Block)) == 0, "%s: the caller's stack block is not as it was after the call (helpers %d)", name, helpers);
+			t(0x1010, (uint64_t)&stack, 0, 0, 0, 0, 0, 0);
+			CHECK(gBlockRuns == 2 && stack.invoke == before.invoke, "%s: a second call with the same block (helpers %d)", name, helpers);
+		}
+		gHook = nullptr;
+	}
+}
+
 static void checkDispatch()
 {
-	for (const char* name : { "_dispatch_async", "_dispatch_once" }) {
+	for (const char* name : { "_dispatch_async", "_dispatch_once", "_dyld_get_image_versions", "__dyld_process_info_for_each_aot_image" }) {
 		Fn8 t = thunkFor(name);
 		gFakeResult = 0;
 		gHook = snapshotBlock;
@@ -1042,7 +1086,7 @@ int main(int argc, char** argv)
 		size_t n;
 		const AdapterRow* rows = adapterRows(&n);
 		for (size_t i = 0; i != n; ++i)
-			printf("ROW %s %u %u %u %d %u %d\n", rows[i].symbol, rows[i].authMask, rows[i].blockArg, rows[i].structArg, (int)rows[i].ret, rows[i].argCount, (int)rows[i].status);
+			printf("ROW %s %u %u %u %d %u %d %d\n", rows[i].symbol, rows[i].authMask, rows[i].blockArg, rows[i].structArg, (int)rows[i].ret, rows[i].argCount, (int)rows[i].status, (int)rows[i].blockInvokeOnly);
 		return 0;
 	}
 	if ( (argc > 2) && (strcmp(argv[1], "auth-thunk") == 0) ) {
@@ -1073,6 +1117,7 @@ int main(int argc, char** argv)
 	checkSignal();
 	checkBlockCopy();
 	checkDispatch();
+	checkInvokeOnlyBlocks();
 	checkRefusedBlocks();
 	checkSigaction();
 	checkSigactionFaults();

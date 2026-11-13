@@ -47,11 +47,15 @@ struct AdapterRow {
 	uint8_t			argCount;		// register arguments up to the last one the row touches; at most 8 (a call thunk takes no FP or stack arguments)
 	AdapterStatus	status;
 	const char*		evidence;		// the probe check or the reason; never empty
+	bool			blockInvokeOnly = false;	// the callee only calls the block before it returns and never copies it: a stack block with copy and dispose helpers may then be passed
 };
 
 // Blocks. A stack block with plain captures and a global block run. A heap block, and any block with copy and dispose
 // helpers (arm64e signs those pointers with the address of the descriptor field, and plain code calls them unsigned), make
-// the adapter stop with SIGTRAP and a message naming the symbol and the arm64e shim. So dispatch_async or dispatch_once of
+// the adapter stop with SIGTRAP and a message naming the symbol and the arm64e shim. The exception is a row with
+// blockInvokeOnly (the callee runs the block before it returns and never copies or releases it, as dyld_get_image_versions
+// does): a stack block with helpers is then passed with only its invoke authenticated, because nothing calls the helpers.
+// A heap block is still refused. So dispatch_async or dispatch_once of
 // a block that captures an object or a __block variable, or of a heap block, stops here; most Objective-C dispatch_async
 // calls are in that group, and so is a heap block that the adapted _Block_copy made and that is then dispatched. That is
 // deliberate: rewriting a shared block corrupts it for its other users, and a proxy block needs code compiled for arm64e.

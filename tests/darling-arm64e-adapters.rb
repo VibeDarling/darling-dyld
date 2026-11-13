@@ -46,6 +46,8 @@ HAND = {
   '_sigaction' => [0x0, 0, 2, 0, 3, 0],                    # (sig, const struct sigaction* act, struct sigaction* oact)
   '_signal' => [0x2, 0, 0, 1, 2, 0],                       # sig_t signal(int, sig_t)
   '__Block_copy' => [0x0, 0, 0, 2, 1, 0],                  # void* _Block_copy(const void*)
+  '_dyld_get_image_versions' => [0x0, 2, 0, 0, 2, 1],      # (const struct mach_header*, void (^)(dyld_platform_t, uint32_t, uint32_t)), dyld_priv.h
+  '__dyld_process_info_for_each_aot_image' => [0x0, 2, 0, 0, 2, 1], # (dyld_process_info, bool (^)(uint64_t, uint64_t, uint64_t, uint8_t*, size_t)), dyld_process_info.h
   '__tlv_atexit' => [0x1, 0, 0, 0, 2, 1],                  # (void (*termFunc)(void*), void* objAddr); not in the T0 lists
 }.freeze
 # The callback-taking imports of the C++ runtime, ObjC and Foundation closures from the T0 facts scan: class, public prototype note.
@@ -62,6 +64,9 @@ def derived(sym, cls, note)
   [args.sum { |i, _| 1 << i.to_i }, 0, 0, 0, args.map { |i, _| i.to_i }.max + 1, 1]
 end
 
+# The rows whose callee only calls the block before it returns, so that a stack block with helpers may be passed (the last field of
+# the driver's ROW line); no other row has the flag.
+INVOKE_ONLY = %w[_dyld_get_image_versions __dyld_process_info_for_each_aot_image].freeze
 SPEC = HAND.dup
 FIXTURE.each { |sym, (cls, note, present, _source)| SPEC[sym] ||= derived(sym, cls, note) if present == 'OK' }
 SPEC.freeze
@@ -86,7 +91,9 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
 
   # ---------------------------------------------------------------- the table
   out, = run(exe, 'rows')
-  rows = out.lines.map { |l| l.split }.select { |f| f[0] == 'ROW' }.to_h { |f| [f[1], f[2..].map(&:to_i)] }
+  row_lines = out.lines.map { |l| l.split }.select { |f| f[0] == 'ROW' }
+  rows = row_lines.to_h { |f| [f[1], f[2..7].map(&:to_i)] }
+  check 'exactly the rows that only call their block before returning are flagged invoke-only', row_lines.select { |f| f[8] == '1' }.map { |f| f[1] }.sort == INVOKE_ONLY.sort, row_lines.select { |f| f[8] == '1' }.map { |f| f[1] }.inspect
   check 'the table has exactly the rows of the spec', rows.keys.sort == SPEC.keys.sort, "extra #{(rows.keys - SPEC.keys).inspect} missing #{(SPEC.keys - rows.keys).inspect}"
   wrong = SPEC.reject { |sym, want| rows[sym] == want }
   check "all #{SPEC.size} rows match the Darwin prototypes and the facts", wrong.empty?, wrong.first(3).map { |sym, want| "#{sym}: #{rows[sym].inspect} want #{want.inspect}" }.inspect
@@ -164,7 +171,14 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     'a block invoke is stripped instead of authenticated' => ['const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);', 'const uint64_t plainInvoke = stripCode((uint64_t)block->invoke);'],
     'a block invoke is authenticated with discriminator 0 instead of its address' => ['const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);', 'const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, 0);'],
     'a heap block is rewritten in place instead of refused' => [/if \( block->flags & kBlockNeedsFree \)\s+refuseBlock\(row, "a heap block"\);/, ''],
-    'a block with copy and dispose helpers is passed on' => [/if \( block->flags & kBlockHasCopyDispose \)\s+refuseBlock\(row, "a block with copy and dispose helpers"\);\n\t\t\tif/, 'if'],
+    'a block with copy and dispose helpers is passed on' => [/if \( \(block->flags & kBlockHasCopyDispose\) && !row->blockInvokeOnly \)\s+refuseBlock\(row, "a block with copy and dispose helpers"\);\n\t\t\tif/, 'if'],
+    'the invoke-only flag is ignored, so a block with helpers is refused for the invoke-only rows' => ['&& !row->blockInvokeOnly )', ')'],
+    'a block with helpers is passed to every row, not only the invoke-only ones' => ['&& !row->blockInvokeOnly )', '&& false )'],
+    'the validator accepts an invoke-only row with no block argument' => ['if ( r.blockInvokeOnly && (r.blockArg == 0) )', 'if ( false )'],
+    'the row of _dyld_get_image_versions is not invoke-only' => [/(\{ "_dyld_get_image_versions",[^\n]*), true \},/, '\\1 },', :rows],
+    'the row of _dispatch_async is invoke-only' => [/(\{ "_dispatch_async",[^\n]*)" \},/, '\\1", true },', :rows],
+    'the row of __dyld_process_info_for_each_aot_image names the wrong argument' => ['{ "__dyld_process_info_for_each_aot_image", 0x0, 2,', '{ "__dyld_process_info_for_each_aot_image", 0x0, 1,', :rows],
+    'the row of _dyld_get_image_versions is unsupported again' => [/\{ "_dyld_get_image_versions", 0x0, 2, 0, ReturnFix::None, 2, AdapterStatus::ShapeOnly, INVOKE_ONLY" \(mach-o\/dyld_priv.h, the block is argument 1\)", true \}/, '{ "_dyld_get_image_versions", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, BLK" (mach-o/dyld_priv.h)" }', :rows],
     'Block_copy takes a block with helpers' => [/if \( \(block->flags & kBlockHasCopyDispose\) && \(\(block->flags & kBlockIsGlobal\) == 0\) \)\s+refuseBlock\(row, "a block with copy and dispose helpers"\);/, ''],
     'a stack block does not get its signature back' => ['*restoreSlot = restoreValue;', '(void)restoreValue;'],
     'a stack block is never restored (slot not recorded)' => ['restoreSlot = &block->invoke;', 'restoreSlot = nullptr;'],
@@ -240,7 +254,7 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
       !mst.success? || mout =~ /^FAIL/
     end
     # a mutated table row is caught by the comparison with the spec, which reads the rows output
-    spec_dead = !mexe.nil? && run(mexe, 'rows')[0].lines.grep(/^ROW/).map { |l| l.split }.to_h { |f| [f[1], f[2..].map(&:to_i)] } != SPEC
+    spec_dead = !mexe.nil? && run(mexe, 'rows')[0].lines.grep(/^ROW/).map { |l| l.split }.to_h { |f| [f[1], f[2..7].map(&:to_i)] } != SPEC
     bytes_dead = false
     if mexe && HAVE_MC && !dead
       # a thunk-shape mutant that the native run does not see is still caught by the assembler comparison
