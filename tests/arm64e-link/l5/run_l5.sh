@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Guest boots of the L5 objc test: each boot runs the configurations in $L5_CONFIGS (default "c3 c1 selftest"):
 #   c3        arm64e with DYLD_SHARED_CACHE_SPLIT_DIR, so libobjc is served from the cache (the L5 proof),
-#             DYLD_PRINT_OBJC_NOTIFICATIONS=1, which makes dyld log the objc callback lines check 07 reads, and
+#             DARLING_DYLD_OBJC_LOG=1, which makes dyld log the objc callback lines check 07 reads, and
 #             DARLING_DYLD_POLICY_LOG=1, which makes dyld log the cache load source line check 01 reads
 #   c1        control: no cache variable, the pre-L5 dyld2 path; check 01 must report the image is not served
 #   selftest  the harness's own children, no guest state involved
@@ -40,7 +40,7 @@ for c in ${L5_CONFIGS:-c3 c1 selftest}; do
           [ -f "$pdir/$(basename "$L5_POLICY")" ] || { echo "no policy file: $L5_POLICY" >&2; exit 2; }
           policy=" DYLD_SHARED_CACHE_SPLIT_POLICY=$(q "$guest_root$pdir/$(basename "$L5_POLICY")")"
         fi
-        cmd="$cmd; echo CONFIG c3; DYLD_PRINT_OBJC_NOTIFICATIONS=1 DARLING_DYLD_POLICY_LOG=1 DYLD_SHARED_CACHE_SPLIT_DIR=$(q "$guest_root$cache")$policy \"\$E\"" ;;
+        cmd="$cmd; echo CONFIG c3; DARLING_DYLD_OBJC_LOG=1 DARLING_DYLD_POLICY_LOG=1 DYLD_SHARED_CACHE_SPLIT_DIR=$(q "$guest_root$cache")$policy \"\$E\"" ;;
     selftest) cmd="$cmd; echo CONFIG selftest; \"\$E\" selftest" ;;
     *) echo "unknown config $c" >&2; exit 2 ;;
   esac

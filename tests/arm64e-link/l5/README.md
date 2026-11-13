@@ -44,7 +44,7 @@ dyld: objc mapped <path> refs_optimized=<0|1>      per image handed to the mappe
 dyld: objc init <path> refs_optimized=<0|1>        per image handed to the init callback
 ```
 
-dyld prints these only when `DYLD_PRINT_OBJC_NOTIFICATIONS=1` is set, so `run_l5.sh` sets it on the c3
+dyld prints these only when `DARLING_DYLD_OBJC_LOG=1` is set, so `run_l5.sh` sets it on the c3
 command inside the guest (never on the launcher); a run without it fails check 07 with that hint. c1 does
 not set it: its check 07 fails anyway because libobjc is not cache-served.
 
@@ -105,7 +105,7 @@ DARLING_GUEST_BUILD=<build> PROBE_DIR=<build dir of build_l5.py> CACHE_DIR=<spli
   run_l5.sh l5- 1 1
 ```
 
-The boot runs `c3` (cache variable set, the proof; it also sets `DYLD_PRINT_OBJC_NOTIFICATIONS=1` and
+The boot runs `c3` (cache variable set, the proof; it also sets `DARLING_DYLD_OBJC_LOG=1` and
 `DARLING_DYLD_POLICY_LOG=1`, inside the guest and never on the launcher, because dyld prints the
 `policy=` line check 01 reads only under the latter and the objc lines check 07 reads only under the
 former; the driver's check children inherit both), `c1` (control, no variable: check 01 must fail

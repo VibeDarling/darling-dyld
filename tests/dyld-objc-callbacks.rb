@@ -66,9 +66,10 @@ MAN = File.read("#{ROOT}/doc/man/man1/dyld.1")
 # Which dyld lines are unrequested diagnostics: each static pin is a function of the sources so a probe can
 # mutate one source and prove the pin fails. name => [description, source key, lambda(source)].
 GATE_PINS = {
-  objc_parse: ['dyld2 parses DYLD_PRINT_OBJC_NOTIFICATIONS into gLogObjCNotifications', :dyld2,
-               ->(t) { t.match?(/else if \( strcmp\(key, "DYLD_PRINT_OBJC_NOTIFICATIONS"\) == 0 \) \{\n\t\tgLogObjCNotifications = true;\n\t\}/) &&
-                       t.match?(/^bool\s+gLogObjCNotifications = false;/) }],
+  objc_parse: ['dyld2 parses DARLING_DYLD_OBJC_LOG into gLogObjCNotifications', :dyld2,
+               ->(t) { t.match?(/\telse if \( \(keyLen == strlen\("DARLING_DYLD_OBJC_LOG"\)\) && \(strncmp\(keyEqualsValue, "DARLING_DYLD_OBJC_LOG", keyLen\) == 0\) \)\n\t\tgLogObjCNotifications = true;\n/) &&
+                       t.match?(/^bool\s+gLogObjCNotifications = false;/) &&
+                       !t.include?('"DYLD_PRINT_OBJC_NOTIFICATIONS"') }],
   objc_extern: ['dyld2.h declares gLogObjCNotifications', :hdr, ->(t) { t.match?(/extern bool\s+gLogObjCNotifications;/) }],
   policy_parse: ['dyld2 parses DARLING_DYLD_POLICY_LOG into gLogCachePolicy, for unrestricted processes only', :dyld2,
                  ->(t) { t.match?(/\tif \( \(keyLen == strlen\("DARLING_DYLD_POLICY_LOG"\)\) && \(strncmp\(keyEqualsValue, "DARLING_DYLD_POLICY_LOG", keyLen\) == 0\) \)\n\t\tgLogCachePolicy = true;\n/) &&
@@ -274,7 +275,7 @@ DRIVER = <<~'CPP'
       return s.registerCallbacks(asCallbacks(&v4));
   }
 
-  // DYLD_PRINT_OBJC_NOTIFICATIONS: the hooks append the lines src/dyldAPIs.cpp's wrappers print.
+  // DARLING_DYLD_OBJC_LOG: the hooks append the lines src/dyldAPIs.cpp's wrappers print.
   static char noteText[2048];
   static void noteRegistered(unsigned version)
   {

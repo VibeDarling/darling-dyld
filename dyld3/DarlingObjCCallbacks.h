@@ -146,7 +146,7 @@ struct ObjCCallbackState {
 	ObjCBlockLayout					markImageMutable = { nullptr, 0, 0, 0, nullptr };
 	bool							arm64eRuntime = false;	// a v4 registration on arm64: libobjc authenticates the metadata it reads
 	void							(*logSkip)(const char* format, const char* path) = nullptr;
-	// DYLD_PRINT_OBJC_NOTIFICATIONS: the registered version, and each image actually handed to the runtime.
+	// DARLING_DYLD_OBJC_LOG: the registered version, and each image actually handed to the runtime.
 	void							(*logRegistered)(unsigned version) = nullptr;
 	void							(*logDelivered)(const char* kind, const char* path, unsigned refsOptimized) = nullptr;
 

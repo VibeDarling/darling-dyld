@@ -176,7 +176,7 @@ static const char *l5_objc_verdict(const struct l5_objc_seen *s) {
     if (s->registers > 1)
         return "the loader logged more than one objc register_callbacks line (in L5 only libobjc registers)";
     if (s->registers != 1)
-        return "the loader did not log an objc register_callbacks line (DYLD_PRINT_OBJC_NOTIFICATIONS=1 set?)";
+        return "the loader did not log an objc register_callbacks line (DARLING_DYLD_OBJC_LOG=1 set?)";
     if (s->version != 4)
         return "libobjc did not register version 4 callbacks";
     if (s->repeats)

@@ -2291,7 +2291,7 @@ void _dyld_objc_notify_register(_dyld_objc_notify_mapped    mapped,
 // The block a v3/v4 mapped callback is handed, called when libobjc makes a cache image's data mutable
 // before remapping a class or protocol reference. The cache runtime maps each mapping with the cache
 // header's protections, and the data mapping's include write (dyld3/SharedCacheRuntime.cpp:601, :634), so
-// there is nothing to change; the line, under DYLD_PRINT_OBJC_NOTIFICATIONS, is the guest evidence that libobjc asked.
+// there is nothing to change; the line, under DARLING_DYLD_OBJC_LOG, is the guest evidence that libobjc asked.
 static void markImageMutableImpl(void*, uint32_t objcImageIndex)
 {
 	if ( dyld::gLogObjCNotifications )

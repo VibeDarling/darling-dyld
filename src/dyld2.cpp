@@ -265,7 +265,7 @@ struct EnvironmentVariables {
 							//	DYLD_PRINT_REBASINGS			==> gLinkContext.verboseRebase
 							//	DYLD_PRINT_DOFS					==> gLinkContext.verboseDOF
 							//	DYLD_PRINT_APIS					==> gLogAPIs
-							//	DYLD_PRINT_OBJC_NOTIFICATIONS	==> gLogObjCNotifications (Darling only)
+							//	DARLING_DYLD_OBJC_LOG			==> gLogObjCNotifications (Darling only, own prefix: see processDarlingLogVariable)
 							//	DARLING_DYLD_POLICY_LOG			==> gLogCachePolicy (Darling only, own prefix: see processDarlingLogVariable)
 							//	DYLD_IGNORE_PREBINDING			==> gLinkContext.prebindUsage
 							//	DYLD_PREBIND_DEBUG				==> gLinkContext.verbosePrebinding
@@ -2332,9 +2332,6 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 	else if ( strcmp(key, "DYLD_PRINT_APIS") == 0 ) {
 		gLogAPIs = true;
 	}
-	else if ( strcmp(key, "DYLD_PRINT_OBJC_NOTIFICATIONS") == 0 ) {
-		gLogObjCNotifications = true;
-	}
 #if SUPPORT_ACCELERATE_TABLES
 	else if ( strcmp(key, "DYLD_PRINT_APIS_APP") == 0 ) {
 		gLogAppAPIs = true;
@@ -2646,6 +2643,8 @@ static void processDarlingLogVariable(const char* keyEqualsValue)
 	const size_t keyLen = equals - keyEqualsValue;
 	if ( (keyLen == strlen("DARLING_DYLD_POLICY_LOG")) && (strncmp(keyEqualsValue, "DARLING_DYLD_POLICY_LOG", keyLen) == 0) )
 		gLogCachePolicy = true;
+	else if ( (keyLen == strlen("DARLING_DYLD_OBJC_LOG")) && (strncmp(keyEqualsValue, "DARLING_DYLD_OBJC_LOG", keyLen) == 0) )
+		gLogObjCNotifications = true;
 }
 
 static void checkEnvironmentVariables(const char* envp[])

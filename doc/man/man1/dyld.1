@@ -36,7 +36,7 @@ DYLD_DISABLE_DOFS
 .br
 DYLD_PRINT_APIS
 .br
-DYLD_PRINT_OBJC_NOTIFICATIONS
+DARLING_DYLD_OBJC_LOG
 .br
 DARLING_DYLD_POLICY_LOG
 .br
@@ -214,7 +214,7 @@ __attribute__((constructor)), and -init functions.
 .B DYLD_PRINT_APIS
 Causes dyld to print a line whenever a dyld API is called (e.g. NSAddImage()).
 .TP
-.B DYLD_PRINT_OBJC_NOTIFICATIONS
+.B DARLING_DYLD_OBJC_LOG
 Causes dyld to print the version the objc runtime registered its callbacks with, and a line for each
 image it hands to the runtime's mapped and init callbacks, a line for each plain image it withholds from an
 arm64e runtime, and a line each time the runtime asks to make an image mutable (Darling only, dyld2 loader only).
