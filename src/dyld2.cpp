@@ -143,6 +143,9 @@ extern "C" int __fork();
 #include "Loading.h"
 #include "DyldSharedCache.h"
 #include "SharedCacheRuntime.h"
+#ifdef DARLING
+#include "DarlingCollectMissing.h"
+#endif
 #include "StringUtils.h"
 #include "Tracing.h"
 #include "ClosureBuilder.h"
@@ -2532,6 +2535,17 @@ static void checkEnvironmentVariables(const char* envp[])
 			const char* path = &keyEqualsValue[16];
 			sEnv.LD_LIBRARY_PATH = parseColonList(path, NULL);
 		}
+#ifdef DARLING
+		// record every unresolved symbol into the named file and keep going (dyld3/DarlingCollectMissing.h). All lazy
+		// pointers are bound at link, else a missing lazy import would only show when it is called. allowEnvVarsPrint is
+		// always true on Darling (the AMFI stub above allows everything), so it protects nothing here: a setuid or AT_SECURE
+		// process must not be told to append to a file the caller names, hence issetugid(). DYLD_PRINT_TO_FILE and
+		// DYLD_INSERT_LIBRARIES are exposed on Darling the same way and are not changed by this.
+		else if ( (strncmp(keyEqualsValue, "DARLING_DYLD_COLLECT_MISSING=", 29) == 0) && gLinkContext.allowEnvVarsPrint && !issetugid() ) {
+			dyld3::darling::collectMissingEnable(&keyEqualsValue[29]);
+			sEnv.DYLD_BIND_AT_LAUNCH = dyld3::darling::collectMissingEnabled() || sEnv.DYLD_BIND_AT_LAUNCH;
+		}
+#endif
 	}
 
 #if SUPPORT_LC_DYLD_ENVIRONMENT
@@ -5158,6 +5172,9 @@ void link(ImageLoader* image, bool forceLazysBound, bool neverUnload, const Imag
 #if SUPPORT_ACCELERATE_TABLES
 		if ( image == sAllCacheImagesProxy )
 			path = sAllCacheImagesProxy->getIndexedPath(cacheIndex);
+#endif
+#ifdef DARLING
+		forceLazysBound = forceLazysBound || dyld3::darling::collectMissingEnabled();
 #endif
 		image->link(gLinkContext, forceLazysBound, false, neverUnload, loaderRPaths, path);
 	}
