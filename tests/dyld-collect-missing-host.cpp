@@ -5,16 +5,39 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <setjmp.h>
+#include <stdarg.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <string>
 #include <vector>
 
 using namespace dyld3::darling;
+
+// What the recorder asks of the kernel is watched through these two wrappers (the executable's symbols win over libc's).
+static const char* sWatchedPath = nullptr;
+static int sWatchedOpenFlags = -1;
+static bool sShortWrite = false;
+extern "C" int open(const char* path, int flags, ...)
+{
+	va_list ap;
+	va_start(ap, flags);
+	const int mode = va_arg(ap, int);
+	va_end(ap);
+	if ( (sWatchedPath != nullptr) && (strcmp(path, sWatchedPath) == 0) )
+		sWatchedOpenFlags = flags;
+	return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+}
+extern "C" ssize_t write(int fd, const void* buf, size_t n)
+{
+	if ( sShortWrite && (n > 1) )
+		return (ssize_t)(n - 1);
+	return (ssize_t)syscall(SYS_write, fd, buf, n);
+}
 
 static sigjmp_buf sJump;
 static char sHaltMessage[1024];
@@ -142,13 +165,15 @@ int main(int argc, char** argv)
 	for (const std::string& l : lines) {
 		if ( !l.empty() && l[0] == '#' ) header = l; else records.push_back(l);
 	}
-	CHECK(header.find("# regions thunk=0x") == 0, "region header line: %s", header.c_str());
+	char pidText[32];
+	snprintf(pidText, sizeof(pidText), "pid=%d", (int)getpid());
+	CHECK(header.find(std::string("# process ") + pidText + " regions thunk=0x") == 0, "region header line names the pid and the regions: %s", header.c_str());
 	CHECK(records.size() == 7, "7 record lines (A, B, C, data, weak, A from another referrer, lazy data), got %zu", records.size());
 	for (const std::string& r : records)
-		CHECK(fields(r).size() == 8, "8 fields: %s", r.c_str());
+		CHECK(fields(r).size() == 9 && fields(r)[8] == std::to_string((int)getpid()), "9 fields, the last the pid: %s", r.c_str());
 	for (const std::string& r : records)
 		CHECK(r.find("0x") == std::string::npos, "no address in a record line");
-	auto has = [&](const char* line) { for (const std::string& r : records) if ( r == line ) return true; return false; };
+	auto has = [&](const char* line) { const std::string want = std::string(line) + "\t" + std::to_string((int)getpid()); for (const std::string& r : records) if ( r == want ) return true; return false; };
 	CHECK(has("/app/Test\t_missingFunctionA\t/usr/lib/libmissing.dylib\t2\tstrong\tlazy\ttrap\tT0"), "A: lazy trap slot 0");
 	CHECK(has("/app/Test\t_missingFunctionB\t/usr/lib/libmissing.dylib\t2\tstrong\tnonlazy\ttrap\tT1"), "B: non-lazy trap slot 1");
 	CHECK(has("/app/Test\t_missingFunctionC\t/usr/lib/libmissing.dylib\t2\tstrong\tchained\ttrap\tT2"), "C: chained trap slot 2");
@@ -194,6 +219,110 @@ int main(int argc, char** argv)
 	};
 	for (const auto& n : names)
 		CHECK(collectMissingNameLooksLikeData(n.name) == n.data, "%s is %s", n.name, n.data ? "data" : "a function");
+
+	// 7. signed ordinals, as the bind opcodes have them: -1 main executable, -2 flat lookup, 0 self
+	std::string thunkBase = header.substr(header.find("thunk=") + 6, header.find(" guard=") - header.find("thunk=") - 6);
+	const uintptr_t thunkRegion = (uintptr_t)strtoull(thunkBase.c_str(), nullptr, 16);
+	collectMissingBind({ "/app/Test", "_mainExecutableImport", "/app/Test", -1, false, BindKind::Unknown });
+	collectMissingBind({ "/app/Test", "_flatImport", "flat", -2, false, BindKind::Unknown });
+	collectMissingBind({ "/app/Test", "_selfImport", "/app/Test", 0, false, BindKind::Unknown });
+	lines = readLines(out);
+	auto hasLine = [&](const char* line) { const std::string want = std::string(line) + "\t" + std::to_string((int)getpid()); for (const std::string& r : lines) if ( r == want ) return true; return false; };
+	CHECK(hasLine("/app/Test\t_mainExecutableImport\t/app/Test\t-1\tstrong\tchained\ttrap\tT4"), "ordinal -1 (main executable) keeps its sign");
+	CHECK(hasLine("/app/Test\t_flatImport\tflat\t-2\tstrong\tchained\ttrap\tT5"), "ordinal -2 (flat lookup) keeps its sign");
+	CHECK(hasLine("/app/Test\t_selfImport\t/app/Test\t0\tstrong\tchained\ttrap\tT6"), "ordinal 0 (self) is 0");
+
+	// 8. guards: one slot per symbol, each its own, the same symbol from another referrer shares it
+	uintptr_t g1 = collectMissingBind({ app, "_kMissingData2", lib, 2, false, BindKind::NonLazy });
+	uintptr_t g2 = collectMissingBind({ app, "_kMissingData3", lib, 2, false, BindKind::NonLazy });
+	uintptr_t g1Again = collectMissingBind({ "/usr/lib/libother.dylib", "_kMissingData2", lib, 3, false, BindKind::NonLazy });
+	CHECK(g1 != g2 && g1 != d && g2 != d, "every data symbol has its own guard slot");
+	CHECK(g1Again == g1, "the same data symbol shares its guard slot across referrers");
+	CHECK(g1 == d + 16 && g2 == d + 32, "guard slots are consecutive 16-byte slots");
+
+	// 9. what the recorder asks of the kernel: close-on-exec and no symlink following; failures are loud
+	{
+		const char* path = "collect-watched.txt";
+		unlink(path);
+		sWatchedPath = path;
+		sWatchedOpenFlags = -1;
+		collectMissingEnable(path);
+		collectMissingBind({ app, "_openFlagsProbe", lib, 2, false, BindKind::Lazy });
+		CHECK(sWatchedOpenFlags >= 0 && (sWatchedOpenFlags & O_CLOEXEC) && (sWatchedOpenFlags & O_NOFOLLOW) && (sWatchedOpenFlags & O_APPEND),
+		      "the output file is opened O_APPEND|O_CLOEXEC|O_NOFOLLOW (flags 0x%x)", sWatchedOpenFlags);
+		sWatchedPath = nullptr;
+
+		// a symlink as the output path is refused loudly and the target is left alone
+		unlink("collect-target.txt");
+		unlink("collect-link.txt");
+		FILE* t = fopen("collect-target.txt", "w");
+		fputs("untouched\n", t);
+		fclose(t);
+		symlink("collect-target.txt", "collect-link.txt");
+		collectMissingEnable("collect-link.txt");
+		sHaltMessage[0] = '\0';
+		if ( sigsetjmp(sJump, 1) == 0 ) {
+			collectMissingBind({ app, "_throughSymlink", lib, 2, false, BindKind::Lazy });
+			CHECK(false, "a symlink as the output path was followed");
+		}
+		CHECK(std::string(sHaltMessage).find("cannot open the output file") != std::string::npos, "a symlink output path halts: %s", sHaltMessage);
+		CHECK(readLines("collect-target.txt").size() == 1, "the symlink's target was not written");
+
+		// an unopenable path halts, and so does a short write
+		collectMissingEnable("/nonexistent-directory/collect.txt");
+		sHaltMessage[0] = '\0';
+		if ( sigsetjmp(sJump, 1) == 0 ) {
+			collectMissingBind({ app, "_unopenable", lib, 2, false, BindKind::Lazy });
+			CHECK(false, "an unopenable output path was ignored");
+		}
+		CHECK(std::string(sHaltMessage).find("cannot open the output file") != std::string::npos, "an unopenable output path halts: %s", sHaltMessage);
+		collectMissingEnable("collect-short.txt");
+		unlink("collect-short.txt");
+		sShortWrite = true;
+		sHaltMessage[0] = '\0';
+		if ( sigsetjmp(sJump, 1) == 0 ) {
+			collectMissingBind({ app, "_shortWrite", lib, 2, false, BindKind::Lazy });
+			CHECK(false, "a short write was ignored");
+		}
+		sShortWrite = false;
+		CHECK(std::string(sHaltMessage).find("cannot write the output file") != std::string::npos, "a short write halts: %s", sHaltMessage);
+		collectMissingEnable(out);
+	}
+
+	// 10. the trap with a slot it has no symbol for names nothing and does not read out of bounds
+	{
+		uint64_t trap = 0;
+		memcpy(&trap, (const void*)thunkRegion, sizeof(trap));
+		sHaltMessage[0] = '\0';
+		if ( sigsetjmp(sJump, 1) == 0 )
+			((void (*)(uint64_t))(uintptr_t)trap)(1ULL << 40);
+		CHECK(std::string(sHaltMessage).find("called: ?") != std::string::npos, "a slot out of range halts without a name: %s", sHaltMessage);
+	}
+
+	// 11. the capacity: 8192 functions and 8192 data symbols per process, the next one halts
+	{
+		auto fill = [&](const char* format, BindKind kind, size_t base, const char* what) {
+			uintptr_t last = 0;
+			size_t i = 0;
+			std::string halted;
+			for (; i < 9000; ++i) {
+				char name[64];
+				snprintf(name, sizeof(name), format, (int)i);
+				sHaltMessage[0] = '\0';
+				if ( sigsetjmp(sJump, 1) == 0 )
+					last = collectMissingBind({ app, name, lib, 2, false, kind });
+				else {
+					halted = sHaltMessage;
+					break;
+				}
+			}
+			CHECK(halted.find("more than 8192") != std::string::npos, "%s: the 8193rd distinct symbol halts (%s)", what, halted.c_str());
+			CHECK(last == base, "%s: the last symbol bound sits in the last slot", what);
+		};
+		fill("_capFunction%d", BindKind::Lazy, thunkRegion + 16 + 16 * 8191, "functions");
+		const uintptr_t guardRegion = (uintptr_t)strtoull(header.c_str() + header.find("guard=") + 6, nullptr, 16);
+		fill("_kCapData%d", BindKind::NonLazy, guardRegion + 16 * 8191, "data symbols");
+	}
 
 	printf(failures == 0 ? "RESULT ok\n" : "RESULT failed (%d)\n", failures);
 	return failures == 0 ? 0 : 1;
