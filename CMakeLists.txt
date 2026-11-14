@@ -110,6 +110,7 @@ add_executable(system_loader
 	dyld3/Tracing.cpp
 	dyld3/Loading.cpp
 	dyld3/Diagnostics.cpp
+	dyld3/DarlingCollectMissing.cpp
 	dyld3/SharedCacheRuntime.cpp
 	dyld3/shared-cache/DyldSharedCache.cpp
 	#dyld3/shared-cache/FileUtils.cpp
