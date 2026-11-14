@@ -73,7 +73,21 @@
 	static void* darlingDlsymSignForCaller(void* result, void* callerAddress)
 	{
 		const ImageLoader* callerImage = dyld::findImageContainingAddress(callerAddress);
-		if ( (callerImage == NULL) || ((callerImage->machHeader()->cpusubtype & ~CPU_SUBTYPE_MASK) != CPU_SUBTYPE_ARM64E) )
+		// A cache image that a stand-in replaced (ImageIO, CoreGraphics, ...) has no loader, yet its code runs: the exports the stand-in
+		// does not define stay the cache's, and cache code calls dlsym from there. Such a caller is in no image's mapped range, but it
+		// is inside the cache region, and an arm64e cache holds arm64e code. Without the signature the soft-linked call by cache code
+		// is an authenticated branch to a plain pointer.
+		bool callerIsArm64e = false;
+		if ( callerImage != NULL ) {
+			callerIsArm64e = ((callerImage->machHeader()->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E);
+		}
+		else {
+			const DyldSharedCache* cache = (const DyldSharedCache*)dyld::imMemorySharedCacheHeader();
+			callerIsArm64e = (cache != nullptr) && (strcmp(cache->header.magic, "dyld_v1  arm64e") == 0)
+						  && ((uintptr_t)callerAddress >= (uintptr_t)cache)
+						  && ((uintptr_t)callerAddress < (uintptr_t)cache + (uintptr_t)cache->mappedSize());
+		}
+		if ( !callerIsArm64e )
 			return result;
 		return DARLING_DLSYM_SIGN(result);
 	}
@@ -2260,9 +2274,7 @@ const void* _dyld_get_shared_cache_range(size_t* length)
 {
     const DyldSharedCache* cache = (DyldSharedCache*)dyld::imMemorySharedCacheHeader();
     if ( cache != nullptr ) {
-        const dyld_cache_mapping_info* const mappings = (dyld_cache_mapping_info*)((char*)cache + cache->header.mappingOffset);
-		const dyld_cache_mapping_info* lastMapping = &mappings[cache->header.mappingCount - 1];
-        *length = (size_t)((lastMapping->address + lastMapping->size) - cache->unslidLoadAddress());
+        *length = (size_t)cache->mappedSize();
         return cache;
     }
 	return nullptr;
