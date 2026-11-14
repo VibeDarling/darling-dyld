@@ -105,7 +105,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
     using namespace dyld3;
     class ImageLoader {
     public:
-      struct LinkContext { bool allowEnvVarsPath = true; const char* const* rootPaths = nullptr; };
+      struct LinkContext { bool allowEnvVarsPath = true; bool iOSonMac = false; const char* const* rootPaths = nullptr; };
       int tag = 0;                       // 1 = cache, 2 = disk
       const void* mh = nullptr;
       uint32_t overrides = 0;
