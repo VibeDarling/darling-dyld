@@ -661,7 +661,7 @@ uintptr_t ImageLoaderMachOCompressed::resolveFlat(const LinkContext& context, co
 	}
 #ifdef DARLING
 	if ( dyld3::darling::collectMissingEnabled() )
-		return darlingCollectMissing(this, symbolName, "flat", 0, weak_import);
+		return darlingCollectMissing(this, symbolName, "flat", BIND_SPECIAL_DYLIB_FLAT_LOOKUP, weak_import);
 #endif
 	if ( weak_import ) {
 		// definition can't be found anywhere, ok because it is weak, just return 0
@@ -787,7 +787,8 @@ uintptr_t ImageLoaderMachOCompressed::resolveTwolevel(const LinkContext& context
 		const char* expectedIn = definedInImage->getInstallPath();
 		if ( (expectedIn == NULL) || (expectedIn[0] == '\0') )
 			expectedIn = definedInImage->getPath();
-		return darlingCollectMissing(this, symbolName, expectedIn, (long)requestorOrdinalOfDef, weak_import);
+		// the ordinal is signed (-1 is the main executable): resolve() passed it through an unsigned parameter
+		return darlingCollectMissing(this, symbolName, expectedIn, (long)(int)requestorOrdinalOfDef, weak_import);
 	}
 #endif
 	if ( weak_import ) {

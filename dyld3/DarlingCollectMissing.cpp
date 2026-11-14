@@ -12,8 +12,12 @@ namespace dyld {
 
 // Design (DARLING_DYLD_COLLECT_MISSING):
 //  - One line per (referring image, symbol), TAB separated, appended to the file as it is found, so an abort or a crash
-//    leaves a complete file: referrer, symbol, expected library, ordinal, strong|weak, lazy|nonlazy|chained, zero|trap|guard, slot.
-//    Names only. Lines starting with '#' give the bases of our own two regions, so a fault in a guard maps to its slot.
+//    leaves a complete file: referrer, symbol, expected library, ordinal, strong|weak, lazy|nonlazy|chained, zero|trap|guard, slot, pid.
+//    The pid attributes lines when children inherit the variable; a relative path resolves against the cwd at each write.
+//    Ordinals are signed as in the bind opcodes: 0 self, -1 main executable, -2 flat lookup, -3 weak lookup. The expected-library
+//    column is the install name as the image records it (so it may start with @), the referrer falls back to the path.
+//    A symbol shared by several referrers has one thunk or guard slot; the trap names the first referrer that met it.
+//    Names only. Lines starting with '#' give the pid and the bases of our own two regions, so a fault in a guard maps to its slot.
 //  - Functions bind to a 16-byte thunk of ours (movz x0,#slot; ldr x16,<trap>; br x16). The region is read-write while an entry
 //    is written and read-execute while it runs, never both. dyld signs the address like any resolved one, so an arm64e
 //    importer's authenticated call works and reaches the trap. The trap halts with the symbol's name.
@@ -34,8 +38,9 @@ static uint8_t* sThunks = nullptr;
 static uint8_t* sGuards = nullptr;
 
 struct SymbolInfo { const char* symbol; const char* referrer; const char* expectedIn; };
-static SymbolInfo sThunkSlots[kSlotsPerKind];
-static SymbolInfo sGuardSlots[kSlotsPerKind];
+// Mapped by makeRegions, so a process that never turns the mode on carries no static storage for them.
+static SymbolInfo* sThunkSlots = nullptr;
+static SymbolInfo* sGuardSlots = nullptr;
 static size_t sThunkCount = 0;
 static size_t sGuardCount = 0;
 
@@ -140,7 +145,7 @@ static size_t appendHex(char* out, size_t at, uint64_t v)
 // One write(2) per line. The file is opened per line, so no descriptor stays open in the process for the app to see.
 static void writeLine(const char* line, size_t length)
 {
-	const int fd = open(sOutputPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	const int fd = open(sOutputPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644);
 	if ( fd < 0 )
 		dyld::halt("DARLING_DYLD_COLLECT_MISSING: cannot open the output file");
 	const ssize_t written = write(fd, line, length);
@@ -151,8 +156,10 @@ static void writeLine(const char* line, size_t length)
 
 static void writeRegionHeader()
 {
-	char line[128];
-	size_t n = appendStr(line, 0, "# regions thunk=");
+	char line[160];
+	size_t n = appendStr(line, 0, "# process pid=");
+	n = appendDec(line, n, (uint64_t)getpid());
+	n = appendStr(line, n, " regions thunk=");
 	n = appendHex(line, n, (uint64_t)(uintptr_t)sThunks);
 	n = appendStr(line, n, " guard=");
 	n = appendHex(line, n, (uint64_t)(uintptr_t)sGuards);
@@ -190,8 +197,11 @@ static void makeRegions()
 		return;
 	void* thunks = mmap(nullptr, kThunkRegionBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	void* guards = mmap(nullptr, kGuardRegionBytes, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-	if ( (thunks == MAP_FAILED) || (guards == MAP_FAILED) )
+	void* slots = mmap(nullptr, 2 * kSlotsPerKind * sizeof(SymbolInfo), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	if ( (thunks == MAP_FAILED) || (guards == MAP_FAILED) || (slots == MAP_FAILED) )
 		dyld::halt("DARLING_DYLD_COLLECT_MISSING: cannot map its regions");
+	sThunkSlots = (SymbolInfo*)slots;
+	sGuardSlots = sThunkSlots + kSlotsPerKind;
 	sThunks = (uint8_t*)thunks;
 	sGuards = (uint8_t*)guards;
 	const uint64_t trap = (uint64_t)(uintptr_t)&collectedMissingTrap;
@@ -217,6 +227,8 @@ static uintptr_t newThunk(const MissingImport& import)
 		entry[1] = 0x58000010u | ((uint32_t)((literalOffset / 4) & 0x7FFFF) << 5);	// ldr x16, <literal>
 		entry[2] = 0xD61F0200u;											// br x16
 		entry[3] = 0xD503201Fu;											// nop
+		// Linux arm64 syncs the instruction cache for a page when it first becomes executable, not for later rewrites of it
+		__builtin___clear_cache((char*)entry, (char*)(entry + 4));
 		if ( mprotect(sThunks, kThunkRegionBytes, PROT_READ | PROT_EXEC) != 0 )
 			dyld::halt("DARLING_DYLD_COLLECT_MISSING: cannot protect its thunk region");
 		++sThunkCount;
@@ -344,6 +356,8 @@ uintptr_t collectMissingBind(const MissingImport& import)
 		line[n++] = (strcmp(binding, "guard") == 0) ? 'G' : 'T';
 		n = appendDec(line, n, slot);
 	}
+	line[n++] = '\t';
+	n = appendDec(line, n, (uint64_t)getpid());
 	line[n++] = '\n';
 	writeLine(line, n);
 	free(line);

@@ -2537,8 +2537,11 @@ static void checkEnvironmentVariables(const char* envp[])
 		}
 #ifdef DARLING
 		// record every unresolved symbol into the named file and keep going (dyld3/DarlingCollectMissing.h). All lazy
-		// pointers are bound at link, else a missing lazy import would only show when it is called.
-		else if ( (strncmp(keyEqualsValue, "DARLING_DYLD_COLLECT_MISSING=", 29) == 0) && gLinkContext.allowEnvVarsPrint ) {
+		// pointers are bound at link, else a missing lazy import would only show when it is called. allowEnvVarsPrint is
+		// always true on Darling (the AMFI stub above allows everything), so it protects nothing here: a setuid or AT_SECURE
+		// process must not be told to append to a file the caller names, hence issetugid(). DYLD_PRINT_TO_FILE and
+		// DYLD_INSERT_LIBRARIES are exposed on Darling the same way and are not changed by this.
+		else if ( (strncmp(keyEqualsValue, "DARLING_DYLD_COLLECT_MISSING=", 29) == 0) && gLinkContext.allowEnvVarsPrint && !issetugid() ) {
 			dyld3::darling::collectMissingEnable(&keyEqualsValue[29]);
 			sEnv.DYLD_BIND_AT_LAUNCH = dyld3::darling::collectMissingEnabled() || sEnv.DYLD_BIND_AT_LAUNCH;
 		}
