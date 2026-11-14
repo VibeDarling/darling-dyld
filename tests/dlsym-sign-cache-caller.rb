@@ -10,6 +10,11 @@ if ENV['DLSYM_SOURCE_REF']
   abort 'source unavailable' unless ok.success?
 end
 fn=source[/static void\* darlingDlsymSignForCaller\(.*?^\t\}/m] or abort 'darlingDlsymSignForCaller missing'
+# The function takes (result, callerAddress) or, with the arm64e adapters, (result, callerAddress, machoName). Call it with
+# whichever form the source under test has, so the test lands unchanged on either side of that change.
+arity=fn[/darlingDlsymSignForCaller\(([^)]*)\)/, 1].split(',').size
+abort "unexpected darlingDlsymSignForCaller arity #{arity}" unless [2, 3].include?(arity)
+extra_args=arity == 3 ? ', "symbol"' : ''
 Dir.mktmpdir('dlsym-sign-cache-caller-') do |dir|
   File.write("#{dir}/test.cpp", <<~CPP)
     #include <stdint.h>
@@ -34,10 +39,16 @@ Dir.mktmpdir('dlsym-sign-cache-caller-') do |dir|
       }
       const void* imMemorySharedCacheHeader() { return gCache; }
     }
+    // what the three-argument form calls besides the caller lookup: an arm64e cpusubtype test and the adapter lookup, which
+    // returns its target here (the cases below never have a loaded image behind the result)
+    namespace dyld3 { namespace darling {
+      inline bool cpusubtypeIsArm64e(int subtype) { return (subtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E; }
+      inline uint64_t adaptedTarget(const char*, uint64_t target, bool) { return target; }
+    } }
     #define DARLING_DLSYM_SIGN(p) ((void*)((uint64_t)(p) | (1ULL << 53)))
     #{fn}
     static int check(const char* what, void* caller, bool expectSigned) {
-      void* r = darlingDlsymSignForCaller((void*)0x1000, caller);
+      void* r = darlingDlsymSignForCaller((void*)0x1000, caller#{extra_args});
       bool isSigned = ((uint64_t)r >> 48) != 0;
       printf("%s: %s\\n", what, isSigned == expectSigned ? "ok" : "WRONG");
       return isSigned == expectSigned ? 0 : 1;
