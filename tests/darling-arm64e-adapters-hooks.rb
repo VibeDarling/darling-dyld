@@ -83,7 +83,10 @@ REPLAY = <<~'CPP'
   // function starts, B plain whose function-starts table lies outside its LINKEDIT, E plain whose load commands do not parse
   enum { kP, kA, kC, kN, kB, kE, kImages };
   static ImageLoader gReal[kImages];
+  // the cache lookup darlingDlsymSignForCaller makes for a caller that is in no image: this replay has no cache
+  struct DyldSharedCache { struct { char magic[16]; } header; uint64_t mappedSize() const { return 0; } };
   namespace dyld {
+    const void* imMemorySharedCacheHeader() { return nullptr; }
     ImageLoader* findImageContainingAddress(const void* a) {
       ImageLoader* all[] = { &gArm64eCaller, &gPlainCaller, &gPlainTarget, &gArm64eTarget,
                              &gReal[kP], &gReal[kA], &gReal[kC], &gReal[kN], &gReal[kB], &gReal[kE] };
@@ -346,7 +349,10 @@ Dir.mktmpdir('darling-arm64e-adapters-hooks-') do |dir|
     'the fixups do not look at the target image' => [:loader, '(targetImage != NULL) && ', ''],
     'the fixups thunk an interposed address' => [:loader, ' && targetImage->containsAddress((void*)symbolAddress)', ''],
     'the fixups thunk an arm64e target' => [:loader, 'dyld3::darling::cpusubtypeIsArm64e(targetImage->machHeader()->cpusubtype));', 'false);'],
-    'dlsym thunks for a plain caller' => [:api, '|| !dyld3::darling::cpusubtypeIsArm64e(callerImage->machHeader()->cpusubtype) )', ')'],
+    # the caller test is one condition, or an assignment once the cache region's callers are handled too
+    'dlsym thunks for a plain caller' => src[:api].include?('callerIsArm64e = dyld3::darling::cpusubtypeIsArm64e(') ?
+      [:api, 'callerIsArm64e = dyld3::darling::cpusubtypeIsArm64e(callerImage->machHeader()->cpusubtype);', 'callerIsArm64e = true;'] :
+      [:api, '|| !dyld3::darling::cpusubtypeIsArm64e(callerImage->machHeader()->cpusubtype) )', ')'],
     'dlsym never thunks' => [:api, "\t\tif ( resultImage != NULL )\n\t\t\tresult = (void*)dyld3::darling::adaptedTarget(", "\t\tif ( false )\n\t\t\tresult = (void*)dyld3::darling::adaptedTarget("],
     'dlsym thunks an arm64e function' => [:api, 'dyld3::darling::cpusubtypeIsArm64e(resultImage->machHeader()->cpusubtype));', 'false);'],
     'dlsym passes no symbol name' => [:api, 'adaptedTarget(machoName,', 'adaptedTarget("_x",'],
