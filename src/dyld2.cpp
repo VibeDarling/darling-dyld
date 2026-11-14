@@ -3740,6 +3740,23 @@ static const char* pathWithoutRoot(const char* path)
 }
 
 
+// A Mac Catalyst process (iOSonMac) puts its root, /System/iOSSupport, in front of a path before it tries the path itself.
+// pathWithoutRoot keeps that root because the cache indexes the iOSSupport images by their full path; this strips it for a
+// caller that has found no such image. Returns path itself when there is no root to strip.
+static const char* pathWithoutIOSMacRoot(const char* path)
+{
+#if SUPPORT_ROOT_PATH
+	if ( (gLinkContext.rootPaths != NULL) && gLinkContext.iOSonMac ) {
+		for (const char* const* rootPath = gLinkContext.rootPaths; *rootPath != NULL; ++rootPath) {
+			const size_t rootLen = strlen(*rootPath);
+			if ( (strncmp(path, *rootPath, rootLen) == 0) && (path[rootLen] == '/') )
+				return &path[rootLen];
+		}
+	}
+#endif
+	return path;
+}
+
 // The split cache's path table lists the canonical install name and the aliases its builder recorded; a path that reaches
 // a cache image only through directory symlinks (CoreServices.framework/Frameworks/LaunchServices.framework/LaunchServices
 // goes through two) is in neither. Every spelling of a cache image's path has to get the same decision from the policy,
@@ -4238,9 +4255,18 @@ static ImageLoader* loadPhase1(const char* path, const char* orgPath, const Load
 	if ( sSharedCacheLoadInfo.loadAddress != nullptr ) {
 		char resolved[PATH_MAX];
 		dyld3::SharedCacheFindDylibResults found;
-		pathIsInDyldCacheWhichCannotBeOverridden = sSharedCacheLoadInfo.loadAddress->hasNonOverridablePath(path)
-												|| ( findInSharedCacheImageBySpelling(path, resolved, found)
-													&& dyld3::pathIsPinnedToSharedCache(sSharedCacheLoadInfo, found) );
+		bool pathIsACachePath = findInSharedCacheImageBySpelling(path, resolved, found);
+		bool pinned = pathIsACachePath && dyld3::pathIsPinnedToSharedCache(sSharedCacheLoadInfo, found);
+		// A Mac Catalyst process tries /System/iOSSupport + path before path itself (loadPhase0). When the cache has no image at
+		// the prefixed spelling, the attempt is for the macOS image at the plain one: it gets the plain one's pin, or a
+		// DYLD_FRAMEWORK_PATH copy of a listed image would be loaded by this first attempt, before the pinned plain spelling is tried.
+		const char* const withoutIOSMacRoot = pathWithoutIOSMacRoot(path);
+		if ( !pathIsACachePath && (withoutIOSMacRoot != path) ) {
+			dyld3::SharedCacheFindDylibResults foundPlain;
+			pinned = findInSharedCacheImageBySpelling(withoutIOSMacRoot, resolved, foundPlain)
+				  && dyld3::pathIsPinnedToSharedCache(sSharedCacheLoadInfo, foundPlain);
+		}
+		pathIsInDyldCacheWhichCannotBeOverridden = sSharedCacheLoadInfo.loadAddress->hasNonOverridablePath(path) || pinned;
 	}
 
 	// <rdar://problem/48490116> dyld customer cache cannot be overridden

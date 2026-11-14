@@ -12,6 +12,7 @@ dyld2_h = File.read("#{root}/src/dyld2.h")
 runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
 runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
 without_root = dyld2[/^static const char\* pathWithoutRoot\(.*?^\}/m] or abort 'pathWithoutRoot missing'
+ios_root = dyld2[/^static const char\* pathWithoutIOSMacRoot\(.*?^\}/m] or abort 'pathWithoutIOSMacRoot missing'
 spelling = dyld2[/^static bool findInSharedCacheImageBySpelling\(.*?^\}/m] or abort 'findInSharedCacheImageBySpelling missing'
 load5 = dyld2[/^static ImageLoader\* loadPhase5load\(.*?^\}/m] or abort 'loadPhase5load missing'
 relative = dyld2[/^static bool isFileRelativePath\(.*?^\}/m] or abort 'isFileRelativePath missing'
@@ -38,6 +39,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
     #include <assert.h>
     #include <stdio.h>
     #include <errno.h>
+    #include <stdlib.h>
     #include <sys/stat.h>
     #include <sys/types.h>
     #include <limits.h>
@@ -74,7 +76,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
         bool hasImagePath(const char* path, uint32_t& index) const {
           if ( !strcmp(path, "/usr/lib/libz.dylib") || !strcmp(path, "/usr/lib/libz.1.dylib") ) { index = 0; return true; }
           if ( !strcmp(path, "/usr/lib/libobjc.A.dylib") ) { index = 1; return true; }
-          if ( !strcmp(path, "/System/iOSSupport/usr/lib/libcatalyst.dylib") ) { index = 2; return true; }
+          if ( !strcmp(path, "/System/iOSSupport/usr/lib/libcatalyst.dylib") || !strcmp(path, "/System/iOSSupport/usr/lib/libz.dylib") ) { index = 2; return true; }
           return false;
         }
         bool hasNonOverridablePath(const char*) const { return false; }
@@ -135,6 +137,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
       #{records}
       #{in_cache}
       #{without_root}
+      #{ios_root}
       #{spelling}
       #{load5}
     }
@@ -291,7 +294,7 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
 
       // --- loadPhase1: an allow-listed path (any alias) cannot be replaced by a search-path override ---
       auto cannotOverride = [&](const char* path) {
-        #{pinned.gsub('sSharedCacheLoadInfo', 'dyld::sSharedCacheLoadInfo').gsub('findInSharedCacheImageBySpelling', 'dyld::findInSharedCacheImageBySpelling')}
+        #{pinned.gsub('sSharedCacheLoadInfo', 'dyld::sSharedCacheLoadInfo').gsub('findInSharedCacheImageBySpelling', 'dyld::findInSharedCacheImageBySpelling').gsub('pathWithoutIOSMacRoot', 'dyld::pathWithoutIOSMacRoot')}
         return pathIsInDyldCacheWhichCannotBeOverridden;
       };
       CHECK(cannotOverride(kLibz) && cannotOverride(kLibzAlias));
@@ -312,6 +315,23 @@ Dir.mktmpdir('shared-cache-precedence-wiring-') do |dir|
         dyld::gLinkContext.rootPaths = nullptr;
         system(("rm -rf '" + root + "'").c_str());
       }
+      // a Mac Catalyst process tries /System/iOSSupport + path first (loadPhase0): when the cache has nothing at that spelling,
+      // the attempt is for the macOS image at the plain one and gets its pin
+      dyld::gLinkContext.rootPaths = kIosRoots;
+      dyld::gLinkContext.iOSonMac = true;
+      CHECK(cannotOverride("/System/iOSSupport/usr/lib/libz.1.dylib"));
+      CHECK(!cannotOverride("/System/iOSSupport/usr/lib/libobjc.A.dylib") && !cannotOverride("/System/iOSSupport/usr/lib/libnotincache.dylib"));
+      // a spelling the cache does have decides for itself, whatever the plain one is
+      CHECK(!cannotOverride(kCatalyst));
+      // the prefixed spelling is itself a cache image (not allow-listed) while the plain spelling, /usr/lib/libz.dylib, is: its own decision
+      CHECK(!cannotOverride("/System/iOSSupport/usr/lib/libz.dylib") && cannotOverride(kLibzAlias));
+      CHECK(cannotOverride(kLibz) && !cannotOverride(kObjc));
+      // not a Catalyst process: the root is stripped like any other (Darling's prefix) and the lookup already pins
+      dyld::gLinkContext.iOSonMac = false;
+      CHECK(cannotOverride("/System/iOSSupport/usr/lib/libz.1.dylib"));
+      dyld::gLinkContext.rootPaths = nullptr;
+      // no root at all: a prefixed-looking path is not a cache path
+      CHECK(!cannotOverride("/System/iOSSupport/usr/lib/libz.1.dylib"));
 
       if (failures) { printf("%d failure(s)\\n", failures); return 1; }
       puts("PASS loadPhase5load precedence (split and old caches), stat zeroing, override record, unfiltered lookups, pinned search paths");
