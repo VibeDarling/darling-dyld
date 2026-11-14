@@ -6,6 +6,10 @@
 //             present  call the library function that exists: returns normally
 //             a|b|c    call a missing function: halts with "a collected missing symbol was called: <name>"
 //             data     read the missing data symbol: faults on the guard (SIGSEGV)
+//             plugin   dlopen a bundle whose import of collectMissingHostFunction binds to this program (ordinal -1), then
+//                      call it (HOST_FULL builds define the function; the run-time program does not)
+//   The same program linked -flat_namespace (collect-missing-flat) records its imports with ordinal -2.
+#include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -14,6 +18,9 @@ extern int collectMissingFunctionA(void);
 extern int collectMissingFunctionB(void);
 extern int collectMissingFunctionC(void);
 extern long kCollectMissingData;
+#ifdef HOST_FULL
+__attribute__((used)) int collectMissingHostFunction(void) { return 5; }
+#endif
 
 int main(int argc, char** argv)
 {
@@ -30,5 +37,11 @@ int main(int argc, char** argv)
 		return collectMissingFunctionC();
 	if ( strcmp(what, "data") == 0 )
 		return (int)kCollectMissingData;
+	if ( strcmp(what, "plugin") == 0 ) {
+		void* bundle = dlopen("@executable_path/collect-missing-plugin.bundle", RTLD_NOW);
+		printf(bundle ? "plugin loaded\n" : "plugin not loaded\n");
+		int (*entry)(void) = bundle ? (int (*)(void))dlsym(bundle, "pluginEntry") : NULL;
+		return entry ? entry() : 6;
+	}
 	return 4;
 }

@@ -1,0 +1,52 @@
+off-present rc=134
+  Symbol not found: _kCollectMissingData
+on-present rc=0
+  REACHED main present
+  collect-missing-guest	_collectMissingFunctionA	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionB	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionC	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_kCollectMissingData	@executable_path/libcollectmissing.dylib	1	strong	nonlazy	guard
+on-a rc=134
+  REACHED main a
+  collected missing symbol was called: _collectMissingFunctionA
+  collect-missing-guest	_collectMissingFunctionA	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionB	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionC	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_kCollectMissingData	@executable_path/libcollectmissing.dylib	1	strong	nonlazy	guard
+on-b rc=134
+  REACHED main b
+  collected missing symbol was called: _collectMissingFunctionB
+  collect-missing-guest	_collectMissingFunctionA	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionB	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionC	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_kCollectMissingData	@executable_path/libcollectmissing.dylib	1	strong	nonlazy	guard
+on-c rc=134
+  REACHED main c
+  collected missing symbol was called: _collectMissingFunctionC
+  collect-missing-guest	_collectMissingFunctionA	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionB	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionC	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_kCollectMissingData	@executable_path/libcollectmissing.dylib	1	strong	nonlazy	guard
+on-data rc=139
+  REACHED main data
+  collect-missing-guest	_collectMissingFunctionA	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionB	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionC	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_kCollectMissingData	@executable_path/libcollectmissing.dylib	1	strong	nonlazy	guard
+on-plugin rc=134
+  REACHED main plugin
+  plugin loaded
+  collected missing symbol was called: _collectMissingHostFunction
+  collect-missing-guest	_collectMissingFunctionA	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionB	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_collectMissingFunctionC	@executable_path/libcollectmissing.dylib	1	strong	lazy	trap
+  collect-missing-guest	_kCollectMissingData	@executable_path/libcollectmissing.dylib	1	strong	nonlazy	guard
+  collect-missing-plugin.bundle	_collectMissingHostFunction	collect-missing-guest	-1	strong	lazy	trap
+off-flat rc=134
+  Symbol not found: _kCollectMissingData
+on-flat rc=0
+  REACHED main present
+  collect-missing-flat	_collectMissingFunctionA	flat	-2	strong	lazy	trap
+  collect-missing-flat	_collectMissingFunctionB	flat	-2	strong	lazy	trap
+  collect-missing-flat	_collectMissingFunctionC	flat	-2	strong	lazy	trap
+  collect-missing-flat	_kCollectMissingData	flat	-2	strong	nonlazy	guard
