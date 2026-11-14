@@ -52,6 +52,7 @@ public:
 	virtual	void						updateUsesCoalIterator(CoalIterator&, uintptr_t newAddr, ImageLoader* target, unsigned imageIndex, const LinkContext& context);
 
 	virtual const char*					getIndexedPath(unsigned index) const;
+	const macho_header*					machHeaderForIndex(unsigned index) const;
 	virtual const char*					getIndexedShortName(unsigned) const;
 	virtual const char*					getInstallPath() const;
 	virtual bool						inSharedCache() const { return true; }

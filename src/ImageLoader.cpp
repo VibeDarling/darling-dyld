@@ -420,6 +420,12 @@ void ImageLoader::applyInterposingToDyldCache(const LinkContext& context) {
 		return;
 	if (fgInterposingTuples.empty())
 		return;
+	// forEachPatchableExport reads the old patch table layout, not the one of a split cache
+	if ( context.dyldCache->isSplitCache() ) {
+		if ( context.verboseInterposing )
+			dyld::log("dyld: interpose: not patching the split shared cache, its patch table is not supported yet\n");
+		return;
+	}
 
 	// make the cache writable for this block
 	DyldSharedCache::DataConstScopedWriter patcher(context.dyldCache, mach_task_self(), (context.verboseMapping ? &dyld::log : nullptr));

@@ -1,0 +1,22 @@
+# Mutation probes for emit_tsd_sites.py: each edits a scratch copy and tests/darling-tsd-emit.rb must then fail.
+- {name: register 31 not matched, file: emit_tsd_sites.py, from: 'rb"[\x60-\x7f]\xd0', to: 'rb"[\x60-\x7e]\xd0'}
+- {name: misaligned match kept, file: emit_tsd_sites.py, from: "            if (pos - off) % 4:\n                continue", to: ""}
+- {name: data sections scanned, file: emit_tsd_sites.py, from: "                if flags & S_INSTRUCTION_ATTRS:", to: "                if True:"}
+- {name: no section scanned, file: emit_tsd_sites.py, from: "                if flags & S_INSTRUCTION_ATTRS:", to: "                if flags & 0:"}
+- {name: shift of another register counts as CPU index, file: emit_tsd_sites.py, from: "if following == LSR_12 | (reg << 5) | reg:", to: "if (following & 0xFFFFFC00) == LSR_12:"}
+- {name: read past the section end, file: emit_tsd_sites.py, from: "if pos + 8 <= off + size and reg != 31:", to: "if pos + 8 <= off + size + 4 and reg != 31:"}
+- {name: CPU index never recognised, file: emit_tsd_sites.py, from: "kind = KIND_CPU", to: "kind = KIND_TSD"}
+- {name: kind bit in the wrong place, file: emit_tsd_sites.py, from: "(kind << 5) | reg", to: "(kind << 4) | reg"}
+- {name: site offset not scaled, file: emit_tsd_sites.py, from: "((offset >> 2) << 6)", to: "((offset >> 1) << 6)"}
+- {name: gap not trimmed past a non-zero word, file: emit_tsd_sites.py, from: "    first = (start + len(stripped) + 3) & ~3", to: "    first = start"}
+- {name: gap minimum lowered, file: emit_tsd_sites.py, from: "MIN_GAP = 20 ", to: "MIN_GAP = 16 "}
+- {name: gap runs to the end of the mapping, file: emit_tsd_sites.py, from: "        limit = cache.image_addresses[index + 1]", to: "        limit = end_of_mapping"}
+- {name: gap starts at the header, file: emit_tsd_sites.py, from: "        text_end = max([a + s for a, s in segments if mapping[0] <= a < end_of_mapping] + [mh])", to: "        text_end = mh"}
+- {name: gaps in read-only mappings, file: emit_tsd_sites.py, from: "if mapping is None or not mapping[4] & VM_PROT_EXECUTE:", to: "if mapping is None:"}
+- {name: images not sorted, file: emit_tsd_sites.py, from: "self.image_addresses = sorted(", to: "self.image_addresses = list("}
+- {name: offsets not relative to the base, file: emit_tsd_sites.py, from: "images.append((mh - base, len(all_sites), len(records)))", to: "images.append((mh - self.base if False else mh, len(all_sites), len(records)))"}
+- {name: uuid of the sub-cache, file: emit_tsd_sites.py, from: "self.uuid = bytes(main[H_UUID:H_UUID + 16])", to: "self.uuid = bytes(range(101, 117))"}
+- {name: sub-cache uuid not checked, file: emit_tsd_sites.py, from: "if bytes(data[H_UUID:H_UUID + 16]) != uuid:", to: "if False:"}
+- {name: suffix with a slash accepted, file: emit_tsd_sites.py, from: 'if not name or "/" in name:', to: "if not name:"}
+- {name: image without a mach header accepted, file: emit_tsd_sites.py, from: "    if magic != 0xFEEDFACF:", to: "    if False:"}
+- {name: sites of an image not counted, file: emit_tsd_sites.py, from: "images.append((mh - base, len(all_sites), len(records)))", to: "images.append((mh - base, len(all_sites), len(records) + 1))"}
